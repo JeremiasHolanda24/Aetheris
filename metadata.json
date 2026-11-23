@@ -1,0 +1,6 @@
+{
+  "name": "Aetheris Flight & Infinite Terrain",
+  "description": "Real-time 3D starfighter flight simulator over infinite procedural chunked terrain with off-screen target tracking and custom starfield shaders.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
