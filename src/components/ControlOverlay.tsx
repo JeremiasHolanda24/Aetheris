@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import {
   CameraMode,
+  QualityLevel,
   SimulationConfig,
   TelemetrySnapshot,
 } from '../types/simulation';
@@ -103,7 +104,11 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
             <strong className="text-amber-400 font-medium">
               {Math.round(telemetry.targetDistance)}m
             </strong>{' '}
-            ({telemetry.targetZone === 'orbit' ? 'Órbita' : 'Solo'})
+            ({telemetry.targetZone === 'orbit'
+              ? 'Órbita'
+              : telemetry.targetZone === 'moon'
+                ? 'Lua'
+                : 'Solo'})
           </span>
           <span className="text-slate-600" aria-hidden="true">
             ·
@@ -194,7 +199,10 @@ interface ControlDockProps {
   config: SimulationConfig;
   dockOpen: boolean;
   activeSliderId: string | null;
+  autoQuality: boolean;
+  qualityLevel: QualityLevel;
   onActiveSliderChange: (id: string | null) => void;
+  onToggleAutoQuality: () => void;
   onCloseDock: () => void;
   onUpdateConfig: (updater: (prev: SimulationConfig) => SimulationConfig) => void;
   onLandSurface: () => void;
@@ -268,7 +276,10 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
     config,
     dockOpen,
     activeSliderId,
+    autoQuality,
+    qualityLevel,
     onActiveSliderChange,
+    onToggleAutoQuality,
     onCloseDock,
     onUpdateConfig,
     onLandSurface,
@@ -379,7 +390,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                 type="button"
                 onClick={onRelocateTarget}
                 className="px-2.5 py-1.5 text-xs font-medium text-slate-100 bg-slate-800 hover:bg-slate-700 border border-white/10 rounded-md transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-                title="Alternar alvo entre superfície e órbita"
+                title="Alternar alvo entre superfície, órbita e lua"
               >
                 <Crosshair className="w-3.5 h-3.5 text-amber-400" />
                 <span>Novo Alvo</span>
@@ -718,6 +729,40 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                 </p>
               </div>
             )}
+          </div>
+
+          {/* Footer: Qualidade automática switch + current quality level */}
+          <div
+            className={`mt-3 pt-2.5 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs transition-opacity duration-150 ${
+              isDraggingAny ? 'opacity-15 pointer-events-none' : 'opacity-100'
+            }`}
+          >
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoQuality}
+              onClick={onToggleAutoQuality}
+              className="flex items-center gap-2 text-slate-200 hover:text-white cursor-pointer"
+            >
+              <span
+                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                  autoQuality
+                    ? 'bg-emerald-500/85 border-emerald-300/70'
+                    : 'bg-slate-800 border-white/15'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                    autoQuality ? 'translate-x-4' : 'translate-x-0.5'
+                  }`}
+                />
+              </span>
+              <span className="font-medium">Qualidade automática</span>
+            </button>
+            <span className="font-mono-tabular text-slate-300">
+              Qualidade:{' '}
+              <strong className="text-sky-300 font-medium">{qualityLevel}</strong>
+            </span>
           </div>
         </section>
       </div>

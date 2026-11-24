@@ -112,6 +112,8 @@ export class SpaceBackground {
   private nebulaMaterial: THREE.MeshBasicMaterial;
 
   private params: BackdropParams;
+  private starRatio = 1;
+  private totalStars = 0;
   private readonly tempColor = new THREE.Color();
 
   constructor(initialParams: BackdropParams) {
@@ -180,6 +182,16 @@ export class SpaceBackground {
     this.starMaterial.uniforms.uPixelRatio.value = pr;
   }
 
+  public setStarRatio(ratio: number): void {
+    this.starRatio = THREE.MathUtils.clamp(ratio, 0.1, 1);
+    if (this.starGeometry) {
+      this.starGeometry.setDrawRange(
+        0,
+        Math.max(1, Math.round(this.totalStars * this.starRatio)),
+      );
+    }
+  }
+
   public updateParams(next: BackdropParams): void {
     const starsNeedRebuild =
       next.starCount !== this.params.starCount ||
@@ -238,6 +250,12 @@ export class SpaceBackground {
     geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
     geo.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
     geo.computeBoundingSphere();
+
+    this.totalStars = count;
+    geo.setDrawRange(
+      0,
+      Math.max(1, Math.round(this.totalStars * this.starRatio)),
+    );
 
     this.starGeometry = geo;
     this.starPoints = new THREE.Points(geo, this.starMaterial);

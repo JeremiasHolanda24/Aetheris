@@ -18,7 +18,7 @@ const CUBE_FACES: CubeFaceBasis[] = [
   { normal: [0, 0, -1], uAxis: [-1, 0, 0], vAxis: [0, 1, 0] }, // -Z
 ];
 
-const PATCH_SUBDIV = 2;
+const PATCH_SUBDIV = 3;
 const PATCH_SEGMENTS = 20;
 
 function hash2(x: number, y: number): number {
@@ -99,7 +99,7 @@ function createPlanetSurfaceTexture(): THREE.CanvasTexture {
 
 /**
  * 3D Procedural Spherical Planet Manager:
- * - 100% continuous terrain across all 24 Cube-Sphere patches (no black ocean cutouts)
+ * - 100% continuous terrain across all 54 Cube-Sphere patches (no black ocean cutouts)
  * - Rich blue & purple planetary elevation colors + seamless triplanar mineral texture
  * - Cyan-to-Violet Fresnel atmosphere halo shell
  * - Distant orbiting moon
@@ -129,6 +129,7 @@ export class PlanetTerrainManager {
   private moonMesh: THREE.Mesh;
   private moonGeo: THREE.IcosahedronGeometry;
   private moonMat: THREE.MeshStandardMaterial;
+  private readonly moonCenter = new THREE.Vector3();
 
   private params: PlanetParams;
 
@@ -231,7 +232,7 @@ export class PlanetTerrainManager {
 
           if (uShowContours > 0.5) {
             float r = length(vPlanetPos);
-            float e = abs(fract(r * 0.42 - 0.5) - 0.5) / max(fwidth(r * 0.42), 0.0001);
+            float e = abs(fract(r * 0.18 - 0.5) - 0.5) / max(fwidth(r * 0.18), 0.0001);
             float contourLine = 1.0 - min(e, 1.0);
 
             vec3 dir = vPlanetPos / max(r, 0.001);
@@ -241,8 +242,9 @@ export class PlanetTerrainManager {
             float gLon = abs(fract(lon - 0.5) - 0.5) / max(fwidth(lon), 0.0001);
             float gridLine = 1.0 - min(min(gLat, gLon), 1.0);
 
-            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.82, 1.0), gridLine * 0.14);
-            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.8, 0.55, 1.0), contourLine * 0.24);
+            float distFade = 1.0 - smoothstep(60.0, 220.0, distance(cameraPosition, vPlanetPos));
+            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.82, 1.0), gridLine * 0.08 * distFade);
+            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.8, 0.55, 1.0), contourLine * 0.12 * distFade);
           }`,
         );
     };
@@ -333,6 +335,11 @@ export class PlanetTerrainManager {
 
   public get patchCount(): number {
     return this.patches.length;
+  }
+
+  public getMoonState(): { center: THREE.Vector3; radius: number } {
+    this.moonMesh.getWorldPosition(this.moonCenter);
+    return { center: this.moonCenter, radius: 26 };
   }
 
   public getSurfaceRadiusAt(nx: number, ny: number, nz: number): number {

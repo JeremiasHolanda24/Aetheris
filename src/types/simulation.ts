@@ -1,4 +1,5 @@
 export type CameraMode = 'chase' | 'tactical' | 'cockpit' | 'orbit';
+export type QualityLevel = 0 | 1 | 2 | 3;
 
 export interface ShipParams {
   rotationSpeed: number; // deg/s (default 110)
@@ -50,12 +51,13 @@ export interface TelemetrySnapshot {
   atmospherePct: number;
   planetPatches: number;
   targetDistance: number;
-  targetZone: 'surface' | 'orbit';
+  targetZone: 'surface' | 'orbit' | 'moon';
   waypointsCaptured: number;
   targetLocked: boolean;
   reentryIntensity: number;
   isThrusting: boolean;
   isBoosting: boolean;
+  qualityLevel: QualityLevel;
   indicator: OffScreenIndicatorState;
 }
 
@@ -73,7 +75,7 @@ export const DEFAULT_CONFIG: SimulationConfig = {
     noiseScale: 0.045,
     atmosphereHeight: 55,
     wireframe: false,
-    showContours: true,
+    showContours: false,
   },
   backdrop: {
     starCount: 1600,

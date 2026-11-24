@@ -4,10 +4,20 @@ import { MobileControls } from './components/MobileControls';
 import { OffScreenHud, OffScreenHudHandle } from './components/OffScreenHud';
 import { FlightEngine, VirtualInputs } from './engine/FlightEngine';
 import {
+  CameraMode,
   DEFAULT_CONFIG,
   SimulationConfig,
   TelemetrySnapshot,
 } from './types/simulation';
+
+const STORAGE_KEY = 'aetheris.config.v1';
+const SAVE_DEBOUNCE_MS = 300;
+
+interface LoadedSettings {
+  config: SimulationConfig;
+  muted: boolean;
+  autoQuality: boolean;
+}
 
 const INITIAL_TELEMETRY: TelemetrySnapshot = {
   speed: 0,
@@ -15,7 +25,7 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   headingDeg: 0,
   inSpace: false,
   atmospherePct: 100,
-  planetPatches: 24,
+  planetPatches: 54,
   targetDistance: 90,
   targetZone: 'surface',
   waypointsCaptured: 0,
@@ -23,6 +33,7 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   reentryIntensity: 0,
   isThrusting: false,
   isBoosting: false,
+  qualityLevel: 0,
   indicator: {
     active: false,
     onScreen: false,
@@ -43,7 +54,36 @@ function detectTouchDevice(): boolean {
   );
 }
 
-function createInitialConfig(isTouch: boolean): SimulationConfig {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNum(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isCameraMode(value: unknown): value is CameraMode {
+  return (
+    value === 'chase' ||
+    value === 'tactical' ||
+    value === 'cockpit' ||
+    value === 'orbit'
+  );
+}
+
+function readStoredSettingsRaw(): Record<string, unknown> | null {
+  try {
+    if (typeof window === 'undefined' || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function createDefaultConfig(isTouch: boolean): SimulationConfig {
   const base = structuredClone(DEFAULT_CONFIG);
   if (isTouch) {
     base.backdrop.starCount = 900;
@@ -51,13 +91,89 @@ function createInitialConfig(isTouch: boolean): SimulationConfig {
   return base;
 }
 
+function createInitialConfig(isTouch: boolean): SimulationConfig {
+  const base = structuredClone(DEFAULT_CONFIG);
+  const stored = readStoredSettingsRaw();
+  const rawConfig = stored
+    ? isRecord(stored.config)
+      ? stored.config
+      : stored
+    : null;
+
+  let hasSavedStarCount = false;
+
+  if (rawConfig) {
+    if (isRecord(rawConfig.ship)) {
+      const s = rawConfig.ship;
+      if (isFiniteNum(s.rotationSpeed)) base.ship.rotationSpeed = s.rotationSpeed;
+      if (isFiniteNum(s.thrustForce)) base.ship.thrustForce = s.thrustForce;
+      if (isFiniteNum(s.maxSpeed)) base.ship.maxSpeed = s.maxSpeed;
+      if (isFiniteNum(s.drag)) base.ship.drag = s.drag;
+      if (typeof s.invertPitch === 'boolean') base.ship.invertPitch = s.invertPitch;
+    }
+
+    if (isRecord(rawConfig.planet)) {
+      const p = rawConfig.planet;
+      if (isFiniteNum(p.planetRadius)) base.planet.planetRadius = p.planetRadius;
+      if (isFiniteNum(p.maxHeight)) base.planet.maxHeight = p.maxHeight;
+      if (isFiniteNum(p.noiseScale)) base.planet.noiseScale = p.noiseScale;
+      if (isFiniteNum(p.atmosphereHeight)) {
+        base.planet.atmosphereHeight = p.atmosphereHeight;
+      }
+      if (typeof p.wireframe === 'boolean') base.planet.wireframe = p.wireframe;
+      if (typeof p.showContours === 'boolean') base.planet.showContours = p.showContours;
+    }
+
+    if (isRecord(rawConfig.backdrop)) {
+      const b = rawConfig.backdrop;
+      if (isFiniteNum(b.starCount)) {
+        base.backdrop.starCount = b.starCount;
+        hasSavedStarCount = true;
+      }
+      if (isFiniteNum(b.minStarSize)) base.backdrop.minStarSize = b.minStarSize;
+      if (isFiniteNum(b.maxStarSize)) base.backdrop.maxStarSize = b.maxStarSize;
+      if (isFiniteNum(b.nebulaOpacity)) base.backdrop.nebulaOpacity = b.nebulaOpacity;
+      if (isFiniteNum(b.indicatorMargin)) {
+        base.backdrop.indicatorMargin = b.indicatorMargin;
+      }
+    }
+
+    if (isCameraMode(rawConfig.cameraMode)) {
+      base.cameraMode = rawConfig.cameraMode;
+    }
+  }
+
+  if (isTouch && !hasSavedStarCount) {
+    base.backdrop.starCount = 900;
+  }
+
+  return base;
+}
+
+function loadInitialSettings(isTouch: boolean): LoadedSettings {
+  const stored = readStoredSettingsRaw();
+  return {
+    config: createInitialConfig(isTouch),
+    muted: stored && typeof stored.muted === 'boolean' ? stored.muted : false,
+    autoQuality:
+      stored && typeof stored.autoQuality === 'boolean' ? stored.autoQuality : true,
+  };
+}
+
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<FlightEngine | null>(null);
   const hudRef = useRef<OffScreenHudHandle | null>(null);
   const captureTimerRef = useRef<number | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const isFirstSaveEffectRef = useRef(true);
+  const skipNextSaveRef = useRef(false);
 
   const initialTouch = useMemo(() => detectTouchDevice(), []);
+  const initialSettings = useMemo(
+    () => loadInitialSettings(initialTouch),
+    [initialTouch],
+  );
 
   const [isTouchDevice, setIsTouchDevice] = useState<boolean>(initialTouch);
   const [isPortraitMobile, setIsPortraitMobile] = useState<boolean>(() => {
@@ -66,9 +182,7 @@ export default function App() {
   });
   const [portraitDismissed, setPortraitDismissed] = useState(false);
 
-  const [config, setConfig] = useState<SimulationConfig>(() =>
-    createInitialConfig(initialTouch),
-  );
+  const [config, setConfig] = useState<SimulationConfig>(initialSettings.config);
   const [telemetry, setTelemetry] =
     useState<TelemetrySnapshot>(INITIAL_TELEMETRY);
 
@@ -78,7 +192,8 @@ export default function App() {
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [targetLocked, setTargetLocked] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(initialSettings.muted);
+  const [autoQuality, setAutoQuality] = useState(initialSettings.autoQuality);
   const [captureFlash, setCaptureFlash] = useState<number | null>(null);
   const [contextLost, setContextLost] = useState(false);
 
@@ -112,8 +227,7 @@ export default function App() {
     const mountEl = canvasMountRef.current;
     if (!mountEl) return;
 
-    const initialCfg = createInitialConfig(detectTouchDevice());
-    const engine = new FlightEngine(mountEl, initialCfg, {
+    const engine = new FlightEngine(mountEl, initialSettings.config, {
       onTelemetry: (snap) => setTelemetry(snap),
       onIndicatorFrame: (ind) => hudRef.current?.updateIndicator(ind),
       onHitmarker: (kind) => hudRef.current?.flashHitmarker(kind),
@@ -129,6 +243,8 @@ export default function App() {
       onContextLostChange: (lost) => setContextLost(lost),
     });
 
+    engine.setMuted(initialSettings.muted);
+    engine.setAutoQuality(initialSettings.autoQuality);
     engineRef.current = engine;
 
     return () => {
@@ -138,11 +254,55 @@ export default function App() {
       engine.dispose();
       engineRef.current = null;
     };
-  }, []);
+  }, [initialSettings]);
 
   useEffect(() => {
     engineRef.current?.updateConfig(config);
   }, [config]);
+
+  useEffect(() => {
+    engineRef.current?.setAutoQuality(autoQuality);
+  }, [autoQuality]);
+
+  useEffect(() => {
+    engineRef.current?.setSliderDragging(activeSliderId !== null);
+  }, [activeSliderId]);
+
+  useEffect(() => {
+    if (isFirstSaveEffectRef.current) {
+      isFirstSaveEffectRef.current = false;
+      return;
+    }
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
+
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify({ config, muted: isMuted, autoQuality }),
+          );
+        }
+      } catch {
+        // Ignore storage quota or private browsing errors
+      }
+    }, SAVE_DEBOUNCE_MS);
+
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [config, isMuted, autoQuality]);
 
   const handleToggleTargetLock = useCallback(() => {
     setTargetLocked((prev) => {
@@ -249,7 +409,27 @@ export default function App() {
   }, []);
 
   const handleResetDefaults = useCallback(() => {
-    setConfig(createInitialConfig(detectTouchDevice()));
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    skipNextSaveRef.current = true;
+    setConfig(createDefaultConfig(detectTouchDevice()));
+    setIsMuted(false);
+    engineRef.current?.setMuted(false);
+    setAutoQuality(true);
+    engineRef.current?.setAutoQuality(true);
+  }, []);
+
+  const handleToggleAutoQuality = useCallback(() => {
+    setAutoQuality((prev) => !prev);
   }, []);
 
   const handleVirtualInput = useCallback((inputs: VirtualInputs) => {
@@ -323,7 +503,10 @@ export default function App() {
         config={config}
         dockOpen={dockOpen}
         activeSliderId={activeSliderId}
+        autoQuality={autoQuality}
+        qualityLevel={telemetry.qualityLevel}
         onActiveSliderChange={setActiveSliderId}
+        onToggleAutoQuality={handleToggleAutoQuality}
         onCloseDock={handleCloseDock}
         onUpdateConfig={handleUpdateConfig}
         onLandSurface={handleLandSurface}
