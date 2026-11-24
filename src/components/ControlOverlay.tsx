@@ -8,6 +8,8 @@ import {
   Orbit,
   RotateCcw,
   Settings,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import {
@@ -22,10 +24,12 @@ interface TelemetryHeaderProps {
   isFullscreen: boolean;
   isTouchDevice: boolean;
   targetLocked: boolean;
+  isMuted: boolean;
   dimmed: boolean;
   onToggleDock: () => void;
   onToggleFullscreen: () => void;
   onToggleTargetLock: () => void;
+  onToggleMute: () => void;
 }
 
 export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
@@ -35,10 +39,12 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
     isFullscreen,
     isTouchDevice,
     targetLocked,
+    isMuted,
     dimmed,
     onToggleDock,
     onToggleFullscreen,
     onToggleTargetLock,
+    onToggleMute,
   }) => (
     <header
       className={`pointer-events-none fixed top-2.5 sm:top-4 left-0 right-0 z-30 flex flex-wrap items-center justify-between gap-2 transition-opacity duration-150 ${
@@ -142,6 +148,25 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
             <Maximize2 className="w-4 h-4 text-sky-400" />
           )}
           <span>{isFullscreen ? 'Sair' : 'Tela Cheia'}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onToggleMute}
+          className={`min-h-[38px] min-w-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 flex items-center justify-center cursor-pointer ${
+            isMuted
+              ? 'bg-[#090c16]/90 text-slate-400 border-white/10 hover:border-white/25'
+              : 'bg-[#090c16]/90 text-sky-300 border-white/10 hover:border-white/25'
+          }`}
+          aria-label={isMuted ? 'Ativar som' : 'Silenciar som'}
+          aria-pressed={!isMuted}
+          title={isMuted ? 'Ativar som (M)' : 'Silenciar som (M)'}
+        >
+          {isMuted ? (
+            <VolumeX className="w-4 h-4 text-rose-400" />
+          ) : (
+            <Volume2 className="w-4 h-4 text-sky-400" />
+          )}
         </button>
 
         <button

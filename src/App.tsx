@@ -78,6 +78,7 @@ export default function App() {
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [targetLocked, setTargetLocked] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const [captureFlash, setCaptureFlash] = useState<number | null>(null);
   const [contextLost, setContextLost] = useState(false);
 
@@ -151,6 +152,14 @@ export default function App() {
     });
   }, []);
 
+  const handleToggleMute = useCallback(() => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      engineRef.current?.setMuted(next);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (
@@ -163,11 +172,13 @@ export default function App() {
         setDockOpen((prev) => !prev);
       } else if (e.code === 'KeyT') {
         handleToggleTargetLock();
+      } else if (e.code === 'KeyM') {
+        handleToggleMute();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleToggleTargetLock]);
+  }, [handleToggleTargetLock, handleToggleMute]);
 
   const handleRequestLandscapeFullscreen = useCallback(async () => {
     try {
@@ -300,10 +311,12 @@ export default function App() {
         isFullscreen={isFullscreen}
         isTouchDevice={isTouchDevice}
         targetLocked={targetLocked}
+        isMuted={isMuted}
         dimmed={isDraggingSlider}
         onToggleDock={handleToggleDock}
         onToggleFullscreen={handleToggleFullscreen}
         onToggleTargetLock={handleToggleTargetLock}
+        onToggleMute={handleToggleMute}
       />
 
       <ControlDock

@@ -15,6 +15,7 @@ import {
   ShipModelHandle,
 } from './proceduralModels';
 import { SpaceBackground } from './SpaceBackground';
+import { SoundEngine } from './SoundEngine';
 
 // Pre-allocated math helpers outside render loop (Zero GC)
 const _shipForward = new THREE.Vector3();
@@ -52,6 +53,7 @@ const _particleColor = new THREE.Color();
 const _particleStartCol = new THREE.Color();
 const _particleEndCol = new THREE.Color();
 const _dummyObj = new THREE.Object3D();
+const _keyLightOffset = new THREE.Vector3(260, 320, 180);
 
 const _spaceBgColor = new THREE.Color(0x05050d);
 const _atmoBgColor = new THREE.Color(0x0b1d38);
@@ -242,12 +244,17 @@ export class FlightEngine {
   private lastTelemetryEmit = 0;
   private lastViewportW = 1;
   private lastViewportH = 1;
+  private lastIndicator: OffScreenIndicatorState | null = null;
 
   private boundOnResize: () => void;
   private boundOnKeyDown: (e: KeyboardEvent) => void;
   private boundOnKeyUp: (e: KeyboardEvent) => void;
   private boundOnPointerDown: (e: PointerEvent) => void;
   private boundOnPointerUp: (e: PointerEvent) => void;
+  private boundUnlockAudio: () => void;
+  private soundEngine = new SoundEngine();
+  private boundOnBlur: () => void;
+  private boundOnVisibilityChange: () => void;
   private boundOnContextMenu: (e: Event) => void;
   private boundOnContextLost: (e: Event) => void;
   private boundOnContextRestored: () => void;
@@ -333,7 +340,7 @@ export class FlightEngine {
     this.scene.add(hemiLight);
 
     this.keyLight = new THREE.DirectionalLight(0xfff1d6, 2.35);
-    this.keyLight.position.set(260, 320, 180);
+    this.keyLight.position.copy(_keyLightOffset);
     this.keyLight.castShadow = enableShadowMap;
     if (enableShadowMap) {
       this.keyLight.shadow.mapSize.set(512, 512);
@@ -348,6 +355,7 @@ export class FlightEngine {
       this.keyLight.shadow.normalBias = 0.02;
     }
     this.scene.add(this.keyLight);
+    this.scene.add(this.keyLight.target);
 
     const rimLight = new THREE.DirectionalLight(0x6366f1, 1.25);
     rimLight.position.set(-240, -140, -220);
@@ -522,6 +530,7 @@ export class FlightEngine {
     this.boundOnKeyDown = this.handleKeyDown.bind(this);
     this.boundOnKeyUp = this.handleKeyUp.bind(this);
     this.boundOnPointerDown = (e: PointerEvent) => {
+      this.soundEngine.unlock();
       if (
         this.config.cameraMode !== 'orbit' &&
         (e.pointerType !== 'mouse' || e.button === 0)
@@ -531,6 +540,9 @@ export class FlightEngine {
     };
     this.boundOnPointerUp = (e: PointerEvent) => {
       this.activeFirePointerIds.delete(e.pointerId);
+    };
+    this.boundUnlockAudio = () => {
+      this.soundEngine.unlock();
     };
     this.boundOnContextMenu = (e: Event) => {
       e.preventDefault();
@@ -543,11 +555,19 @@ export class FlightEngine {
       this.callbacks.onContextLostChange(false);
     };
 
+    this.boundOnBlur = () => this.releaseAllInputs();
+    this.boundOnVisibilityChange = () => {
+      if (document.hidden) this.releaseAllInputs();
+    };
+    window.addEventListener('blur', this.boundOnBlur);
+    document.addEventListener('visibilitychange', this.boundOnVisibilityChange);
     window.addEventListener('resize', this.boundOnResize);
     window.addEventListener('orientationchange', this.boundOnResize);
     window.visualViewport?.addEventListener('resize', this.boundOnResize);
     window.addEventListener('keydown', this.boundOnKeyDown);
     window.addEventListener('keyup', this.boundOnKeyUp);
+    window.addEventListener('pointerdown', this.boundUnlockAudio, { passive: true });
+    window.addEventListener('keydown', this.boundUnlockAudio, { passive: true });
     window.addEventListener('pointerup', this.boundOnPointerUp);
     window.addEventListener('pointercancel', this.boundOnPointerUp);
     this.renderer.domElement.addEventListener(
@@ -594,6 +614,10 @@ export class FlightEngine {
 
   public setTargetLocked(locked: boolean): void {
     this.targetLocked = locked;
+  }
+
+  public setMuted(muted: boolean): void {
+    this.soundEngine.setMuted(muted);
   }
 
   public landOnSurface(): void {
@@ -703,16 +727,22 @@ export class FlightEngine {
     this.renderer.setSize(w, h);
   }
 
+  private releaseAllInputs(): void {
+    this.keysDown.clear();
+    this.activeFirePointerIds.clear();
+  }
+
   private handleKeyDown(e: KeyboardEvent): void {
+    const tag = document.activeElement?.tagName;
+    if (tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (tag === 'INPUT' && e.code.startsWith('Arrow')) return;
+
     if (
       ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(
         e.code,
       )
     ) {
-      if (
-        document.activeElement?.tagName !== 'INPUT' &&
-        document.activeElement?.tagName !== 'BUTTON'
-      ) {
+      if (tag !== 'INPUT' && tag !== 'BUTTON') {
         e.preventDefault();
       }
     }
@@ -752,6 +782,8 @@ export class FlightEngine {
     const elapsed = this.timer.getElapsed();
 
     this.stepPhysics(dt, elapsed);
+    this.keyLight.position.copy(this.shipRoot.position).add(_keyLightOffset);
+    this.keyLight.target.position.copy(this.shipRoot.position);
     this.stepProjectiles(dt);
     this.planetManager.update(elapsed);
     this.spaceBackground.update(elapsed, this.shipRoot.position);
@@ -760,9 +792,8 @@ export class FlightEngine {
     this.updateAtmosphereAndCamera(dt);
     this.renderer.render(this.scene, this.camera);
 
-    if (this.callbacks.onIndicatorFrame) {
-      this.callbacks.onIndicatorFrame(this.computeOffScreenIndicator());
-    }
+    this.lastIndicator = this.computeOffScreenIndicator();
+    this.callbacks.onIndicatorFrame?.(this.lastIndicator);
 
     if (elapsed - this.lastTelemetryEmit >= 0.1) {
       this.lastTelemetryEmit = elapsed;
@@ -916,8 +947,8 @@ export class FlightEngine {
 
     this.shipAltitude = Math.max(0.5, this.shipRoot.position.length() - surfaceR);
 
-    // 6. Spherical Ground Contact Shadow
-    const showShadow = this.shipAltitude < 32;
+    // 6. Spherical Ground Contact Shadow (fallback for mobile/software GPUs without shadowMap)
+    const showShadow = !this.renderer.shadowMap.enabled && this.shipAltitude < 32;
     this.hoverShadowMesh.visible = showShadow;
     if (showShadow) {
       this.hoverShadowMesh.position
@@ -1007,6 +1038,7 @@ export class FlightEngine {
       isBoosting,
       this.reentryIntensity,
     );
+    this.soundEngine.updateAtmosphereEntry(this.reentryIntensity);
     this.stepAtmosphereAndExhaustParticles(
       dt,
       thrustInput > 0.05,
@@ -1144,6 +1176,8 @@ export class FlightEngine {
     if (!slot) {
       slot = this.bolts[0];
     }
+
+    this.soundEngine.playLaser();
 
     this.fireAlternator = (this.fireAlternator + 1) % 2;
     const wingSide = this.fireAlternator === 0 ? -1 : 1;
@@ -1647,7 +1681,7 @@ export class FlightEngine {
       reentryIntensity: this.reentryIntensity,
       isThrusting,
       isBoosting,
-      indicator: this.computeOffScreenIndicator(),
+      indicator: this.lastIndicator ?? this.computeOffScreenIndicator(),
     });
   }
 
@@ -1658,11 +1692,18 @@ export class FlightEngine {
     this.timer.disconnect();
     this.timer.dispose();
 
+    window.removeEventListener('blur', this.boundOnBlur);
+    document.removeEventListener(
+      'visibilitychange',
+      this.boundOnVisibilityChange,
+    );
     window.removeEventListener('resize', this.boundOnResize);
     window.removeEventListener('orientationchange', this.boundOnResize);
     window.visualViewport?.removeEventListener('resize', this.boundOnResize);
     window.removeEventListener('keydown', this.boundOnKeyDown);
     window.removeEventListener('keyup', this.boundOnKeyUp);
+    window.removeEventListener('pointerdown', this.boundUnlockAudio);
+    window.removeEventListener('keydown', this.boundUnlockAudio);
     window.removeEventListener('pointerup', this.boundOnPointerUp);
     window.removeEventListener('pointercancel', this.boundOnPointerUp);
     this.renderer.domElement.removeEventListener(
@@ -1682,6 +1723,7 @@ export class FlightEngine {
       this.boundOnContextRestored,
     );
 
+    this.soundEngine.dispose();
     this.controls.dispose();
     this.planetManager.dispose();
     this.spaceBackground.dispose();
