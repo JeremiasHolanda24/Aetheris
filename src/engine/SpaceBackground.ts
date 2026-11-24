@@ -120,6 +120,8 @@ export class SpaceBackground {
     this.params = { ...initialParams };
     this.root.name = 'SpaceBackground';
 
+    this.root.renderOrder = -1000;
+
     this.starMaterial = new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
@@ -152,8 +154,9 @@ export class SpaceBackground {
           gl_FragColor = vec4(vColor * vTwinkle, a);
         }
       `,
-      transparent: true,
+      transparent: false,
       depthWrite: false,
+      depthTest: false,
       blending: THREE.AdditiveBlending,
       vertexColors: true,
       fog: false,
@@ -163,16 +166,18 @@ export class SpaceBackground {
     this.nebulaGeometry = new THREE.SphereGeometry(1250, 20, 14);
     this.nebulaMaterial = new THREE.MeshBasicMaterial({
       map: this.nebulaTexture,
-      transparent: true,
+      transparent: false,
       opacity: initialParams.nebulaOpacity,
       depthWrite: false,
+      depthTest: false,
       blending: THREE.AdditiveBlending,
       side: THREE.BackSide,
       fog: false,
     });
 
     this.nebulaMesh = new THREE.Mesh(this.nebulaGeometry, this.nebulaMaterial);
-    this.nebulaMesh.renderOrder = -10;
+    this.nebulaMesh.renderOrder = -1000;
+    this.nebulaMesh.frustumCulled = false;
     this.root.add(this.nebulaMesh);
 
     this.rebuildStars();
@@ -259,13 +264,14 @@ export class SpaceBackground {
 
     this.starGeometry = geo;
     this.starPoints = new THREE.Points(geo, this.starMaterial);
+    this.starPoints.renderOrder = -999;
     this.starPoints.frustumCulled = false;
     this.root.add(this.starPoints);
   }
 
-  public update(elapsed: number, shipPos: THREE.Vector3): void {
+  public update(elapsed: number, cameraPos: THREE.Vector3): void {
     this.starMaterial.uniforms.uTime.value = elapsed;
-    this.root.position.copy(shipPos);
+    this.root.position.copy(cameraPos);
     this.nebulaMesh.rotation.y = elapsed * 0.0025;
   }
 

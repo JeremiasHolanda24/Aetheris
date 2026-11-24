@@ -10,7 +10,8 @@ import {
   TelemetrySnapshot,
 } from './types/simulation';
 
-const STORAGE_KEY = 'aetheris.config.v1';
+const STORAGE_KEY = 'aetheris.config.v2';
+const LEGACY_STORAGE_KEY = 'aetheris.config.v1';
 const SAVE_DEBOUNCE_MS = 300;
 
 interface LoadedSettings {
@@ -25,7 +26,8 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   headingDeg: 0,
   inSpace: false,
   atmospherePct: 100,
-  planetPatches: 54,
+  biome: '',
+  planetPatches: 96,
   targetDistance: 90,
   targetZone: 'surface',
   waypointsCaptured: 0,
@@ -34,6 +36,9 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   isThrusting: false,
   isBoosting: false,
   qualityLevel: 0,
+  landingState: 'flying',
+  canLand: false,
+  landHint: '',
   indicator: {
     active: false,
     onScreen: false,
@@ -74,6 +79,9 @@ function isCameraMode(value: unknown): value is CameraMode {
 function readStoredSettingsRaw(): Record<string, unknown> | null {
   try {
     if (typeof window === 'undefined' || !window.localStorage) return null;
+    if (window.localStorage.getItem(LEGACY_STORAGE_KEY) !== null) {
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
@@ -120,6 +128,7 @@ function createInitialConfig(isTouch: boolean): SimulationConfig {
       if (isFiniteNum(p.atmosphereHeight)) {
         base.planet.atmosphereHeight = p.atmosphereHeight;
       }
+      if (isFiniteNum(p.seaLevel)) base.planet.seaLevel = p.seaLevel;
       if (typeof p.wireframe === 'boolean') base.planet.wireframe = p.wireframe;
       if (typeof p.showContours === 'boolean') base.planet.showContours = p.showContours;
     }
@@ -436,7 +445,36 @@ export default function App() {
     engineRef.current?.setVirtualInputs(inputs);
   }, []);
 
+  const handleToggleLanding = useCallback(() => {
+    engineRef.current?.toggleLanding();
+  }, []);
+
   const isDraggingSlider = activeSliderId !== null;
+
+  let landingNoticeText = '';
+  let landingNoticeTone = 'text-slate-300 border-white/10';
+  if (telemetry.landingState === 'flying') {
+    if (telemetry.canLand) {
+      landingNoticeText = isTouchDevice ? 'Toque em POUSAR / DECOLAR' : '[L] Pousar';
+      landingNoticeTone = 'text-emerald-300 border-emerald-400/40';
+    } else if (telemetry.altitude < 80 && telemetry.landHint) {
+      landingNoticeText = telemetry.landHint;
+      landingNoticeTone = 'text-slate-300 border-white/10';
+    }
+  } else if (telemetry.landingState === 'landing') {
+    landingNoticeText = isTouchDevice
+      ? 'Pousando… Toque em POUSAR / DECOLAR'
+      : 'Pousando… [L] Cancelar';
+    landingNoticeTone = 'text-amber-300 border-amber-400/40';
+  } else if (telemetry.landingState === 'landed') {
+    landingNoticeText = isTouchDevice
+      ? 'Pousado · Toque em POUSAR / DECOLAR'
+      : 'Pousado · [L] Decolar';
+    landingNoticeTone = 'text-sky-300 border-sky-400/35';
+  } else if (telemetry.landingState === 'takeoff') {
+    landingNoticeText = 'Decolando…';
+    landingNoticeTone = 'text-sky-300 border-sky-400/35';
+  }
 
   return (
     <main className="relative w-screen h-[100dvh] overflow-hidden bg-[#05050d]">
@@ -476,14 +514,27 @@ export default function App() {
         <MobileControls
           visible={isTouchDevice}
           targetLocked={targetLocked}
+          landingState={telemetry.landingState}
+          canLand={telemetry.canLand}
           isPortraitMobile={isPortraitMobile && isTouchDevice}
           portraitDismissed={portraitDismissed}
           onDismissPortrait={handleDismissPortrait}
           onRequestLandscapeFullscreen={handleRequestLandscapeFullscreen}
           onToggleTargetLock={handleToggleTargetLock}
+          onToggleLanding={handleToggleLanding}
           onVirtualInputChange={handleVirtualInput}
         />
       </div>
+
+      {!dockOpen && landingNoticeText && (
+        <div
+          className={`pointer-events-none fixed bottom-4 sm:bottom-6 left-1/2 -translate-x-1/2 z-20 px-3 py-1 bg-[#090c16]/85 border rounded-lg text-xs font-medium font-mono-tabular whitespace-nowrap transition-opacity duration-150 ${
+            isDraggingSlider ? 'opacity-15' : 'opacity-100'
+          } ${landingNoticeTone}`}
+        >
+          {landingNoticeText}
+        </div>
+      )}
 
       <TelemetryHeader
         telemetry={telemetry}

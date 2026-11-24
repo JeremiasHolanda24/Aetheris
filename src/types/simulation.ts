@@ -1,5 +1,6 @@
 export type CameraMode = 'chase' | 'tactical' | 'cockpit' | 'orbit';
 export type QualityLevel = 0 | 1 | 2 | 3;
+export type LandingState = 'flying' | 'landing' | 'landed' | 'takeoff';
 
 export interface ShipParams {
   rotationSpeed: number; // deg/s (default 110)
@@ -10,10 +11,11 @@ export interface ShipParams {
 }
 
 export interface PlanetParams {
-  planetRadius: number;     // default 180
-  maxHeight: number;        // default 12
+  planetRadius: number;     // default 360
+  maxHeight: number;        // default 14
   noiseScale: number;       // default 0.045
-  atmosphereHeight: number; // default 55
+  atmosphereHeight: number; // default 70
+  seaLevel: number;         // default -0.15 (normalized -1..1)
   wireframe: boolean;
   showContours: boolean;
 }
@@ -49,6 +51,7 @@ export interface TelemetrySnapshot {
   headingDeg: number;
   inSpace: boolean;
   atmospherePct: number;
+  biome: string;
   planetPatches: number;
   targetDistance: number;
   targetZone: 'surface' | 'orbit' | 'moon';
@@ -58,6 +61,9 @@ export interface TelemetrySnapshot {
   isThrusting: boolean;
   isBoosting: boolean;
   qualityLevel: QualityLevel;
+  landingState: LandingState;
+  canLand: boolean;
+  landHint: string;
   indicator: OffScreenIndicatorState;
 }
 
@@ -70,10 +76,11 @@ export const DEFAULT_CONFIG: SimulationConfig = {
     invertPitch: false,
   },
   planet: {
-    planetRadius: 180,
-    maxHeight: 12,
+    planetRadius: 360,
+    maxHeight: 14,
     noiseScale: 0.045,
-    atmosphereHeight: 55,
+    atmosphereHeight: 70,
+    seaLevel: -0.15,
     wireframe: false,
     showContours: false,
   },

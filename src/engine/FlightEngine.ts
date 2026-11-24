@@ -6,9 +6,11 @@ import {
   TelemetrySnapshot,
 } from '../types/simulation';
 import { BeaconController } from './BeaconController';
+import { getBiomeName } from './biomes';
 import { CameraRig } from './CameraRig';
 import { FlightPhysics } from './FlightPhysics';
 import { InputController, VirtualInputs } from './InputController';
+import { LandingHooks } from './LandingController';
 import { computeOffScreenIndicator } from './OffScreenIndicator';
 import { ParticleSystem } from './ParticleSystem';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
@@ -16,12 +18,14 @@ import { createShipModel, ShipModelHandle } from './proceduralModels';
 import { QualityPreset, QualityScaler } from './QualityScaler';
 import { SoundEngine } from './SoundEngine';
 import { SpaceBackground } from './SpaceBackground';
+import { getPlanetTerrainHeight } from './terrainMath';
 import { WeaponsSystem } from './WeaponsSystem';
 
 export type { VirtualInputs };
 
 // Pre-allocated math helpers outside render loop (Zero GC)
 const _shipForward = new THREE.Vector3();
+const _shipDir = new THREE.Vector3();
 const _snapCamPos = new THREE.Vector3();
 const _snapLookAt = new THREE.Vector3();
 const _snapUp = new THREE.Vector3();
@@ -93,10 +97,11 @@ export class FlightEngine {
   private timer = new THREE.Timer();
   private frameId = 0;
   private disposed = false;
-  private lastTelemetryEmit = 0;
+  private lastTelemetryEmit = -1;
   private lastViewportW = 1;
   private lastViewportH = 1;
   private lastIndicator: OffScreenIndicatorState | null = null;
+  private readonly landingHooks: LandingHooks;
 
   private boundOnResize: () => void;
   private boundOnContextLost: (e: Event) => void;
@@ -153,7 +158,7 @@ export class FlightEngine {
     // 2. Scene & Dynamic Atmosphere Fog
     this.scene = new THREE.Scene();
     this.scene.background = _atmoBgColor.clone();
-    this.fog = new THREE.FogExp2(0x0b1d38, 0.0024);
+    this.fog = new THREE.FogExp2(0x0b1d38, 0.0017);
     this.scene.fog = this.fog;
 
     // 3. Studio RoomEnvironment map
@@ -169,6 +174,7 @@ export class FlightEngine {
       height,
       this.config.cameraMode,
       this.isSoftwareGl,
+      this.config.planet.planetRadius,
     );
 
     // 5. Three-Point Solar Lighting Rig
@@ -219,17 +225,24 @@ export class FlightEngine {
     this.weaponsSystem = new WeaponsSystem(this.scene, this.soundEngine);
     this.particleSystem = new ParticleSystem(this.scene);
 
+    this.landingHooks = {
+      spawnDust: (pos, normal, count) =>
+        this.weaponsSystem.spawnDust(pos, normal, count),
+      onTouchdown: () => this.soundEngine.playTouchdown(),
+      onGear: (extending) => this.soundEngine.playGear(extending),
+    };
+
     this.inputController = new InputController(this.renderer.domElement, {
       getCameraMode: () => this.config.cameraMode,
       onUnlockAudio: () => this.soundEngine.unlock(),
       onVisibilityChange: (hidden) => this.soundEngine.setPaused(hidden),
+      onLandToggle: () => this.toggleLanding(),
     });
 
     this.landOnSurface();
-    this.beaconController.placeAtAngle(
-      0.42,
-      0.25,
+    this.beaconController.relocateTarget(
       'surface',
+      this.physics.shipRoot.position,
       this.config.planet,
       this.planetManager,
     );
@@ -269,6 +282,7 @@ export class FlightEngine {
     const prevMode = this.config.cameraMode;
     this.config = structuredClone(next);
     this.planetManager.updateParams(next.planet);
+    this.cameraRig.setPlanetRadius(next.planet.planetRadius);
     this.spaceBackground.updateParams(next.backdrop);
 
     if (prevMode !== next.cameraMode) {
@@ -313,6 +327,17 @@ export class FlightEngine {
     this.emitTelemetry();
   }
 
+  public toggleLanding(): void {
+    this.soundEngine.unlock();
+    this.physics.landing.toggle(
+      this.physics.shipRoot.position,
+      this.physics.velocity,
+      this.planetManager,
+      this.landingHooks,
+    );
+    this.lastTelemetryEmit = -1;
+  }
+
   public landOnSurface(): void {
     this.physics.landOnSurface(
       this.planetManager,
@@ -320,7 +345,8 @@ export class FlightEngine {
       _snapLookAt,
       _snapUp,
     );
-    this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp);
+    this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, true);
+    this.lastTelemetryEmit = -1;
   }
 
   public launchToOrbit(): void {
@@ -330,7 +356,8 @@ export class FlightEngine {
       _snapLookAt,
       _snapUp,
     );
-    this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp);
+    this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, false);
+    this.lastTelemetryEmit = -1;
   }
 
   public relocateTarget(
@@ -383,7 +410,7 @@ export class FlightEngine {
     const dt = Math.min(rawDt, 0.05);
     const elapsed = this.timer.getElapsed();
 
-    this.planetManager.update(elapsed);
+    this.planetManager.update(elapsed, this.cameraRig.camera.position, dt);
     if (this.beaconController.targetZone === 'moon') {
       this.beaconController.syncMoonBeaconPosition(this.planetManager);
     }
@@ -391,9 +418,10 @@ export class FlightEngine {
     const inputs = this.inputController.sampleFlightInputs(
       this.config.ship.invertPitch,
     );
-    this.wantsFire = inputs.wantsFire;
-    this.isThrusting = inputs.isThrusting;
-    this.isBoosting = inputs.isBoosting;
+    const landingControlled = this.physics.landing.isControlling;
+    this.wantsFire = landingControlled ? false : inputs.wantsFire;
+    this.isThrusting = landingControlled ? false : inputs.isThrusting;
+    this.isBoosting = landingControlled ? false : inputs.isBoosting;
 
     const physOut = this.physics.step(dt, elapsed, {
       inputs,
@@ -401,8 +429,9 @@ export class FlightEngine {
       planet: this.config.planet,
       planetManager: this.planetManager,
       beaconPos: this.beaconController.position,
-      targetLocked: this.targetLocked,
+      targetLocked: landingControlled ? false : this.targetLocked,
       shadowMapEnabled: this.renderer.shadowMap.enabled,
+      landingHooks: this.landingHooks,
     });
 
     this.soundEngine.updateAtmosphereEntry(this.physics.reentryIntensity);
@@ -411,7 +440,7 @@ export class FlightEngine {
       shipQuat: this.physics.shipQuat,
       shipVisualQuat: this.shipModel.group.quaternion,
       shipVelocity: this.physics.velocity,
-      isThrusting: inputs.thrust > 0.05,
+      isThrusting: landingControlled ? false : inputs.thrust > 0.05,
       isBoosting: this.isBoosting,
       thrustPower: physOut.thrustPower,
       atmoRatio: physOut.atmoRatio,
@@ -437,7 +466,7 @@ export class FlightEngine {
 
     this.weaponsSystem.update(dt, {
       wantsFire: this.wantsFire,
-      targetLocked: this.targetLocked,
+      targetLocked: landingControlled ? false : this.targetLocked,
       cameraMode: this.config.cameraMode,
       camera: this.cameraRig.camera,
       shipPos: this.physics.shipRoot.position,
@@ -453,14 +482,13 @@ export class FlightEngine {
       onHitmarker: this.callbacks.onHitmarker,
     });
 
-    this.spaceBackground.update(elapsed, this.physics.shipRoot.position);
     this.beaconController.update(elapsed, dt, this.planetManager);
 
     const atmoT = this.physics.atmospherePct / 100;
     _blendedBgColor.lerpColors(_spaceBgColor, _atmoBgColor, atmoT);
     (this.scene.background as THREE.Color).copy(_blendedBgColor);
     this.fog.color.copy(_blendedBgColor);
-    this.fog.density = THREE.MathUtils.lerp(0.00028, 0.0024, atmoT);
+    this.fog.density = THREE.MathUtils.lerp(0.0002, 0.0017, atmoT);
 
     this.cameraRig.update(dt, elapsed, {
       mode: this.config.cameraMode,
@@ -469,7 +497,11 @@ export class FlightEngine {
       speed: physOut.speed,
       maxSpeed: this.config.ship.maxSpeed,
       reentryIntensity: this.physics.reentryIntensity,
+      landingState: this.physics.landing.state,
     });
+
+    this.spaceBackground.update(elapsed, this.cameraRig.camera.position);
+    this.planetManager.updateHorizonCulling(this.cameraRig.camera.position);
 
     this.renderer.render(this.scene, this.cameraRig.camera);
 
@@ -505,12 +537,52 @@ export class FlightEngine {
         360) %
       360;
 
+    let biome = '';
+    if (!this.physics.inSpace) {
+      const lenSq = this.physics.shipRoot.position.lengthSq();
+      if (lenSq > 0.0001) {
+        _shipDir
+          .copy(this.physics.shipRoot.position)
+          .divideScalar(Math.sqrt(lenSq));
+        const rawH = getPlanetTerrainHeight(
+          _shipDir.x,
+          _shipDir.y,
+          _shipDir.z,
+          this.config.planet.planetRadius,
+          this.config.planet.noiseScale,
+          this.config.planet.maxHeight,
+        );
+        const safeMaxH = Math.max(this.config.planet.maxHeight, 0.001);
+        biome = getBiomeName(
+          _shipDir.x,
+          _shipDir.y,
+          _shipDir.z,
+          THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1),
+          this.config.planet.seaLevel,
+        );
+      }
+    }
+
+    const landingState = this.physics.landing.state;
+    let canLand = false;
+    let landHint = '';
+    if (landingState === 'flying') {
+      const evalRes = this.physics.landing.evaluate(
+        this.physics.shipRoot.position,
+        this.physics.velocity,
+        this.planetManager,
+      );
+      canLand = evalRes.canLand;
+      landHint = evalRes.hint;
+    }
+
     this.callbacks.onTelemetry({
       speed: this.physics.velocity.length(),
       altitude: this.physics.shipAltitude,
       headingDeg: heading,
       inSpace: this.physics.inSpace,
       atmospherePct: this.physics.atmospherePct,
+      biome,
       planetPatches: this.planetManager.patchCount,
       targetDistance: targetDist,
       targetZone: this.beaconController.targetZone,
@@ -520,6 +592,9 @@ export class FlightEngine {
       isThrusting: this.isThrusting,
       isBoosting: this.isBoosting,
       qualityLevel: this.qualityScaler.getLevel(),
+      landingState,
+      canLand,
+      landHint,
       indicator:
         this.lastIndicator ??
         computeOffScreenIndicator(

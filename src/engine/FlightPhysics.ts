@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { PlanetParams, ShipParams } from '../types/simulation';
 import { FlightInputSample } from './InputController';
+import {
+  GEAR_REST_HEIGHT,
+  LandingController,
+  LandingHooks,
+} from './LandingController';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
 import { ShipModelHandle } from './proceduralModels';
 
@@ -9,6 +14,7 @@ const _shipForward = new THREE.Vector3();
 const _shipUp = new THREE.Vector3();
 const _shipRight = new THREE.Vector3();
 const _radialUp = new THREE.Vector3();
+const _surfNormal = new THREE.Vector3();
 const _targetRight = new THREE.Vector3();
 const _targetUp = new THREE.Vector3();
 const _rotQuat = new THREE.Quaternion();
@@ -21,6 +27,8 @@ const _unitZ = new THREE.Vector3(0, 0, 1);
 const _unitX = new THREE.Vector3(1, 0, 0);
 const _toTarget = new THREE.Vector3();
 const _moonToShip = new THREE.Vector3();
+const _shipBack = new THREE.Vector3();
+const _basisMat = new THREE.Matrix4();
 
 function createSoftShadowTexture(): THREE.CanvasTexture {
   const size = 64;
@@ -62,6 +70,7 @@ export class FlightPhysics {
   public readonly shipRoot = new THREE.Group();
   public readonly shipQuat = new THREE.Quaternion();
   public readonly velocity = new THREE.Vector3(0, 0, 0);
+  public readonly landing = new LandingController();
 
   public shipAltitude = 12;
   public atmospherePct = 100;
@@ -111,18 +120,49 @@ export class FlightPhysics {
     outLookAt: THREE.Vector3,
     outUp: THREE.Vector3,
   ): void {
-    const surfR = planetManager.getSurfaceRadiusAt(0, 1, 0);
-    this.shipRoot.position.set(0, surfR + 10, 0);
-    this.shipQuat.identity();
+    planetManager.findLandDirection(0, _radialUp);
+    const surfR = planetManager.getSurfaceRadiusAt(
+      _radialUp.x,
+      _radialUp.y,
+      _radialUp.z,
+    );
+    this.shipRoot.position
+      .copy(_radialUp)
+      .multiplyScalar(surfR + GEAR_REST_HEIGHT);
+
+    planetManager.getSurfaceNormalAt(
+      _radialUp.x,
+      _radialUp.y,
+      _radialUp.z,
+      _surfNormal,
+    );
+    _shipRight.crossVectors(_unitY, _surfNormal);
+    if (_shipRight.lengthSq() < 0.0001) {
+      _shipRight.set(1, 0, 0);
+    } else {
+      _shipRight.normalize();
+    }
+    _shipForward.crossVectors(_surfNormal, _shipRight).normalize();
+    _shipBack.copy(_shipForward).negate();
+    _basisMat.makeBasis(_shipRight, _surfNormal, _shipBack);
+
+    this.shipQuat.setFromRotationMatrix(_basisMat).normalize();
     this.shipRoot.quaternion.copy(this.shipQuat);
     this.shipModel.group.quaternion.identity();
     this.velocity.set(0, 0, 0);
     this.bankRad = 0;
     this.pitchVisualRad = 0;
+    this.reentryIntensity = 0;
 
-    outCamPos.set(0, surfR + 13.8, 13.5);
-    outUp.set(0, 1, 0);
-    outLookAt.copy(this.shipRoot.position).add(_shipForward.set(0, 0, -135));
+    this.landing.forceLanded(_radialUp, planetManager);
+    this.shipModel.setGearExtension(this.landing.gearT);
+
+    outUp.copy(_surfNormal);
+    outCamPos
+      .copy(this.shipRoot.position)
+      .addScaledVector(_shipForward, -13.5)
+      .addScaledVector(_surfNormal, 3.8);
+    outLookAt.copy(this.shipRoot.position).addScaledVector(_shipForward, 135);
   }
 
   public launchToOrbit(
@@ -147,6 +187,10 @@ export class FlightPhysics {
     this.velocity.set(0, 0, 0);
     this.bankRad = 0;
     this.pitchVisualRad = 0;
+    this.reentryIntensity = 0;
+
+    this.landing.forceFlying();
+    this.shipModel.setGearExtension(0);
 
     _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
     outUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
@@ -168,10 +212,19 @@ export class FlightPhysics {
       beaconPos: THREE.Vector3;
       targetLocked: boolean;
       shadowMapEnabled: boolean;
+      landingHooks: LandingHooks;
     },
   ): PhysicsStepResult {
-    const { inputs, ship, planet, planetManager, beaconPos, targetLocked, shadowMapEnabled } =
-      params;
+    const {
+      inputs,
+      ship,
+      planet,
+      planetManager,
+      beaconPos,
+      targetLocked,
+      shadowMapEnabled,
+      landingHooks,
+    } = params;
     const { rotationSpeed, thrustForce, maxSpeed, drag } = ship;
     const { planetRadius, atmosphereHeight } = planet;
 
@@ -183,137 +236,178 @@ export class FlightPhysics {
     // Radial normal & atmosphere ratio
     _radialUp.copy(this.shipRoot.position).normalize();
     const distFromCenter = this.shipRoot.position.length();
-    const surfaceR = planetManager.getSurfaceRadiusAt(
-      _radialUp.x,
-      _radialUp.y,
-      _radialUp.z,
-    );
     const altitude = distFromCenter - planetRadius;
     const atmoRatio =
       1 - THREE.MathUtils.smoothstep(altitude, 0, atmosphereHeight);
     this.atmospherePct = Math.round(atmoRatio * 100);
     this.inSpace = altitude > atmosphereHeight;
 
-    // 3D Quaternion Yaw & Pitch
-    const rotStep = THREE.MathUtils.degToRad(rotationSpeed) * dt;
+    if (this.landing.isControlling) {
+      this.landing.update(
+        dt,
+        {
+          root: this.shipRoot,
+          quat: this.shipQuat,
+          velocity: this.velocity,
+        },
+        planetManager,
+        { turn: turnInput, pitch: pitchInput, thrust: thrustInput },
+        landingHooks,
+      );
+    } else {
+      this.landing.stepFlyingGear(dt);
 
-    if (Math.abs(turnInput) > 0.005) {
-      _shipUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
-      _rotQuat.setFromAxisAngle(_shipUp, turnInput * rotStep);
-      this.shipQuat.premultiply(_rotQuat);
-    }
+      // 3D Quaternion Yaw & Pitch
+      const rotStep = THREE.MathUtils.degToRad(rotationSpeed) * dt;
 
-    if (Math.abs(pitchInput) > 0.005) {
-      _shipRight.set(1, 0, 0).applyQuaternion(this.shipQuat);
-      _rotQuat.setFromAxisAngle(_shipRight, pitchInput * rotStep * 0.85);
-      this.shipQuat.premultiply(_rotQuat);
-    }
+      if (Math.abs(turnInput) > 0.005) {
+        _shipUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
+        _rotQuat.setFromAxisAngle(_shipUp, turnInput * rotStep);
+        this.shipQuat.premultiply(_rotQuat);
+      }
 
-    // Target Lock (Travar Alvo)
-    if (targetLocked) {
-      _toTarget.subVectors(beaconPos, this.shipRoot.position);
-      const distToBeaconLock = _toTarget.length();
-      if (distToBeaconLock > 4) {
-        _toTarget.divideScalar(distToBeaconLock);
-        if (this.shipAltitude < 34 && _toTarget.dot(_radialUp) < 0.1) {
-          _toTarget.addScaledVector(_radialUp, 0.42).normalize();
+      if (Math.abs(pitchInput) > 0.005) {
+        _shipRight.set(1, 0, 0).applyQuaternion(this.shipQuat);
+        _rotQuat.setFromAxisAngle(_shipRight, pitchInput * rotStep * 0.85);
+        this.shipQuat.premultiply(_rotQuat);
+      }
+
+      // Target Lock (Travar Alvo)
+      if (targetLocked) {
+        _toTarget.subVectors(beaconPos, this.shipRoot.position);
+        const distToBeaconLock = _toTarget.length();
+        if (distToBeaconLock > 4) {
+          _toTarget.divideScalar(distToBeaconLock);
+          if (this.shipAltitude < 34 && _toTarget.dot(_radialUp) < 0.1) {
+            _toTarget.addScaledVector(_radialUp, 0.42).normalize();
+          }
+          _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
+          const manualMag = Math.min(1, Math.hypot(turnInput, pitchInput));
+          const lockBlend =
+            (1 - manualMag * 0.65) * THREE.MathUtils.clamp(dt * 3.4, 0, 1);
+          _alignQuat.setFromUnitVectors(_shipForward, _toTarget);
+          _rotQuat.copy(_alignQuat).multiply(this.shipQuat);
+          this.shipQuat.slerp(_rotQuat, lockBlend);
         }
-        _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
-        const manualMag = Math.min(1, Math.hypot(turnInput, pitchInput));
-        const lockBlend =
-          (1 - manualMag * 0.65) * THREE.MathUtils.clamp(dt * 3.4, 0, 1);
-        _alignQuat.setFromUnitVectors(_shipForward, _toTarget);
-        _rotQuat.copy(_alignQuat).multiply(this.shipQuat);
-        this.shipQuat.slerp(_rotQuat, lockBlend);
+      }
+
+      // Gentle planetary horizon roll-leveling inside atmosphere when not near vertical
+      _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
+      _shipUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
+      if (atmoRatio > 0.08 && Math.abs(_shipForward.dot(_radialUp)) < 0.85) {
+        _targetRight.crossVectors(_shipForward, _radialUp).normalize();
+        _targetUp.crossVectors(_targetRight, _shipForward).normalize();
+        _alignQuat.setFromUnitVectors(_shipUp, _targetUp);
+        this.shipQuat.slerp(
+          _alignQuat.multiply(this.shipQuat),
+          THREE.MathUtils.clamp(dt * 2.4 * atmoRatio, 0, 1),
+        );
+      }
+      this.shipQuat.normalize();
+      this.shipRoot.quaternion.copy(this.shipQuat);
+
+      // Thrust & Drag (1x inside atmosphere, smoothly scaled to planetRadius / 180 in vacuum)
+      const spaceScale = planetRadius / 180;
+      const vacuumMult = THREE.MathUtils.lerp(spaceScale, 1, atmoRatio);
+
+      _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
+      if (Math.abs(thrustInput) > 0.01) {
+        this.velocity.addScaledVector(
+          _shipForward,
+          thrustInput * thrustForce * vacuumMult * boostMult * dt,
+        );
+      }
+
+      const effectiveMax =
+        maxSpeed * vacuumMult * (inputs.isBoosting ? 1.45 : 1.0);
+      if (this.velocity.length() > effectiveMax) {
+        this.velocity.setLength(effectiveMax);
+      }
+
+      const effectiveDrag = THREE.MathUtils.lerp(0.994, drag, atmoRatio);
+      const dragFactor = Math.pow(
+        THREE.MathUtils.clamp(effectiveDrag, 0.88, 0.998),
+        dt * 60,
+      );
+      this.velocity.multiplyScalar(dragFactor);
+      this.shipRoot.position.addScaledVector(this.velocity, dt);
+
+      // Spherical Terrain Collision Floor
+      _radialUp.copy(this.shipRoot.position).normalize();
+      const newDist = this.shipRoot.position.length();
+      const newSurfR = planetManager.getSurfaceRadiusAt(
+        _radialUp.x,
+        _radialUp.y,
+        _radialUp.z,
+      );
+      const minFlightR = newSurfR + 3.2;
+      if (newDist < minFlightR) {
+        this.shipRoot.position.copy(_radialUp).multiplyScalar(minFlightR);
+        const inward = this.velocity.dot(_radialUp);
+        if (inward < 0) {
+          this.velocity.addScaledVector(_radialUp, -inward);
+        }
+      }
+
+      // Moon Collision Sphere
+      const { center: moonCenter, radius: moonRadius } =
+        planetManager.getMoonState();
+      _moonToShip.subVectors(this.shipRoot.position, moonCenter);
+      const moonDist = _moonToShip.length();
+      const minMoonR = moonRadius + 3.2;
+      if (moonDist < minMoonR) {
+        if (moonDist > 0.0001) {
+          _moonToShip.divideScalar(moonDist);
+        } else {
+          _moonToShip.copy(_unitY);
+        }
+        this.shipRoot.position
+          .copy(moonCenter)
+          .addScaledVector(_moonToShip, minMoonR);
+        const inwardMoon = this.velocity.dot(_moonToShip);
+        if (inwardMoon < 0) {
+          this.velocity.addScaledVector(_moonToShip, -inwardMoon);
+        }
       }
     }
 
-    // Gentle planetary horizon roll-leveling inside atmosphere when not near vertical
-    _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
-    _shipUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
-    if (atmoRatio > 0.08 && Math.abs(_shipForward.dot(_radialUp)) < 0.85) {
-      _targetRight.crossVectors(_shipForward, _radialUp).normalize();
-      _targetUp.crossVectors(_targetRight, _shipForward).normalize();
-      _alignQuat.setFromUnitVectors(_shipUp, _targetUp);
-      this.shipQuat.slerp(
-        _alignQuat.multiply(this.shipQuat),
-        THREE.MathUtils.clamp(dt * 2.4 * atmoRatio, 0, 1),
-      );
-    }
-    this.shipQuat.normalize();
-    this.shipRoot.quaternion.copy(this.shipQuat);
-
-    // Thrust & Drag
-    _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
-    if (Math.abs(thrustInput) > 0.01) {
-      this.velocity.addScaledVector(
-        _shipForward,
-        thrustInput * thrustForce * boostMult * dt,
-      );
-    }
-
-    const spaceSpeedBonus = this.inSpace ? 1.55 : 1.0;
-    const effectiveMax = maxSpeed * spaceSpeedBonus * (inputs.isBoosting ? 1.45 : 1.0);
-    if (this.velocity.length() > effectiveMax) {
-      this.velocity.setLength(effectiveMax);
-    }
-
-    const effectiveDrag = THREE.MathUtils.lerp(0.994, drag, atmoRatio);
-    const dragFactor = Math.pow(
-      THREE.MathUtils.clamp(effectiveDrag, 0.88, 0.998),
-      dt * 60,
-    );
-    this.velocity.multiplyScalar(dragFactor);
-    this.shipRoot.position.addScaledVector(this.velocity, dt);
-
-    // Spherical Terrain Collision Floor
     _radialUp.copy(this.shipRoot.position).normalize();
-    const newDist = this.shipRoot.position.length();
-    const newSurfR = planetManager.getSurfaceRadiusAt(
+    const curSurfR = planetManager.getSurfaceRadiusAt(
       _radialUp.x,
       _radialUp.y,
       _radialUp.z,
     );
-    const minFlightR = newSurfR + 3.2;
-    if (newDist < minFlightR) {
-      this.shipRoot.position.copy(_radialUp).multiplyScalar(minFlightR);
-      const inward = this.velocity.dot(_radialUp);
-      if (inward < 0) {
-        this.velocity.addScaledVector(_radialUp, -inward);
-      }
-    }
+    const curPlanetAlt = this.shipRoot.position.length() - curSurfR;
 
-    // Moon Collision Sphere
-    const { center: moonCenter, radius: moonRadius } =
+    const { center: curMoonCenter, radius: curMoonRadius } =
       planetManager.getMoonState();
-    _moonToShip.subVectors(this.shipRoot.position, moonCenter);
-    const moonDist = _moonToShip.length();
-    const minMoonR = moonRadius + 3.2;
-    if (moonDist < minMoonR) {
-      if (moonDist > 0.0001) {
-        _moonToShip.divideScalar(moonDist);
-      } else {
-        _moonToShip.copy(_unitY);
-      }
-      this.shipRoot.position
-        .copy(moonCenter)
-        .addScaledVector(_moonToShip, minMoonR);
-      const inwardMoon = this.velocity.dot(_moonToShip);
-      if (inwardMoon < 0) {
-        this.velocity.addScaledVector(_moonToShip, -inwardMoon);
-      }
-    }
+    _moonToShip.subVectors(this.shipRoot.position, curMoonCenter);
+    const curMoonDist = _moonToShip.length();
+    const curMoonAlt = curMoonDist - curMoonRadius;
+    const moonClosest = curMoonAlt < curPlanetAlt;
 
-    this.shipAltitude = Math.max(0.5, this.shipRoot.position.length() - surfaceR);
+    this.shipAltitude = Math.max(0.5, moonClosest ? curMoonAlt : curPlanetAlt);
 
     // Spherical Ground Contact Shadow (fallback for mobile/software GPUs without shadowMap)
     const showShadow = !shadowMapEnabled && this.shipAltitude < 32;
     this.hoverShadowMesh.visible = showShadow;
     if (showShadow) {
-      this.hoverShadowMesh.position
-        .copy(_radialUp)
-        .multiplyScalar(newSurfR + 0.18);
-      this.hoverShadowMesh.quaternion.setFromUnitVectors(_unitY, _radialUp);
+      if (moonClosest) {
+        if (curMoonDist > 0.0001) {
+          _moonToShip.divideScalar(curMoonDist);
+        } else {
+          _moonToShip.copy(_unitY);
+        }
+        this.hoverShadowMesh.position
+          .copy(curMoonCenter)
+          .addScaledVector(_moonToShip, curMoonRadius + 0.18);
+        this.hoverShadowMesh.quaternion.setFromUnitVectors(_unitY, _moonToShip);
+      } else {
+        this.hoverShadowMesh.position
+          .copy(_radialUp)
+          .multiplyScalar(curSurfR + 0.18);
+        this.hoverShadowMesh.quaternion.setFromUnitVectors(_unitY, _radialUp);
+      }
       this.hoverShadowMesh.rotateX(-Math.PI / 2);
       const shadowScale = THREE.MathUtils.clamp(
         1.35 - this.shipAltitude * 0.03,
@@ -328,11 +422,17 @@ export class FlightPhysics {
       );
     }
 
+    // Landing gear animation
+    this.shipModel.setGearExtension(this.landing.gearT);
+
     // Visual Banking & Pitch Tilt on Ship Mesh
-    this.bankRad = THREE.MathUtils.damp(this.bankRad, turnInput * 0.48, 8, dt);
+    const landingControlled = this.landing.isControlling;
+    const visualTurn = landingControlled ? 0 : turnInput;
+    const visualPitch = landingControlled ? 0 : pitchInput;
+    this.bankRad = THREE.MathUtils.damp(this.bankRad, visualTurn * 0.48, 8, dt);
     this.pitchVisualRad = THREE.MathUtils.damp(
       this.pitchVisualRad,
-      pitchInput * 0.14,
+      visualPitch * 0.14,
       8,
       dt,
     );
@@ -348,36 +448,49 @@ export class FlightPhysics {
       0,
       1.3,
     );
-    const thrustPower =
-      thrustInput > 0.05
-        ? THREE.MathUtils.clamp(
-            (0.55 + thrustInput * 0.45) * (inputs.isBoosting ? 1.45 : 1),
-            0,
-            1.5,
-          )
-        : speedNorm * 0.3;
+    let thrustPower = 0;
+    if (landingControlled) {
+      this.shipModel.leftFlame.visible = false;
+      this.shipModel.rightFlame.visible = false;
+      this.shipModel.flameMaterial.opacity = 0;
+      if (this.shipModel.thrusterLight) {
+        this.shipModel.thrusterLight.color.setHex(0x38bdf8);
+        this.shipModel.thrusterLight.intensity = 0.2;
+      }
+    } else {
+      this.shipModel.leftFlame.visible = true;
+      this.shipModel.rightFlame.visible = true;
+      thrustPower =
+        thrustInput > 0.05
+          ? THREE.MathUtils.clamp(
+              (0.55 + thrustInput * 0.45) * (inputs.isBoosting ? 1.45 : 1),
+              0,
+              1.5,
+            )
+          : speedNorm * 0.3;
 
-    const flameTarget =
-      thrustInput > 0.05
-        ? (0.78 + 0.55 * Math.sin(elapsed * 38) * 0.14) * boostMult
-        : 0.18 + speedNorm * 0.22;
-    this.shipModel.leftFlame.scale.set(
-      0.85 + thrustPower * 0.22,
-      0.85 + thrustPower * 0.22,
-      flameTarget,
-    );
-    this.shipModel.rightFlame.scale.set(
-      0.85 + thrustPower * 0.22,
-      0.85 + thrustPower * 0.22,
-      flameTarget,
-    );
-    this.shipModel.flameMaterial.opacity = thrustInput > 0.05 ? 0.94 : 0.38;
-    if (this.shipModel.thrusterLight) {
-      this.shipModel.thrusterLight.color.setHex(
-        inputs.isBoosting ? 0xf59e0b : 0x38bdf8,
+      const flameTarget =
+        thrustInput > 0.05
+          ? (0.78 + 0.55 * Math.sin(elapsed * 38) * 0.14) * boostMult
+          : 0.18 + speedNorm * 0.22;
+      this.shipModel.leftFlame.scale.set(
+        0.85 + thrustPower * 0.22,
+        0.85 + thrustPower * 0.22,
+        flameTarget,
       );
-      this.shipModel.thrusterLight.intensity =
-        thrustInput > 0.05 ? 3.5 * boostMult : 0.95;
+      this.shipModel.rightFlame.scale.set(
+        0.85 + thrustPower * 0.22,
+        0.85 + thrustPower * 0.22,
+        flameTarget,
+      );
+      this.shipModel.flameMaterial.opacity = thrustInput > 0.05 ? 0.94 : 0.38;
+      if (this.shipModel.thrusterLight) {
+        this.shipModel.thrusterLight.color.setHex(
+          inputs.isBoosting ? 0xf59e0b : 0x38bdf8,
+        );
+        this.shipModel.thrusterLight.intensity =
+          thrustInput > 0.05 ? 3.5 * boostMult : 0.95;
+      }
     }
 
     const radialSpeedInward = -this.velocity.dot(_radialUp);
@@ -392,8 +505,9 @@ export class FlightPhysics {
     const diveHeat = THREE.MathUtils.clamp((radialSpeedInward - 2.5) / 18, 0, 1);
     const speedHeat = THREE.MathUtils.clamp((speed - 22) / 30, 0, 1);
     const descending = THREE.MathUtils.clamp(radialSpeedInward / 6, 0, 1);
-    const targetReentry =
-      atmoEntryBand * Math.max(diveHeat, speedHeat * 0.65 * descending);
+    const targetReentry = landingControlled
+      ? 0
+      : atmoEntryBand * Math.max(diveHeat, speedHeat * 0.65 * descending);
     this.reentryIntensity = THREE.MathUtils.damp(
       this.reentryIntensity,
       targetReentry,
@@ -404,7 +518,7 @@ export class FlightPhysics {
     this.shipModel.updateEffects(
       elapsed,
       thrustPower,
-      inputs.isBoosting,
+      landingControlled ? false : inputs.isBoosting,
       this.reentryIntensity,
     );
 

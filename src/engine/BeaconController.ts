@@ -63,6 +63,47 @@ export class BeaconController {
     }
 
     _radialUp.copy(shipPos).normalize();
+
+    if (zone === 'surface') {
+      let foundLand = false;
+      const minLandNorm = planetParams.seaLevel + 0.03;
+
+      for (let attempt = 0; attempt < 30; attempt++) {
+        _toTarget.set(
+          Math.random() - 0.5,
+          Math.random() - 0.5,
+          Math.random() - 0.5,
+        );
+        if (_toTarget.lengthSq() < 0.0001) continue;
+        _toTarget.normalize();
+        if (_toTarget.dot(_radialUp) > 0.85) {
+          _toTarget.negate();
+        }
+        if (
+          planetManager.getRawHeightNormAt(
+            _toTarget.x,
+            _toTarget.y,
+            _toTarget.z,
+          ) > minLandNorm
+        ) {
+          foundLand = true;
+          break;
+        }
+      }
+
+      if (!foundLand) {
+        planetManager.findLandDirection(
+          Math.floor(Math.random() * 512),
+          _toTarget,
+        );
+      }
+
+      const theta = Math.atan2(_toTarget.z, _toTarget.x);
+      const phi = Math.acos(THREE.MathUtils.clamp(_toTarget.y, -1, 1));
+      this.placeAtAngle(theta, phi, zone, planetParams, planetManager);
+      return;
+    }
+
     const randDir = _toTarget
       .set(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5)
       .normalize();

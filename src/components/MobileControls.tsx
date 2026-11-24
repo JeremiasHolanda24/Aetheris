@@ -1,15 +1,28 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Flame, Gauge, LocateFixed, RotateCw, Smartphone } from 'lucide-react';
+import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Flame,
+  Gauge,
+  LocateFixed,
+  RotateCw,
+  Smartphone,
+  X,
+} from 'lucide-react';
 import { VirtualInputs } from '../engine/FlightEngine';
+import { LandingState } from '../types/simulation';
 
 interface MobileControlsProps {
   visible: boolean;
   targetLocked: boolean;
+  landingState: LandingState;
+  canLand: boolean;
   isPortraitMobile: boolean;
   portraitDismissed: boolean;
   onDismissPortrait: () => void;
   onRequestLandscapeFullscreen: () => void;
   onToggleTargetLock: () => void;
+  onToggleLanding: () => void;
   onVirtualInputChange: (inputs: VirtualInputs) => void;
 }
 
@@ -17,11 +30,14 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
   ({
     visible,
     targetLocked,
+    landingState,
+    canLand,
     isPortraitMobile,
     portraitDismissed,
     onDismissPortrait,
     onRequestLandscapeFullscreen,
     onToggleTargetLock,
+    onToggleLanding,
     onVirtualInputChange,
   }) => {
     const stickStateRef = useRef({ turn: 0, pitch: 0 });
@@ -255,6 +271,49 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
               }}
             >
               <div className="flex flex-col items-center gap-2.5">
+                {(landingState === 'landed' ||
+                  landingState === 'landing' ||
+                  (landingState === 'flying' && canLand)) && (
+                  <button
+                    type="button"
+                    onPointerDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onToggleLanding();
+                    }}
+                    style={{ touchAction: 'none' }}
+                    className={`min-w-[74px] h-11 px-2.5 rounded-xl border-2 flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer ${
+                      landingState === 'landing'
+                        ? 'bg-rose-500/90 text-white border-rose-200 font-bold'
+                        : landingState === 'landed'
+                          ? 'bg-sky-500/90 text-slate-950 border-sky-200 font-bold'
+                          : 'bg-emerald-500/90 text-slate-950 border-emerald-200 font-bold'
+                    }`}
+                    aria-label={
+                      landingState === 'landing'
+                        ? 'Cancelar pouso'
+                        : landingState === 'landed'
+                          ? 'Decolar'
+                          : 'Pousar'
+                    }
+                  >
+                    {landingState === 'landing' ? (
+                      <X className="w-3.5 h-3.5" />
+                    ) : landingState === 'landed' ? (
+                      <ArrowUpFromLine className="w-3.5 h-3.5" />
+                    ) : (
+                      <ArrowDownToLine className="w-3.5 h-3.5" />
+                    )}
+                    <span className="text-[10px] font-bold tracking-wide leading-none">
+                      {landingState === 'landing'
+                        ? 'CANCELAR'
+                        : landingState === 'landed'
+                          ? 'DECOLAR'
+                          : 'POUSAR'}
+                    </span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onPointerDown={(e) => {

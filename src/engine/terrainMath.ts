@@ -40,7 +40,7 @@ const F3 = 1 / 3;
 const G3 = 1 / 6;
 const REF_PLANET_RADIUS = 180;
 
-function simplex3(xin: number, yin: number, zin: number): number {
+export function simplex3(xin: number, yin: number, zin: number): number {
   const s = (xin + yin + zin) * F3;
   const i = Math.floor(xin + s);
   const j = Math.floor(yin + s);
@@ -173,6 +173,29 @@ export function getPlanetTerrainHeight(
   );
 
   return normalized * maxHeight;
+}
+
+/**
+ * Surface height with flat ocean floor cutoff at `seaLevel * maxHeight`.
+ */
+export function getPlanetSurfaceHeight(
+  nx: number,
+  ny: number,
+  nz: number,
+  planetRadius: number,
+  noiseScale: number,
+  maxHeight: number,
+  seaLevel: number,
+): number {
+  const h = getPlanetTerrainHeight(
+    nx,
+    ny,
+    nz,
+    planetRadius,
+    noiseScale,
+    maxHeight,
+  );
+  return Math.max(h, seaLevel * maxHeight);
 }
 
 /**

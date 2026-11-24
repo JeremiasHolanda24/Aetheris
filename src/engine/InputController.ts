@@ -27,6 +27,7 @@ export class InputController {
   private readonly getCameraMode: () => CameraMode;
   private readonly onUnlockAudio: () => void;
   private readonly onVisibilityChange: (hidden: boolean) => void;
+  private readonly onLandToggle?: () => void;
 
   private keysDown = new Set<string>();
   private activeFirePointerIds = new Set<number>();
@@ -62,12 +63,14 @@ export class InputController {
       getCameraMode: () => CameraMode;
       onUnlockAudio: () => void;
       onVisibilityChange: (hidden: boolean) => void;
+      onLandToggle?: () => void;
     },
   ) {
     this.domElement = domElement;
     this.getCameraMode = options.getCameraMode;
     this.onUnlockAudio = options.onUnlockAudio;
     this.onVisibilityChange = options.onVisibilityChange;
+    this.onLandToggle = options.onLandToggle;
 
     this.boundOnBlur = () => this.releaseAllInputs();
     this.boundOnVisibilityChange = () => {
@@ -170,6 +173,10 @@ export class InputController {
     const tag = document.activeElement?.tagName;
     if (tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (tag === 'INPUT' && e.code.startsWith('Arrow')) return;
+
+    if (e.code === 'KeyL' && !e.repeat) {
+      this.onLandToggle?.();
+    }
 
     if (
       ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(

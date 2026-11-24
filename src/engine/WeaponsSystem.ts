@@ -16,9 +16,14 @@ const _boltVel = new THREE.Vector3();
 const _segVec = new THREE.Vector3();
 const _toTarget = new THREE.Vector3();
 const _closestPt = new THREE.Vector3();
+const _dustT1 = new THREE.Vector3();
+const _dustT2 = new THREE.Vector3();
+const _dustPos = new THREE.Vector3();
+const _dustVel = new THREE.Vector3();
+const _zeroVec = new THREE.Vector3();
 
 const MAX_BOLTS = 24;
-const MAX_BURSTS = 12;
+const MAX_BURSTS = 16;
 
 interface LaserBolt {
   mesh: THREE.Mesh;
@@ -32,9 +37,11 @@ interface LaserBolt {
 interface ImpactBurst {
   mesh: THREE.Mesh;
   material: THREE.MeshBasicMaterial;
+  vel: THREE.Vector3;
   age: number;
   maxAge: number;
   maxScale: number;
+  baseOpacity: number;
   active: boolean;
 }
 
@@ -123,9 +130,11 @@ export class WeaponsSystem {
       this.bursts.push({
         mesh,
         material,
+        vel: new THREE.Vector3(),
         age: 0,
         maxAge: 0.25,
         maxScale: 4,
+        baseOpacity: 0.95,
         active: false,
       });
     }
@@ -245,9 +254,54 @@ export class WeaponsSystem {
         burst.mesh.visible = false;
         continue;
       }
+      burst.mesh.position.addScaledVector(burst.vel, dt);
       const scale = THREE.MathUtils.lerp(0.8, burst.maxScale, t);
       burst.mesh.scale.setScalar(scale);
-      burst.material.opacity = (1 - t) * 0.92;
+      burst.material.opacity = (1 - t) * burst.baseOpacity;
+    }
+  }
+
+  public spawnDust(
+    pos: THREE.Vector3,
+    normal: THREE.Vector3,
+    count: number,
+  ): void {
+    if (Math.abs(normal.y) < 0.9) {
+      _dustT1.set(0, 1, 0);
+    } else {
+      _dustT1.set(1, 0, 0);
+    }
+    _dustT1.crossVectors(_dustT1, normal).normalize();
+    _dustT2.crossVectors(normal, _dustT1).normalize();
+
+    const n = Math.min(Math.max(1, count), MAX_BURSTS);
+    for (let i = 0; i < n; i++) {
+      const angle = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+      const startOffset = 1.4 + Math.random() * 1.4;
+      const speed = 5.5 + Math.random() * 5.0;
+
+      _dustPos
+        .copy(pos)
+        .addScaledVector(normal, -1.2)
+        .addScaledVector(_dustT1, cosA * startOffset)
+        .addScaledVector(_dustT2, sinA * startOffset);
+
+      _dustVel
+        .copy(_dustT1)
+        .multiplyScalar(cosA * speed)
+        .addScaledVector(_dustT2, sinA * speed)
+        .addScaledVector(normal, 0.8 + Math.random() * 1.2);
+
+      this.spawnBurst(
+        _dustPos,
+        0xcbb89a,
+        2.0 + Math.random() * 1.4,
+        _dustVel,
+        0.55,
+        0.52,
+      );
     }
   }
 
@@ -322,6 +376,9 @@ export class WeaponsSystem {
     pos: THREE.Vector3,
     colorHex: number,
     maxScale: number,
+    vel: THREE.Vector3 = _zeroVec,
+    maxAge = 0.28,
+    baseOpacity = 0.92,
   ): void {
     let slot: ImpactBurst | null = null;
     for (let i = 0; i < this.bursts.length; i++) {
@@ -335,10 +392,12 @@ export class WeaponsSystem {
     }
     slot.active = true;
     slot.age = 0;
-    slot.maxAge = 0.28;
+    slot.maxAge = maxAge;
     slot.maxScale = maxScale;
+    slot.baseOpacity = baseOpacity;
+    slot.vel.copy(vel);
     slot.material.color.setHex(colorHex);
-    slot.material.opacity = 0.95;
+    slot.material.opacity = baseOpacity;
     slot.mesh.position.copy(pos);
     slot.mesh.scale.setScalar(0.8);
     slot.mesh.visible = true;

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { CameraMode } from '../types/simulation';
+import { CameraMode, LandingState } from '../types/simulation';
 
 // Pre-allocated math helpers outside render loop (Zero GC)
 const _shipForward = new THREE.Vector3();
@@ -9,15 +9,18 @@ const _desiredCamPos = new THREE.Vector3();
 const _desiredLookAt = new THREE.Vector3();
 const _currentLookAt = new THREE.Vector3();
 const _camUp = new THREE.Vector3(0, 1, 0);
+const _camOffset = new THREE.Vector3();
+const _yawQuat = new THREE.Quaternion();
 
 /**
  * Manages PerspectiveCamera, OrbitControls, chase/tactical/cockpit/orbit views,
- * speed-driven FOV, and atmospheric re-entry camera shake.
+ * speed-driven FOV, relaxed landed chase framing, and atmospheric re-entry camera shake.
  */
 export class CameraRig {
   public readonly camera: THREE.PerspectiveCamera;
   private readonly controls: OrbitControls;
   private userOrbiting = false;
+  private landedCamBlend = 0;
 
   constructor(
     domElement: HTMLElement,
@@ -25,9 +28,15 @@ export class CameraRig {
     height: number,
     initialMode: CameraMode,
     isSoftwareGl: boolean,
+    initialPlanetRadius: number,
   ) {
     // Near plane raised to 0.6 intentionally to reduce depth fighting along planet borders
-    this.camera = new THREE.PerspectiveCamera(62, width / height, 0.6, 2800);
+    this.camera = new THREE.PerspectiveCamera(
+      62,
+      width / height,
+      0.6,
+      initialPlanetRadius * 12,
+    );
 
     this.controls = new OrbitControls(this.camera, domElement);
     this.controls.enableDamping = !isSoftwareGl;
@@ -41,6 +50,14 @@ export class CameraRig {
     this.controls.addEventListener('end', () => {
       this.userOrbiting = false;
     });
+  }
+
+  public setPlanetRadius(planetRadius: number): void {
+    const nextFar = planetRadius * 12;
+    if (this.camera.far !== nextFar) {
+      this.camera.far = nextFar;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   public setMode(mode: CameraMode, shipPos: THREE.Vector3): void {
@@ -60,7 +77,9 @@ export class CameraRig {
     camPos: THREE.Vector3,
     lookAt: THREE.Vector3,
     up: THREE.Vector3,
+    isLanded = false,
   ): void {
+    this.landedCamBlend = isLanded ? 1 : 0;
     _camUp.copy(up);
     this.camera.up.copy(_camUp);
     this.camera.position.copy(camPos);
@@ -78,9 +97,26 @@ export class CameraRig {
       speed: number;
       maxSpeed: number;
       reentryIntensity: number;
+      landingState: LandingState;
     },
   ): void {
-    const { mode, shipPos, shipQuat, speed, maxSpeed, reentryIntensity } = params;
+    const {
+      mode,
+      shipPos,
+      shipQuat,
+      speed,
+      maxSpeed,
+      reentryIntensity,
+      landingState,
+    } = params;
+
+    const targetLandedBlend = landingState === 'landed' ? 1 : 0;
+    this.landedCamBlend = THREE.MathUtils.damp(
+      this.landedCamBlend,
+      targetLandedBlend,
+      targetLandedBlend > 0.5 ? 2.2 : 2.8,
+      dt,
+    );
 
     if (mode === 'orbit') {
       if (!this.userOrbiting) {
@@ -111,13 +147,28 @@ export class CameraRig {
     _shipUp.set(0, 1, 0).applyQuaternion(shipQuat);
 
     if (mode === 'chase') {
-      // Positioned slightly above & behind the ship while converging forward at 135m
-      // so the centered crosshair (50%, 50%) aligns cleanly above the starfighter silhouette
+      const chaseBack = 13.5 * (1 + 0.25 * this.landedCamBlend);
+      const chaseUp = 3.8 + 1.4 * this.landedCamBlend;
+      const yawSway =
+        THREE.MathUtils.degToRad(6) *
+        Math.sin(elapsed * ((Math.PI * 2) / 14)) *
+        this.landedCamBlend;
+
+      _camOffset.copy(_shipForward).multiplyScalar(-chaseBack);
+      if (Math.abs(yawSway) > 0.00001) {
+        _yawQuat.setFromAxisAngle(_shipUp, yawSway);
+        _camOffset.applyQuaternion(_yawQuat);
+      }
       _desiredCamPos
         .copy(shipPos)
-        .addScaledVector(_shipForward, -13.5)
-        .addScaledVector(_shipUp, 3.8);
-      _desiredLookAt.copy(shipPos).addScaledVector(_shipForward, 135);
+        .add(_camOffset)
+        .addScaledVector(_shipUp, chaseUp);
+
+      const lookForward = THREE.MathUtils.lerp(135, 4, this.landedCamBlend);
+      _desiredLookAt
+        .copy(shipPos)
+        .addScaledVector(_shipForward, lookForward)
+        .addScaledVector(_shipUp, 0.6 * this.landedCamBlend);
     } else if (mode === 'tactical') {
       _desiredCamPos
         .copy(shipPos)

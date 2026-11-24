@@ -80,6 +80,11 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
               {telemetry.altitude.toFixed(0)}
             </strong>{' '}
             m
+            {telemetry.biome ? (
+              <span className="ml-1.5 text-slate-400 font-normal">
+                · {telemetry.biome}
+              </span>
+            ) : null}
           </span>
           <span className="text-slate-600" aria-hidden="true">
             ·
@@ -511,13 +516,13 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
             )}
 
             {activeTab === 'planet' && (
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 sm:gap-4 items-end">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4 items-end">
                 <SliderRow
                   id="planetRadius"
                   label="Raio Planeta"
                   value={config.planet.planetRadius}
                   min={100}
-                  max={320}
+                  max={700}
                   step={10}
                   unit="m"
                   activeSliderId={activeSliderId}
@@ -534,7 +539,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                   label="Altura Relevos"
                   value={config.planet.maxHeight}
                   min={2}
-                  max={24}
+                  max={28}
                   step={1}
                   unit="m"
                   activeSliderId={activeSliderId}
@@ -568,7 +573,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                   label="Atmosfera"
                   value={config.planet.atmosphereHeight}
                   min={25}
-                  max={120}
+                  max={140}
                   step={5}
                   unit="m"
                   activeSliderId={activeSliderId}
@@ -577,6 +582,23 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                     onUpdateConfig((prev) => ({
                       ...prev,
                       planet: { ...prev.planet, atmosphereHeight: v },
+                    }))
+                  }
+                />
+                <SliderRow
+                  id="seaLevel"
+                  label="Nível do mar"
+                  value={config.planet.seaLevel}
+                  min={-0.6}
+                  max={0.4}
+                  step={0.01}
+                  decimals={2}
+                  activeSliderId={activeSliderId}
+                  onStartDrag={onActiveSliderChange}
+                  onChange={(v) =>
+                    onUpdateConfig((prev) => ({
+                      ...prev,
+                      planet: { ...prev.planet, seaLevel: v },
                     }))
                   }
                 />
@@ -725,7 +747,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                 <p className="text-xs text-slate-400">
                   {config.cameraMode === 'orbit'
                     ? 'Arraste para girar a câmera e use pinça/scroll para zoom.'
-                    : 'Segure na tela para atirar · T Travar Alvo · W/S/A/D/E/Q Voar · Espaço Turbo.'}
+                    : 'Segure na tela para atirar · T Travar Alvo · W/S/A/D/E/Q Voar · Espaço Turbo · L — Pousar / Decolar.'}
                 </p>
               </div>
             )}

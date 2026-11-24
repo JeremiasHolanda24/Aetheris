@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { GEAR_REST_HEIGHT } from './LandingController';
 
 export interface ShipModelHandle {
   group: THREE.Group;
@@ -6,6 +7,7 @@ export interface ShipModelHandle {
   rightFlame: THREE.Mesh;
   thrusterLight: THREE.PointLight | null;
   flameMaterial: THREE.MeshBasicMaterial;
+  setGearExtension: (t: number) => void;
   updateEffects: (
     elapsed: number,
     thrustPower: number,
@@ -434,7 +436,67 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   rightFin.rotation.z = -0.28;
   group.add(rightFin);
 
-  // 10. Dynamic Thruster Glow Light (skip extra per-pixel point light on mobile/software GL)
+  // 10. Retractable Tricycle Landing Gear calibrated so foot bottoms reach -GEAR_REST_HEIGHT
+  const landingGear = new THREE.Group();
+  landingGear.visible = false;
+  group.add(landingGear);
+
+  const gearPivotY = -0.05;
+  const gearReach = GEAR_REST_HEIGHT + gearPivotY; // 1.65 below pivot -> -1.70 total
+  const footHeight = 0.08;
+  const strutLen = 0.92;
+  const pistonLen = 0.92;
+
+  const gearStrutGeo = trackGeo(new THREE.CylinderGeometry(0.07, 0.065, strutLen, 8));
+  const gearPistonGeo = trackGeo(new THREE.CylinderGeometry(0.05, 0.055, pistonLen, 8));
+  const gearFootGeo = trackGeo(new THREE.CylinderGeometry(0.22, 0.26, footHeight, 12));
+
+  const gearLegOffsets: Array<[number, number]> = [
+    [0, -1.42],   // Nose strut
+    [-0.92, 0.72], // Left main strut
+    [0.92, 0.72],  // Right main strut
+  ];
+  const gearLegs: THREE.Group[] = [];
+
+  for (let i = 0; i < gearLegOffsets.length; i++) {
+    const [gx, gz] = gearLegOffsets[i];
+    const legGroup = new THREE.Group();
+    legGroup.position.set(gx, gearPivotY, gz);
+    legGroup.scale.setScalar(0.001);
+
+    const strut = new THREE.Mesh(gearStrutGeo, darkTrimMat);
+    strut.position.y = -strutLen * 0.5;
+    strut.castShadow = !isMobileOrSoftware;
+    legGroup.add(strut);
+
+    const piston = new THREE.Mesh(gearPistonGeo, engineMetalMat);
+    piston.position.y = -(gearReach - footHeight - pistonLen * 0.5);
+    piston.castShadow = !isMobileOrSoftware;
+    legGroup.add(piston);
+
+    const foot = new THREE.Mesh(gearFootGeo, darkTrimMat);
+    foot.position.y = -(gearReach - footHeight * 0.5);
+    foot.castShadow = !isMobileOrSoftware;
+    legGroup.add(foot);
+
+    landingGear.add(legGroup);
+    gearLegs.push(legGroup);
+  }
+
+  const setGearExtension = (t: number) => {
+    const s = THREE.MathUtils.smoothstep(THREE.MathUtils.clamp(t, 0, 1), 0, 1);
+    if (s < 0.02) {
+      landingGear.visible = false;
+      return;
+    }
+    landingGear.visible = true;
+    const xzScale = 0.35 + 0.65 * s;
+    for (let i = 0; i < gearLegs.length; i++) {
+      gearLegs[i].scale.set(xzScale, s, xzScale);
+    }
+  };
+
+  // 11. Dynamic Thruster Glow Light (skip extra per-pixel point light on mobile/software GL)
   let thrusterLight: THREE.PointLight | null = null;
   if (!isMobileOrSoftware) {
     thrusterLight = new THREE.PointLight(0x38bdf8, 1.5, 18);
@@ -448,6 +510,7 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     rightFlame,
     thrusterLight,
     flameMaterial,
+    setGearExtension,
     updateEffects: (
       elapsed: number,
       thrustPower: number,
@@ -471,12 +534,16 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
         machRingMaterial.color.setHex(0x7dd3fc);
       }
 
+      const showFlames = leftFlame.visible;
+      leftCoreFlame.visible = showFlames;
+      rightCoreFlame.visible = rightFlame.visible;
+
       const coreLength = leftFlame.scale.z * 0.85;
       const coreWidth = 0.82 + thrustPower * 0.35;
       leftCoreFlame.scale.set(coreWidth, coreWidth, coreLength);
       rightCoreFlame.scale.set(coreWidth, coreWidth, coreLength);
 
-      const showRing = thrustPower > 0.25;
+      const showRing = showFlames && thrustPower > 0.25;
       leftRing.visible = showRing;
       rightRing.visible = showRing;
       if (showRing) {

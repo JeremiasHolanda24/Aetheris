@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { PlanetParams } from '../types/simulation';
-import { getPlanetTerrainHeight, spherifyCubePoint } from './terrainMath';
+import { getBiomeColor } from './biomes';
+import {
+  getPlanetSurfaceHeight,
+  getPlanetTerrainHeight,
+  spherifyCubePoint,
+} from './terrainMath';
 
 interface CubeFaceBasis {
   normal: [number, number, number];
@@ -18,8 +23,20 @@ const CUBE_FACES: CubeFaceBasis[] = [
   { normal: [0, 0, -1], uAxis: [-1, 0, 0], vAxis: [0, 1, 0] }, // -Z
 ];
 
-const PATCH_SUBDIV = 3;
+const PATCH_SUBDIV = 4;
 const PATCH_SEGMENTS = 20;
+const MOON_RADIUS_RATIO = 0.145;
+const _camDir = new THREE.Vector3();
+const _nDir = new THREE.Vector3();
+const _nT1 = new THREE.Vector3();
+const _nT2 = new THREE.Vector3();
+const _nSample = new THREE.Vector3();
+const _nP1a = new THREE.Vector3();
+const _nP1b = new THREE.Vector3();
+const _nP2a = new THREE.Vector3();
+const _nP2b = new THREE.Vector3();
+const _nD1 = new THREE.Vector3();
+const _nD2 = new THREE.Vector3();
 
 function hash2(x: number, y: number): number {
   const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
@@ -99,7 +116,7 @@ function createPlanetSurfaceTexture(): THREE.CanvasTexture {
 
 /**
  * 3D Procedural Spherical Planet Manager:
- * - 100% continuous terrain across all 54 Cube-Sphere patches (no black ocean cutouts)
+ * - 100% continuous terrain across all 96 Cube-Sphere patches (no black ocean cutouts)
  * - Rich blue & purple planetary elevation colors + seamless triplanar mineral texture
  * - Cyan-to-Violet Fresnel atmosphere halo shell
  * - Distant orbiting moon
@@ -113,6 +130,8 @@ export class PlanetTerrainManager {
     pv: number;
     mesh: THREE.Mesh;
     geometry: THREE.BufferGeometry;
+    centerDir: THREE.Vector3;
+    angularRadius: number;
   }> = [];
 
   private sharedIndices: THREE.BufferAttribute;
@@ -130,14 +149,19 @@ export class PlanetTerrainManager {
   private moonGeo: THREE.IcosahedronGeometry;
   private moonMat: THREE.MeshStandardMaterial;
   private readonly moonCenter = new THREE.Vector3();
+  private readonly prevMoonCenter = new THREE.Vector3();
+  private readonly moonVelocity = new THREE.Vector3();
+  private readonly moonWorldQuat = new THREE.Quaternion();
+  private lastUpdateElapsed = 0;
+  private readonly moonState = {
+    center: this.moonCenter,
+    radius: 0,
+    moonVelocity: this.moonVelocity,
+    moonQuat: this.moonWorldQuat,
+  };
 
   private params: PlanetParams;
 
-  // 100% Blue & Purple terrain palette (no dark/black valleys)
-  private readonly valleyBlueColor = new THREE.Color(0x1d4ed8);   // Vivid Cobalt Blue
-  private readonly midIndigoColor = new THREE.Color(0x4338ca);    // Deep Electric Indigo
-  private readonly ridgePurpleColor = new THREE.Color(0x7c3aed);  // Vibrant Amethyst Purple
-  private readonly peakLavenderColor = new THREE.Color(0xc4b5fd); // Bright Violet-Lavender Peaks
   private readonly tempColor = new THREE.Color();
 
   constructor(initialParams: PlanetParams) {
@@ -182,7 +206,7 @@ export class PlanetTerrainManager {
       roughness: 0.72,
       metalness: 0.12,
       envMapIntensity: 0.4,
-      emissive: new THREE.Color(0x16123d),
+      emissive: new THREE.Color(0x0a0f14),
       emissiveIntensity: 0.25,
       wireframe: initialParams.wireframe,
       side: THREE.FrontSide,
@@ -228,7 +252,8 @@ export class PlanetTerrainManager {
           vec3 ty = texture2D(uDetailTex, vPlanetPos.xz * texScale).rgb;
           vec3 tz = texture2D(uDetailTex, vPlanetPos.xy * texScale).rgb;
           vec3 detailTint = tx * triW.x + ty * triW.y + tz * triW.z;
-          diffuseColor.rgb *= mix(vec3(1.0), detailTint * 1.18, 0.7);
+          float lum = dot(detailTint, vec3(0.299, 0.587, 0.114));
+          diffuseColor.rgb *= mix(1.0, lum * 1.5, 0.45);
 
           if (uShowContours > 0.5) {
             float r = length(vPlanetPos);
@@ -249,9 +274,16 @@ export class PlanetTerrainManager {
         );
     };
 
+    const patchSpan = 2 / PATCH_SUBDIV;
     for (let f = 0; f < CUBE_FACES.length; f++) {
+      const face = CUBE_FACES[f];
       for (let pv = 0; pv < PATCH_SUBDIV; pv++) {
+        const vStart = -1 + pv * patchSpan;
+        const vMid = vStart + patchSpan * 0.5;
         for (let pu = 0; pu < PATCH_SUBDIV; pu++) {
+          const uStart = -1 + pu * patchSpan;
+          const uMid = uStart + patchSpan * 0.5;
+
           const geometry = new THREE.BufferGeometry();
           geometry.setAttribute(
             'position',
@@ -273,7 +305,44 @@ export class PlanetTerrainManager {
           mesh.castShadow = false;
           this.root.add(mesh);
 
-          this.patches.push({ faceIdx: f, pu, pv, mesh, geometry });
+          const cMid = spherifyCubePoint(
+            face.normal[0] + uMid * face.uAxis[0] + vMid * face.vAxis[0],
+            face.normal[1] + uMid * face.uAxis[1] + vMid * face.vAxis[1],
+            face.normal[2] + uMid * face.uAxis[2] + vMid * face.vAxis[2],
+          );
+          const centerDir = new THREE.Vector3(cMid.nx, cMid.ny, cMid.nz).normalize();
+
+          let angularRadius = 0;
+          for (let py = 0; py <= PATCH_SEGMENTS; py++) {
+            const v = vStart + (py / PATCH_SEGMENTS) * patchSpan;
+            for (let px = 0; px <= PATCH_SEGMENTS; px++) {
+              const u = uStart + (px / PATCH_SEGMENTS) * patchSpan;
+              const { nx, ny, nz } = spherifyCubePoint(
+                face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
+                face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
+                face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
+              );
+              const dot = THREE.MathUtils.clamp(
+                centerDir.x * nx + centerDir.y * ny + centerDir.z * nz,
+                -1,
+                1,
+              );
+              const angle = Math.acos(dot);
+              if (angle > angularRadius) {
+                angularRadius = angle;
+              }
+            }
+          }
+
+          this.patches.push({
+            faceIdx: f,
+            pu,
+            pv,
+            mesh,
+            geometry,
+            centerDir,
+            angularRadius,
+          });
         }
       }
     }
@@ -317,8 +386,8 @@ export class PlanetTerrainManager {
     this.atmosphereMesh.renderOrder = 4;
     this.root.add(this.atmosphereMesh);
 
-    // Distant Orbiting Moon
-    this.moonGeo = new THREE.IcosahedronGeometry(26, 2);
+    // Distant Orbiting Moon (unit radius geometry scaled to planetRadius * MOON_RADIUS_RATIO)
+    this.moonGeo = new THREE.IcosahedronGeometry(1, 2);
     this.moonMat = new THREE.MeshStandardMaterial({
       color: 0x8b92c4,
       roughness: 0.85,
@@ -337,13 +406,37 @@ export class PlanetTerrainManager {
     return this.patches.length;
   }
 
-  public getMoonState(): { center: THREE.Vector3; radius: number } {
+  public getMoonState(): {
+    center: THREE.Vector3;
+    radius: number;
+    moonVelocity: THREE.Vector3;
+    moonQuat: THREE.Quaternion;
+  } {
     this.moonMesh.getWorldPosition(this.moonCenter);
-    return { center: this.moonCenter, radius: 26 };
+    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
+    this.moonState.radius = this.params.planetRadius * MOON_RADIUS_RATIO;
+    return this.moonState;
   }
 
   public getSurfaceRadiusAt(nx: number, ny: number, nz: number): number {
-    const h = getPlanetTerrainHeight(
+    const h = getPlanetSurfaceHeight(
+      nx,
+      ny,
+      nz,
+      this.params.planetRadius,
+      this.params.noiseScale,
+      this.params.maxHeight,
+      this.params.seaLevel,
+    );
+    return this.params.planetRadius + h;
+  }
+
+  public getSeaLevel(): number {
+    return this.params.seaLevel;
+  }
+
+  public getRawHeightNormAt(nx: number, ny: number, nz: number): number {
+    const rawH = getPlanetTerrainHeight(
       nx,
       ny,
       nz,
@@ -351,19 +444,160 @@ export class PlanetTerrainManager {
       this.params.noiseScale,
       this.params.maxHeight,
     );
-    return this.params.planetRadius + h;
+    return rawH / Math.max(this.params.maxHeight, 0.001);
   }
 
-  public update(elapsed: number): void {
+  public getSurfaceNormalAt(
+    dx: number,
+    dy: number,
+    dz: number,
+    out: THREE.Vector3,
+  ): THREE.Vector3 {
+    const eps = 0.004;
+    _nDir.set(dx, dy, dz);
+    if (_nDir.lengthSq() < 1e-8) {
+      _nDir.set(0, 1, 0);
+    } else {
+      _nDir.normalize();
+    }
+
+    if (Math.abs(_nDir.y) < 0.9) {
+      _nT1.set(0, 1, 0);
+    } else {
+      _nT1.set(1, 0, 0);
+    }
+    _nT1.crossVectors(_nT1, _nDir).normalize();
+    _nT2.crossVectors(_nDir, _nT1).normalize();
+
+    _nSample.copy(_nDir).addScaledVector(_nT1, eps).normalize();
+    const r1a = this.getSurfaceRadiusAt(_nSample.x, _nSample.y, _nSample.z);
+    _nP1a.copy(_nSample).multiplyScalar(r1a);
+
+    _nSample.copy(_nDir).addScaledVector(_nT1, -eps).normalize();
+    const r1b = this.getSurfaceRadiusAt(_nSample.x, _nSample.y, _nSample.z);
+    _nP1b.copy(_nSample).multiplyScalar(r1b);
+
+    _nSample.copy(_nDir).addScaledVector(_nT2, eps).normalize();
+    const r2a = this.getSurfaceRadiusAt(_nSample.x, _nSample.y, _nSample.z);
+    _nP2a.copy(_nSample).multiplyScalar(r2a);
+
+    _nSample.copy(_nDir).addScaledVector(_nT2, -eps).normalize();
+    const r2b = this.getSurfaceRadiusAt(_nSample.x, _nSample.y, _nSample.z);
+    _nP2b.copy(_nSample).multiplyScalar(r2b);
+
+    _nD1.subVectors(_nP1a, _nP1b);
+    _nD2.subVectors(_nP2a, _nP2b);
+    out.crossVectors(_nD1, _nD2);
+
+    if (out.dot(_nDir) < 0) {
+      out.negate();
+    }
+    if (out.lengthSq() < 1e-10) {
+      out.copy(_nDir);
+    } else {
+      out.normalize();
+    }
+    return out;
+  }
+
+  public findLandDirection(
+    startIndex: number,
+    out: THREE.Vector3,
+  ): THREE.Vector3 {
+    const totalSamples = 512;
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    const safeMaxH = Math.max(this.params.maxHeight, 0.001);
+    const minNorm = this.params.seaLevel + 0.12;
+    const start = ((Math.floor(startIndex) % totalSamples) + totalSamples) % totalSamples;
+
+    let bestNx = 0;
+    let bestNy = 0;
+    let bestNz = 1;
+    let bestRawNorm = -Infinity;
+
+    for (let step = 0; step < totalSamples; step++) {
+      const idx = (start + step) % totalSamples;
+      const ny = 1 - (2 * (idx + 0.5)) / totalSamples;
+      if (Math.abs(ny) >= 0.6) continue;
+
+      const rAtY = Math.sqrt(Math.max(0, 1 - ny * ny));
+      const theta = idx * goldenAngle;
+      const nx = Math.cos(theta) * rAtY;
+      const nz = Math.sin(theta) * rAtY;
+
+      const rawNorm =
+        getPlanetTerrainHeight(
+          nx,
+          ny,
+          nz,
+          this.params.planetRadius,
+          this.params.noiseScale,
+          this.params.maxHeight,
+        ) / safeMaxH;
+
+      if (rawNorm > minNorm) {
+        return out.set(nx, ny, nz).normalize();
+      }
+      if (rawNorm > bestRawNorm) {
+        bestRawNorm = rawNorm;
+        bestNx = nx;
+        bestNy = ny;
+        bestNz = nz;
+      }
+    }
+
+    return out.set(bestNx, bestNy, bestNz).normalize();
+  }
+
+  public update(elapsed: number, cameraPos?: THREE.Vector3, dt?: number): void {
+    this.moonMesh.getWorldPosition(this.prevMoonCenter);
     this.moonPivot.rotation.y = elapsed * 0.035;
     this.moonMesh.rotation.y = elapsed * 0.08;
+    this.moonMesh.getWorldPosition(this.moonCenter);
+    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
+
+    const stepDt = dt !== undefined ? dt : elapsed - this.lastUpdateElapsed;
+    this.lastUpdateElapsed = elapsed;
+    if (stepDt > 0.0001) {
+      this.moonVelocity
+        .subVectors(this.moonCenter, this.prevMoonCenter)
+        .divideScalar(stepDt);
+    } else {
+      this.moonVelocity.set(0, 0, 0);
+    }
+
+    if (cameraPos) {
+      this.updateHorizonCulling(cameraPos);
+    }
+  }
+
+  public updateHorizonCulling(cameraPos: THREE.Vector3): void {
+    const camDist = cameraPos.length();
+    if (camDist <= this.params.planetRadius) {
+      for (let i = 0; i < this.patches.length; i++) {
+        this.patches[i].mesh.visible = true;
+      }
+      return;
+    }
+
+    _camDir.copy(cameraPos).divideScalar(camDist);
+    const horizonAngle =
+      Math.acos(this.params.planetRadius / camDist) + 0.05;
+
+    for (let i = 0; i < this.patches.length; i++) {
+      const patch = this.patches[i];
+      const dot = THREE.MathUtils.clamp(_camDir.dot(patch.centerDir), -1, 1);
+      const angle = Math.acos(dot);
+      patch.mesh.visible = angle <= horizonAngle + patch.angularRadius;
+    }
   }
 
   public updateParams(next: PlanetParams): void {
     const geoChanged =
       next.planetRadius !== this.params.planetRadius ||
       next.maxHeight !== this.params.maxHeight ||
-      next.noiseScale !== this.params.noiseScale;
+      next.noiseScale !== this.params.noiseScale ||
+      next.seaLevel !== this.params.seaLevel;
 
     const atmoChanged =
       next.atmosphereHeight !== this.params.atmosphereHeight ||
@@ -384,7 +618,12 @@ export class PlanetTerrainManager {
     const { planetRadius, atmosphereHeight } = this.params;
     const atmoRadius = planetRadius + Math.max(15, atmosphereHeight * 1.15);
     this.atmosphereMesh.scale.setScalar(atmoRadius);
+    this.moonMesh.scale.setScalar(planetRadius * MOON_RADIUS_RATIO);
     this.moonMesh.position.set(planetRadius * 2.55, planetRadius * 0.45, 0);
+    this.moonMesh.getWorldPosition(this.moonCenter);
+    this.prevMoonCenter.copy(this.moonCenter);
+    this.moonVelocity.set(0, 0, 0);
+    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
   }
 
   private computeSmoothTerrainNormal(
@@ -394,6 +633,7 @@ export class PlanetTerrainManager {
     planetRadius: number,
     noiseScale: number,
     maxHeight: number,
+    seaLevel: number,
   ): [number, number, number] {
     const eps = 0.008;
     const ax = Math.abs(ny) < 0.9 ? 0 : 1;
@@ -419,7 +659,15 @@ export class PlanetTerrainManager {
       const uz = dz / len;
       const r =
         planetRadius +
-        getPlanetTerrainHeight(ux, uy, uz, planetRadius, noiseScale, maxHeight);
+        getPlanetSurfaceHeight(
+          ux,
+          uy,
+          uz,
+          planetRadius,
+          noiseScale,
+          maxHeight,
+          seaLevel,
+        );
       return [ux * r, uy * r, uz * r];
     };
 
@@ -449,8 +697,9 @@ export class PlanetTerrainManager {
   }
 
   private rebuildPlanet(): void {
-    const { planetRadius, maxHeight, noiseScale } = this.params;
+    const { planetRadius, maxHeight, noiseScale, seaLevel } = this.params;
     const safeMaxH = Math.max(maxHeight, 0.001);
+    const seaFloorH = seaLevel * maxHeight;
     const patchSpan = 2 / PATCH_SUBDIV;
 
     for (const patch of this.patches) {
@@ -486,7 +735,7 @@ export class PlanetTerrainManager {
             face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2];
 
           const { nx, ny, nz } = spherifyCubePoint(cx, cy, cz);
-          const h = getPlanetTerrainHeight(
+          const rawH = getPlanetTerrainHeight(
             nx,
             ny,
             nz,
@@ -494,6 +743,7 @@ export class PlanetTerrainManager {
             noiseScale,
             maxHeight,
           );
+          const h = Math.max(rawH, seaFloorH);
           const r = planetRadius + h;
 
           positions[vi * 3] = nx * r;
@@ -507,31 +757,14 @@ export class PlanetTerrainManager {
             planetRadius,
             noiseScale,
             maxHeight,
+            seaLevel,
           );
           normals[vi * 3] = snx;
           normals[vi * 3 + 1] = sny;
           normals[vi * 3 + 2] = snz;
 
-          const t = THREE.MathUtils.clamp((h / safeMaxH + 0.85) / 1.7, 0, 1);
-          if (t < 0.35) {
-            this.tempColor.lerpColors(
-              this.valleyBlueColor,
-              this.midIndigoColor,
-              t / 0.35,
-            );
-          } else if (t < 0.72) {
-            this.tempColor.lerpColors(
-              this.midIndigoColor,
-              this.ridgePurpleColor,
-              (t - 0.35) / 0.37,
-            );
-          } else {
-            this.tempColor.lerpColors(
-              this.ridgePurpleColor,
-              this.peakLavenderColor,
-              (t - 0.72) / 0.28,
-            );
-          }
+          const rawHeightNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
+          getBiomeColor(nx, ny, nz, rawHeightNorm, seaLevel, this.tempColor);
 
           colors[vi * 3] = this.tempColor.r;
           colors[vi * 3 + 1] = this.tempColor.g;

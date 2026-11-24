@@ -18,8 +18,10 @@ export class SoundEngine {
 
   private reentrySource: AudioBufferSourceNode | null = null;
   private reentryGain: GainNode | null = null;
+  private noiseBuffer: AudioBuffer | null = null;
   private lastLaserTime = 0;
   private muted = false;
+  private paused = false;
   private disposed = false;
 
   constructor() {
@@ -82,6 +84,7 @@ export class SoundEngine {
   }
 
   public setPaused(paused: boolean): void {
+    this.paused = paused;
     if (!this.ctx || this.disposed) return;
     if (paused) {
       void this.ctx.suspend();
@@ -115,11 +118,24 @@ export class SoundEngine {
     this.reentryBuffer = reentry;
   }
 
+  private getNoiseBuffer(ctx: AudioContext): AudioBuffer {
+    if (this.noiseBuffer) return this.noiseBuffer;
+    const length = Math.max(1, Math.floor(ctx.sampleRate * 0.16));
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    this.noiseBuffer = buffer;
+    return buffer;
+  }
+
   public playLaser(): void {
     this.unlock();
     if (
       this.disposed ||
       this.muted ||
+      this.paused ||
       !this.ctx ||
       !this.compressor ||
       !this.laserBuffer
@@ -150,6 +166,107 @@ export class SoundEngine {
     source.start(now, 0, Math.min(this.laserBuffer.duration, 1.4));
   }
 
+  public playGear(extending: boolean): void {
+    if (
+      this.disposed ||
+      this.muted ||
+      this.paused ||
+      !this.ctx ||
+      !this.compressor ||
+      this.ctx.state !== 'running'
+    ) {
+      return;
+    }
+
+    const now = this.ctx.currentTime;
+    const dur = 0.6;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(extending ? 180 : 260, now);
+    osc.frequency.linearRampToValueAtTime(extending ? 260 : 180, now + dur);
+
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(extending ? 420 : 520, now);
+    filter.frequency.linearRampToValueAtTime(extending ? 580 : 380, now + dur);
+    filter.Q.value = 3.0;
+
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.linearRampToValueAtTime(0.05, now + 0.04);
+    gain.gain.setValueAtTime(0.05, now + dur - 0.08);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.compressor);
+
+    osc.onended = () => {
+      osc.disconnect();
+      filter.disconnect();
+      gain.disconnect();
+    };
+    osc.start(now);
+    osc.stop(now + dur + 0.01);
+  }
+
+  public playTouchdown(): void {
+    if (
+      this.disposed ||
+      this.muted ||
+      this.paused ||
+      !this.ctx ||
+      !this.compressor ||
+      this.ctx.state !== 'running'
+    ) {
+      return;
+    }
+
+    const now = this.ctx.currentTime;
+    const thumpDur = 0.25;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(90, now);
+    osc.frequency.exponentialRampToValueAtTime(40, now + thumpDur);
+
+    const thumpGain = this.ctx.createGain();
+    thumpGain.gain.setValueAtTime(0.2, now);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + thumpDur);
+
+    osc.connect(thumpGain);
+    thumpGain.connect(this.compressor);
+
+    osc.onended = () => {
+      osc.disconnect();
+      thumpGain.disconnect();
+    };
+    osc.start(now);
+    osc.stop(now + thumpDur + 0.01);
+
+    const noiseDur = 0.14;
+    const noiseSrc = this.ctx.createBufferSource();
+    noiseSrc.buffer = this.getNoiseBuffer(this.ctx);
+
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(400, now);
+
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.2, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + noiseDur);
+
+    noiseSrc.connect(lp);
+    lp.connect(noiseGain);
+    noiseGain.connect(this.compressor);
+
+    noiseSrc.onended = () => {
+      noiseSrc.disconnect();
+      lp.disconnect();
+      noiseGain.disconnect();
+    };
+    noiseSrc.start(now, 0, noiseDur);
+  }
+
   public updateAtmosphereEntry(reentryIntensity: number): void {
     if (
       this.disposed ||
@@ -161,7 +278,7 @@ export class SoundEngine {
     }
 
     const now = this.ctx.currentTime;
-    const active = !this.muted && reentryIntensity > 0.04;
+    const active = !this.muted && !this.paused && reentryIntensity > 0.04;
 
     if (active && !this.reentrySource) {
       const source = this.ctx.createBufferSource();
@@ -212,6 +329,7 @@ export class SoundEngine {
 
   public dispose(): void {
     this.disposed = true;
+    this.noiseBuffer = null;
     if (this.reentrySource) {
       try {
         this.reentrySource.stop();
