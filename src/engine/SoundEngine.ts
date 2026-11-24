@@ -1,7 +1,5 @@
-const LASER_AUDIO_URL =
-  '/assets/audio/Spaceship_laser_cann__3-1795449680461_a36c0711.mp3';
-const ATMOSPHERE_ENTRY_AUDIO_URL =
-  '/assets/audio/Spaceship_entering_p__3-1795449171341_080b202b.mp3';
+const LASER_AUDIO_URL = `${import.meta.env.BASE_URL}assets/audio/Spaceship_laser_cann__3-1795449680461_a36c0711.mp3`;
+const ATMOSPHERE_ENTRY_AUDIO_URL = `${import.meta.env.BASE_URL}assets/audio/Spaceship_entering_p__3-1795449171341_080b202b.mp3`;
 
 /**
  * Low-latency Web Audio engine for Starfighter laser cannon bursts
@@ -14,6 +12,8 @@ export class SoundEngine {
 
   private laserBuffer: AudioBuffer | null = null;
   private reentryBuffer: AudioBuffer | null = null;
+  private rawLaser: Promise<ArrayBuffer | null>;
+  private rawReentry: Promise<ArrayBuffer | null>;
   private loadStarted = false;
 
   private reentrySource: AudioBufferSourceNode | null = null;
@@ -21,6 +21,15 @@ export class SoundEngine {
   private lastLaserTime = 0;
   private muted = false;
   private disposed = false;
+
+  constructor() {
+    const fetchRaw = (url: string) =>
+      fetch(url)
+        .then((r) => (r.ok ? r.arrayBuffer() : null))
+        .catch(() => null);
+    this.rawLaser = fetchRaw(LASER_AUDIO_URL);
+    this.rawReentry = fetchRaw(ATMOSPHERE_ENTRY_AUDIO_URL);
+  }
 
   public unlock(): void {
     if (this.disposed) return;
@@ -72,15 +81,24 @@ export class SoundEngine {
     return this.muted;
   }
 
+  public setPaused(paused: boolean): void {
+    if (!this.ctx || this.disposed) return;
+    if (paused) {
+      void this.ctx.suspend();
+    } else if (this.ctx.state === 'suspended') {
+      void this.ctx.resume();
+    }
+  }
+
   private async loadBuffers(): Promise<void> {
     if (!this.ctx || this.disposed) return;
 
-    const decodeUrl = async (url: string): Promise<AudioBuffer | null> => {
+    const decodeRaw = async (
+      rawPromise: Promise<ArrayBuffer | null>,
+    ): Promise<AudioBuffer | null> => {
       try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const arr = await res.arrayBuffer();
-        if (!this.ctx || this.disposed) return null;
+        const arr = await rawPromise;
+        if (!arr || !this.ctx || this.disposed) return null;
         return await this.ctx.decodeAudioData(arr);
       } catch {
         return null;
@@ -88,8 +106,8 @@ export class SoundEngine {
     };
 
     const [laser, reentry] = await Promise.all([
-      decodeUrl(LASER_AUDIO_URL),
-      decodeUrl(ATMOSPHERE_ENTRY_AUDIO_URL),
+      decodeRaw(this.rawLaser),
+      decodeRaw(this.rawReentry),
     ]);
 
     if (this.disposed) return;

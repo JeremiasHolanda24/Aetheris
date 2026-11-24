@@ -558,6 +558,7 @@ export class FlightEngine {
     this.boundOnBlur = () => this.releaseAllInputs();
     this.boundOnVisibilityChange = () => {
       if (document.hidden) this.releaseAllInputs();
+      this.soundEngine.setPaused(document.hidden);
     };
     window.addEventListener('blur', this.boundOnBlur);
     document.addEventListener('visibilitychange', this.boundOnVisibilityChange);
@@ -1024,7 +1025,9 @@ export class FlightEngine {
       (1 - THREE.MathUtils.smoothstep(altitude, atmosphereHeight * 0.88, atmosphereHeight * 1.25));
     const diveHeat = THREE.MathUtils.clamp((radialSpeedInward - 2.5) / 18, 0, 1);
     const speedHeat = THREE.MathUtils.clamp((speed - 22) / 30, 0, 1);
-    const targetReentry = atmoEntryBand * Math.max(diveHeat, speedHeat * 0.65);
+    const descending = THREE.MathUtils.clamp(radialSpeedInward / 6, 0, 1);
+    const targetReentry =
+      atmoEntryBand * Math.max(diveHeat, speedHeat * 0.65 * descending);
     this.reentryIntensity = THREE.MathUtils.damp(
       this.reentryIntensity,
       targetReentry,
