@@ -36,6 +36,7 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   isThrusting: false,
   isBoosting: false,
   qualityLevel: 0,
+  floraInstances: 0,
   landingState: 'flying',
   canLand: false,
   landHint: '',
@@ -144,6 +145,14 @@ function createInitialConfig(isTouch: boolean): SimulationConfig {
       if (isFiniteNum(b.nebulaOpacity)) base.backdrop.nebulaOpacity = b.nebulaOpacity;
       if (isFiniteNum(b.indicatorMargin)) {
         base.backdrop.indicatorMargin = b.indicatorMargin;
+      }
+    }
+
+    if (isRecord(rawConfig.flora)) {
+      const f = rawConfig.flora;
+      if (typeof f.enabled === 'boolean') base.flora.enabled = f.enabled;
+      if (isFiniteNum(f.density) && f.density >= 0 && f.density <= 1.5) {
+        base.flora.density = f.density;
       }
     }
 
@@ -556,6 +565,7 @@ export default function App() {
         activeSliderId={activeSliderId}
         autoQuality={autoQuality}
         qualityLevel={telemetry.qualityLevel}
+        floraInstances={telemetry.floraInstances}
         onActiveSliderChange={setActiveSliderId}
         onToggleAutoQuality={handleToggleAutoQuality}
         onCloseDock={handleCloseDock}

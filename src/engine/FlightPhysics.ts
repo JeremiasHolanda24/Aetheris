@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { PlanetParams, ShipParams } from '../types/simulation';
+import { CameraMode, PlanetParams, ShipParams } from '../types/simulation';
+import { FloraManager, TreeCollider } from './FloraManager';
 import { FlightInputSample } from './InputController';
 import {
   GEAR_REST_HEIGHT,
@@ -29,6 +30,9 @@ const _toTarget = new THREE.Vector3();
 const _moonToShip = new THREE.Vector3();
 const _shipBack = new THREE.Vector3();
 const _basisMat = new THREE.Matrix4();
+const _treeDiff = new THREE.Vector3();
+const _treeAxis = new THREE.Vector3();
+const _treeRadial = new THREE.Vector3();
 
 function createSoftShadowTexture(): THREE.CanvasTexture {
   const size = 64;
@@ -86,6 +90,7 @@ export class FlightPhysics {
 
   private bankRad = 0;
   private pitchVisualRad = 0;
+  private readonly nearbyTrees: TreeCollider[] = [];
 
   private readonly stepOut: PhysicsStepResult = {
     speed: 0,
@@ -156,13 +161,17 @@ export class FlightPhysics {
 
     this.landing.forceLanded(_radialUp, planetManager);
     this.shipModel.setGearExtension(this.landing.gearT);
+    this.shipModel.updateCockpit(0.1, 0, GEAR_REST_HEIGHT, false, false, 0, 0);
 
     outUp.copy(_surfNormal);
     outCamPos
       .copy(this.shipRoot.position)
-      .addScaledVector(_shipForward, -13.5)
-      .addScaledVector(_surfNormal, 3.8);
-    outLookAt.copy(this.shipRoot.position).addScaledVector(_shipForward, 135);
+      .addScaledVector(_shipForward, -15.625)
+      .addScaledVector(_surfNormal, 4.8);
+    outLookAt
+      .copy(this.shipRoot.position)
+      .addScaledVector(_shipForward, 4)
+      .addScaledVector(_surfNormal, 0.6);
   }
 
   public launchToOrbit(
@@ -191,13 +200,22 @@ export class FlightPhysics {
 
     this.landing.forceFlying();
     this.shipModel.setGearExtension(0);
+    this.shipModel.updateCockpit(
+      0.1,
+      0,
+      atmosphereHeight + 135,
+      true,
+      false,
+      0,
+      0,
+    );
 
     _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
     outUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
     outCamPos
       .copy(this.shipRoot.position)
-      .addScaledVector(_shipForward, -13.5)
-      .addScaledVector(outUp, 3.8);
+      .addScaledVector(_shipForward, -12.5)
+      .addScaledVector(outUp, 3.4);
     outLookAt.copy(this.shipRoot.position).addScaledVector(_shipForward, 135);
   }
 
@@ -213,6 +231,9 @@ export class FlightPhysics {
       targetLocked: boolean;
       shadowMapEnabled: boolean;
       landingHooks: LandingHooks;
+      floraManager?: FloraManager;
+      floraEnabled?: boolean;
+      cameraMode?: CameraMode;
     },
   ): PhysicsStepResult {
     const {
@@ -224,6 +245,9 @@ export class FlightPhysics {
       targetLocked,
       shadowMapEnabled,
       landingHooks,
+      floraManager,
+      floraEnabled,
+      cameraMode,
     } = params;
     const { rotationSpeed, thrustForce, maxSpeed, drag } = ship;
     const { planetRadius, atmosphereHeight } = planet;
@@ -369,6 +393,50 @@ export class FlightPhysics {
           this.velocity.addScaledVector(_moonToShip, -inwardMoon);
         }
       }
+
+      // Cylindrical Tree Collision (only when flying near planet ground)
+      if (floraManager && floraEnabled && altitude <= 40) {
+        const treeCount = floraManager.queryTrees(
+          this.shipRoot.position,
+          this.nearbyTrees,
+        );
+        const minTreeDist = 2.8;
+        const minTreeDistSq = minTreeDist * minTreeDist;
+        for (let t = 0; t < treeCount; t++) {
+          const tree = this.nearbyTrees[t];
+          _treeDiff.set(
+            this.shipRoot.position.x - tree.x,
+            this.shipRoot.position.y - tree.y,
+            this.shipRoot.position.z - tree.z,
+          );
+          _treeAxis.set(tree.nx, tree.ny, tree.nz);
+          const axial = _treeDiff.dot(_treeAxis);
+          if (axial < -1.5 || axial >= tree.height) continue;
+
+          _treeRadial.copy(_treeDiff).addScaledVector(_treeAxis, -axial);
+          const radSq = _treeRadial.lengthSq();
+          if (radSq >= minTreeDistSq) continue;
+
+          const radDist = Math.sqrt(radSq);
+          if (radDist > 0.0001) {
+            _treeRadial.divideScalar(radDist);
+          } else {
+            _treeRadial.crossVectors(
+              Math.abs(_treeAxis.y) < 0.9 ? _unitY : _unitX,
+              _treeAxis,
+            ).normalize();
+          }
+
+          this.shipRoot.position.addScaledVector(
+            _treeRadial,
+            minTreeDist - radDist,
+          );
+          const inwardTree = this.velocity.dot(_treeRadial);
+          if (inwardTree < 0) {
+            this.velocity.addScaledVector(_treeRadial, -inwardTree);
+          }
+        }
+      }
     }
 
     _radialUp.copy(this.shipRoot.position).normalize();
@@ -425,17 +493,22 @@ export class FlightPhysics {
     // Landing gear animation
     this.shipModel.setGearExtension(this.landing.gearT);
 
-    // Visual Banking & Pitch Tilt on Ship Mesh
+    // Visual Banking & Pitch Tilt on Ship Mesh (keep level in cockpit mode so interior stays aligned with pilot POV)
     const landingControlled = this.landing.isControlling;
-    const visualTurn = landingControlled ? 0 : turnInput;
-    const visualPitch = landingControlled ? 0 : pitchInput;
-    this.bankRad = THREE.MathUtils.damp(this.bankRad, visualTurn * 0.48, 8, dt);
-    this.pitchVisualRad = THREE.MathUtils.damp(
-      this.pitchVisualRad,
-      visualPitch * 0.14,
-      8,
-      dt,
-    );
+    if (cameraMode === 'cockpit') {
+      this.bankRad = 0;
+      this.pitchVisualRad = 0;
+    } else {
+      const visualTurn = landingControlled ? 0 : turnInput;
+      const visualPitch = landingControlled ? 0 : pitchInput;
+      this.bankRad = THREE.MathUtils.damp(this.bankRad, visualTurn * 0.48, 8, dt);
+      this.pitchVisualRad = THREE.MathUtils.damp(
+        this.pitchVisualRad,
+        visualPitch * 0.14,
+        8,
+        dt,
+      );
+    }
     _bankQuat.setFromAxisAngle(_unitZ, this.bankRad);
     _pitchQuat.setFromAxisAngle(_unitX, this.pitchVisualRad);
     _visualQuat.copy(_pitchQuat).multiply(_bankQuat);
@@ -515,11 +588,22 @@ export class FlightPhysics {
       dt,
     );
 
+    const isCockpit = cameraMode === 'cockpit';
+    this.shipModel.setCockpitView(isCockpit);
     this.shipModel.updateEffects(
       elapsed,
       thrustPower,
       landingControlled ? false : inputs.isBoosting,
       this.reentryIntensity,
+    );
+    this.shipModel.updateCockpit(
+      dt,
+      speed,
+      this.shipAltitude,
+      this.inSpace,
+      landingControlled ? false : inputs.isBoosting,
+      landingControlled ? 0 : turnInput,
+      landingControlled ? 0 : pitchInput,
     );
 
     this.stepOut.speed = speed;

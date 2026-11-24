@@ -6,6 +6,8 @@ export interface QualityPreset {
   starRatio: number;
   shadowsEnabled: boolean;
   particleRatio: number;
+  floraDensityRatio: number;
+  floraViewRatio: number;
 }
 
 const STAR_RATIOS: Record<QualityLevel, number> = {
@@ -13,6 +15,20 @@ const STAR_RATIOS: Record<QualityLevel, number> = {
   1: 1.0,
   2: 0.7,
   3: 0.4,
+};
+
+const FLORA_DENSITY_RATIOS: Record<QualityLevel, number> = {
+  0: 1.0,
+  1: 0.8,
+  2: 0.5,
+  3: 0.25,
+};
+
+const FLORA_VIEW_RATIOS: Record<QualityLevel, number> = {
+  0: 1.0,
+  1: 0.9,
+  2: 0.7,
+  3: 0.5,
 };
 
 const PIXEL_RATIO_CAPS: Record<QualityLevel, number> = {
@@ -143,6 +159,8 @@ export class QualityScaler {
       starRatio: STAR_RATIOS[level],
       shadowsEnabled: this.baseShadowsEnabled && level < 2,
       particleRatio: level === 3 ? 0.5 : 1.0,
+      floraDensityRatio: FLORA_DENSITY_RATIOS[level],
+      floraViewRatio: FLORA_VIEW_RATIOS[level],
     };
   }
 }

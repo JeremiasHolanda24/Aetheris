@@ -12,6 +12,8 @@ const _camUp = new THREE.Vector3(0, 1, 0);
 const _camOffset = new THREE.Vector3();
 const _yawQuat = new THREE.Quaternion();
 
+const _shipDelta = new THREE.Vector3();
+
 /**
  * Manages PerspectiveCamera, OrbitControls, chase/tactical/cockpit/orbit views,
  * speed-driven FOV, relaxed landed chase framing, and atmospheric re-entry camera shake.
@@ -21,6 +23,8 @@ export class CameraRig {
   private readonly controls: OrbitControls;
   private userOrbiting = false;
   private landedCamBlend = 0;
+  private hasPrevOrbitShipPos = false;
+  private readonly prevOrbitShipPos = new THREE.Vector3();
 
   constructor(
     domElement: HTMLElement,
@@ -30,11 +34,11 @@ export class CameraRig {
     isSoftwareGl: boolean,
     initialPlanetRadius: number,
   ) {
-    // Near plane raised to 0.6 intentionally to reduce depth fighting along planet borders
+    // Near plane raised to 0.6 outside cockpit to reduce depth fighting along planet borders
     this.camera = new THREE.PerspectiveCamera(
       62,
       width / height,
-      0.6,
+      initialMode === 'cockpit' ? 0.08 : 0.6,
       initialPlanetRadius * 12,
     );
 
@@ -61,9 +65,18 @@ export class CameraRig {
   }
 
   public setMode(mode: CameraMode, shipPos: THREE.Vector3): void {
+    const targetNear = mode === 'cockpit' ? 0.08 : 0.6;
+    if (this.camera.near !== targetNear) {
+      this.camera.near = targetNear;
+      this.camera.updateProjectionMatrix();
+    }
+
     this.controls.enabled = mode === 'orbit';
+    this.hasPrevOrbitShipPos = false;
     if (mode === 'orbit') {
       this.controls.target.copy(shipPos);
+      this.prevOrbitShipPos.copy(shipPos);
+      this.hasPrevOrbitShipPos = true;
       this.controls.update();
     }
   }
@@ -119,36 +132,32 @@ export class CameraRig {
     );
 
     if (mode === 'orbit') {
-      if (!this.userOrbiting) {
-        this.controls.target.x = THREE.MathUtils.damp(
-          this.controls.target.x,
-          shipPos.x,
-          6,
-          dt,
-        );
-        this.controls.target.y = THREE.MathUtils.damp(
-          this.controls.target.y,
-          shipPos.y,
-          6,
-          dt,
-        );
-        this.controls.target.z = THREE.MathUtils.damp(
-          this.controls.target.z,
-          shipPos.z,
-          6,
-          dt,
-        );
+      if (this.hasPrevOrbitShipPos) {
+        _shipDelta.subVectors(shipPos, this.prevOrbitShipPos);
+        this.camera.position.add(_shipDelta);
+        this.controls.target.add(_shipDelta);
+      } else if (!this.userOrbiting) {
+        this.controls.target.copy(shipPos);
       }
+      this.prevOrbitShipPos.copy(shipPos);
+      this.hasPrevOrbitShipPos = true;
       this.controls.update();
       return;
+    }
+    this.hasPrevOrbitShipPos = false;
+
+    const desiredNear = mode === 'cockpit' ? 0.08 : 0.6;
+    if (this.camera.near !== desiredNear) {
+      this.camera.near = desiredNear;
+      this.camera.updateProjectionMatrix();
     }
 
     _shipForward.set(0, 0, -1).applyQuaternion(shipQuat);
     _shipUp.set(0, 1, 0).applyQuaternion(shipQuat);
 
     if (mode === 'chase') {
-      const chaseBack = 13.5 * (1 + 0.25 * this.landedCamBlend);
-      const chaseUp = 3.8 + 1.4 * this.landedCamBlend;
+      const chaseBack = 12.5 * (1 + 0.25 * this.landedCamBlend);
+      const chaseUp = 3.4 + 1.4 * this.landedCamBlend;
       const yawSway =
         THREE.MathUtils.degToRad(6) *
         Math.sin(elapsed * ((Math.PI * 2) / 14)) *
@@ -176,61 +185,30 @@ export class CameraRig {
         .addScaledVector(_shipUp, 38);
       _desiredLookAt.copy(shipPos).addScaledVector(_shipForward, 6);
     } else {
-      // cockpit
+      // cockpit: fixed inside the bubble canopy at pilot eye height
       _desiredCamPos
         .copy(shipPos)
-        .addScaledVector(_shipForward, 0.25)
-        .addScaledVector(_shipUp, 1.35);
-      _desiredLookAt.copy(shipPos).addScaledVector(_shipForward, 140);
+        .addScaledVector(_shipForward, 0.16)
+        .addScaledVector(_shipUp, 0.43);
+      _desiredLookAt
+        .copy(shipPos)
+        .addScaledVector(_shipForward, 140)
+        .addScaledVector(_shipUp, 0.43);
     }
 
-    const lambda = mode === 'cockpit' ? 18 : 6.8;
-    this.camera.position.x = THREE.MathUtils.damp(
-      this.camera.position.x,
-      _desiredCamPos.x,
-      lambda,
-      dt,
-    );
-    this.camera.position.y = THREE.MathUtils.damp(
-      this.camera.position.y,
-      _desiredCamPos.y,
-      lambda,
-      dt,
-    );
-    this.camera.position.z = THREE.MathUtils.damp(
-      this.camera.position.z,
-      _desiredCamPos.z,
-      lambda,
-      dt,
-    );
+    // Rigidly anchor camera to ship frame so high speed or sharp turns never lose the ship
+    this.camera.position.copy(_desiredCamPos);
 
     if (reentryIntensity > 0.04 && mode !== 'tactical') {
-      const shake = reentryIntensity * 0.14;
+      const shake = reentryIntensity * (mode === 'cockpit' ? 0.05 : 0.12);
       this.camera.position.x += Math.sin(elapsed * 53) * shake;
       this.camera.position.y += Math.cos(elapsed * 61) * shake;
     }
 
-    _camUp.lerp(_shipUp, THREE.MathUtils.clamp(dt * 6.5, 0, 1)).normalize();
+    _camUp.copy(_shipUp);
     this.camera.up.copy(_camUp);
 
-    _currentLookAt.x = THREE.MathUtils.damp(
-      _currentLookAt.x,
-      _desiredLookAt.x,
-      lambda * 1.2,
-      dt,
-    );
-    _currentLookAt.y = THREE.MathUtils.damp(
-      _currentLookAt.y,
-      _desiredLookAt.y,
-      lambda * 1.2,
-      dt,
-    );
-    _currentLookAt.z = THREE.MathUtils.damp(
-      _currentLookAt.z,
-      _desiredLookAt.z,
-      lambda * 1.2,
-      dt,
-    );
+    _currentLookAt.copy(_desiredLookAt);
     this.camera.lookAt(_currentLookAt);
 
     const speedRatio = THREE.MathUtils.clamp(
@@ -239,7 +217,11 @@ export class CameraRig {
       1.3,
     );
     const targetFov =
-      mode === 'tactical' ? 54 : 60 + speedRatio * 10 + reentryIntensity * 4.5;
+      mode === 'tactical'
+        ? 54
+        : mode === 'cockpit'
+          ? 66 + speedRatio * 8 + reentryIntensity * 3.5
+          : 60 + speedRatio * 10 + reentryIntensity * 4.5;
     if (Math.abs(this.camera.fov - targetFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 5, dt);
       this.camera.updateProjectionMatrix();

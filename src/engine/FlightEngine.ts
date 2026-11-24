@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import {
+  LandingState,
   OffScreenIndicatorState,
   SimulationConfig,
   TelemetrySnapshot,
@@ -9,6 +10,7 @@ import { BeaconController } from './BeaconController';
 import { getBiomeName } from './biomes';
 import { CameraRig } from './CameraRig';
 import { FlightPhysics } from './FlightPhysics';
+import { FloraManager } from './FloraManager';
 import { InputController, VirtualInputs } from './InputController';
 import { LandingHooks } from './LandingController';
 import { computeOffScreenIndicator } from './OffScreenIndicator';
@@ -30,6 +32,8 @@ const _snapCamPos = new THREE.Vector3();
 const _snapLookAt = new THREE.Vector3();
 const _snapUp = new THREE.Vector3();
 const _keyLightOffset = new THREE.Vector3(260, 320, 180);
+const _sunDir = new THREE.Vector3();
+const _clearingPos = new THREE.Vector3();
 
 const _spaceBgColor = new THREE.Color(0x05050d);
 const _atmoBgColor = new THREE.Color(0x0b1d38);
@@ -84,7 +88,10 @@ export class FlightEngine {
   private beaconController: BeaconController;
   private weaponsSystem: WeaponsSystem;
   private particleSystem: ParticleSystem;
+  private floraManager: FloraManager;
   private particleRatio = 1.0;
+  private floraDensityRatio = 1.0;
+  private floraViewRatio = 1.0;
 
   // Mission & input state
   private waypointsCaptured = 0;
@@ -102,6 +109,7 @@ export class FlightEngine {
   private lastViewportH = 1;
   private lastIndicator: OffScreenIndicatorState | null = null;
   private readonly landingHooks: LandingHooks;
+  private prevLandingState: LandingState = 'flying';
 
   private boundOnResize: () => void;
   private boundOnContextLost: (e: Event) => void;
@@ -224,6 +232,10 @@ export class FlightEngine {
 
     this.weaponsSystem = new WeaponsSystem(this.scene, this.soundEngine);
     this.particleSystem = new ParticleSystem(this.scene);
+    this.floraManager = new FloraManager(this.scene, {
+      castShadows: enableShadowMap,
+      isMobileOrSoftware: this.isSoftwareGl || this.isMobileDevice,
+    });
 
     this.landingHooks = {
       spawnDust: (pos, normal, count) =>
@@ -280,8 +292,18 @@ export class FlightEngine {
 
   public updateConfig(next: SimulationConfig): void {
     const prevMode = this.config.cameraMode;
+    const prevPlanet = this.config.planet;
+    const planetRebuilt =
+      next.planet.planetRadius !== prevPlanet.planetRadius ||
+      next.planet.maxHeight !== prevPlanet.maxHeight ||
+      next.planet.noiseScale !== prevPlanet.noiseScale ||
+      next.planet.seaLevel !== prevPlanet.seaLevel;
+
     this.config = structuredClone(next);
     this.planetManager.updateParams(next.planet);
+    if (planetRebuilt) {
+      this.floraManager.invalidate();
+    }
     this.cameraRig.setPlanetRadius(next.planet.planetRadius);
     this.spaceBackground.updateParams(next.backdrop);
 
@@ -324,7 +346,38 @@ export class FlightEngine {
       this.renderer.shadowMap.needsUpdate = true;
     }
     this.particleRatio = preset.particleRatio;
+    this.floraDensityRatio = preset.floraDensityRatio;
+    this.floraViewRatio = preset.floraViewRatio;
+    this.floraManager.setCastShadows(preset.shadowsEnabled);
     this.emitTelemetry();
+  }
+
+  private syncLandingClearing(): void {
+    const curState = this.physics.landing.state;
+    if (curState === this.prevLandingState) return;
+    this.prevLandingState = curState;
+
+    if (
+      (curState === 'landing' || curState === 'landed') &&
+      this.physics.landing.landedBody === 'planet'
+    ) {
+      const pos = this.physics.shipRoot.position;
+      const lenSq = pos.lengthSq();
+      if (lenSq > 0.0001) {
+        _clearingPos.copy(pos).divideScalar(Math.sqrt(lenSq));
+      } else {
+        _clearingPos.set(0, 1, 0);
+      }
+      const surfR = this.planetManager.getSurfaceRadiusAt(
+        _clearingPos.x,
+        _clearingPos.y,
+        _clearingPos.z,
+      );
+      _clearingPos.multiplyScalar(surfR);
+      this.floraManager.setClearing(_clearingPos, 8);
+    } else if (curState === 'flying') {
+      this.floraManager.setClearing(null, 8);
+    }
   }
 
   public toggleLanding(): void {
@@ -335,6 +388,7 @@ export class FlightEngine {
       this.planetManager,
       this.landingHooks,
     );
+    this.syncLandingClearing();
     this.lastTelemetryEmit = -1;
   }
 
@@ -346,6 +400,7 @@ export class FlightEngine {
       _snapUp,
     );
     this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, true);
+    this.syncLandingClearing();
     this.lastTelemetryEmit = -1;
   }
 
@@ -357,6 +412,7 @@ export class FlightEngine {
       _snapUp,
     );
     this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, false);
+    this.syncLandingClearing();
     this.lastTelemetryEmit = -1;
   }
 
@@ -432,7 +488,11 @@ export class FlightEngine {
       targetLocked: landingControlled ? false : this.targetLocked,
       shadowMapEnabled: this.renderer.shadowMap.enabled,
       landingHooks: this.landingHooks,
+      floraManager: this.floraManager,
+      floraEnabled: this.config.flora.enabled,
+      cameraMode: this.config.cameraMode,
     });
+    this.syncLandingClearing();
 
     this.soundEngine.updateAtmosphereEntry(this.physics.reentryIntensity);
     this.particleSystem.update(dt, {
@@ -449,6 +509,30 @@ export class FlightEngine {
       particleRatio: this.particleRatio,
     });
 
+    this.keyLight.position
+      .copy(this.physics.shipRoot.position)
+      .add(_keyLightOffset);
+    this.keyLight.target.position.copy(this.physics.shipRoot.position);
+    _sunDir
+      .copy(this.keyLight.position)
+      .sub(this.keyLight.target.position)
+      .normalize();
+
+    this.floraManager.update(
+      dt,
+      this.physics.shipRoot.position,
+      this.physics.shipAltitude,
+      this.planetManager,
+      this.config.planet,
+      this.config.flora,
+      {
+        floraDensityRatio: this.floraDensityRatio,
+        floraViewRatio: this.floraViewRatio,
+        qualityLevel: this.qualityScaler.getLevel(),
+      },
+      _sunDir,
+    );
+
     if (
       this.physics.shipRoot.position.distanceTo(
         this.beaconController.position,
@@ -458,11 +542,6 @@ export class FlightEngine {
       this.callbacks.onWaypointCaptured(this.waypointsCaptured);
       this.relocateTarget('alternate');
     }
-
-    this.keyLight.position
-      .copy(this.physics.shipRoot.position)
-      .add(_keyLightOffset);
-    this.keyLight.target.position.copy(this.physics.shipRoot.position);
 
     this.weaponsSystem.update(dt, {
       wantsFire: this.wantsFire,
@@ -592,6 +671,7 @@ export class FlightEngine {
       isThrusting: this.isThrusting,
       isBoosting: this.isBoosting,
       qualityLevel: this.qualityScaler.getLevel(),
+      floraInstances: this.floraManager.getActiveInstanceCount(),
       landingState,
       canLand,
       landHint,
@@ -629,6 +709,7 @@ export class FlightEngine {
     this.inputController.dispose();
     this.weaponsSystem.dispose();
     this.particleSystem.dispose();
+    this.floraManager.dispose();
     this.physics.dispose();
     this.beaconController.dispose();
     this.cameraRig.dispose();

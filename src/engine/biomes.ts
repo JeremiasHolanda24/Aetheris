@@ -1,6 +1,23 @@
 import * as THREE from 'three';
 import { simplex3 } from './terrainMath';
 
+export type BiomeId =
+  | 'ocean'
+  | 'beach'
+  | 'desert'
+  | 'grassland'
+  | 'forest'
+  | 'tundra'
+  | 'taiga'
+  | 'mountain'
+  | 'ice';
+
+export interface BiomeSample {
+  biome: BiomeId;
+  T: number;
+  M: number;
+}
+
 // Editable biome color table
 const COLOR_OCEAN_DEEP = new THREE.Color(0x0b2a6b);
 const COLOR_OCEAN_SHALLOW = new THREE.Color(0x2aa6b8);
@@ -15,10 +32,23 @@ const COLOR_SNOW = new THREE.Color(0xf4f7fb);
 const COLOR_POLAR_ICE = new THREE.Color(0xe8f1fb);
 const COLOR_POLAR_SEA_ICE = new THREE.Color(0xdbeafe);
 
-// Pre-allocated scratch colors (Zero GC per vertex/telemetry call)
+// Pre-allocated scratch helpers (Zero GC per vertex/telemetry call)
 const _coldRow = new THREE.Color();
 const _hotRow = new THREE.Color();
 const _landColor = new THREE.Color();
+const _biomeSample: BiomeSample = { biome: 'ocean', T: 0.5, M: 0.5 };
+
+const BIOME_NAMES: Record<BiomeId, string> = {
+  ocean: 'Oceano',
+  beach: 'Praia',
+  desert: 'Deserto',
+  grassland: 'Pradaria',
+  forest: 'Floresta/Selva',
+  tundra: 'Tundra',
+  taiga: 'Taiga',
+  mountain: 'Montanha',
+  ice: 'Neve/Gelo',
+};
 
 function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
@@ -45,6 +75,49 @@ function computeMoisture(nx: number, ny: number, nz: number): number {
 }
 
 /**
+ * Pure, zero-allocation biome classifier filling temperature `T`, moisture `M`, and `biome`.
+ * `rawHeightNorm` is unclipped `h / maxHeight` in [-1, 1].
+ */
+export function sampleBiome(
+  nx: number,
+  ny: number,
+  nz: number,
+  rawHeightNorm: number,
+  seaLevel: number,
+  out: BiomeSample,
+): BiomeSample {
+  const temperature = computeTemperature(nx, ny, nz, rawHeightNorm);
+  const moisture = computeMoisture(nx, ny, nz);
+  out.T = temperature;
+  out.M = moisture;
+
+  if (temperature < 0.15) {
+    out.biome = 'ice';
+  } else if (rawHeightNorm <= seaLevel) {
+    out.biome = 'ocean';
+  } else if (rawHeightNorm < seaLevel + 0.05) {
+    out.biome = 'beach';
+  } else if (rawHeightNorm >= THREE.MathUtils.lerp(0.55, 0.95, temperature)) {
+    out.biome = 'ice';
+  } else if (rawHeightNorm >= 0.5) {
+    out.biome = 'mountain';
+  } else if (
+    temperature >= 0.35 &&
+    temperature <= 0.65 &&
+    moisture >= 0.35 &&
+    moisture <= 0.65
+  ) {
+    out.biome = 'grassland';
+  } else if (temperature < 0.5) {
+    out.biome = moisture < 0.5 ? 'tundra' : 'taiga';
+  } else {
+    out.biome = moisture < 0.5 ? 'desert' : 'forest';
+  }
+
+  return out;
+}
+
+/**
  * Pure, zero-allocation biome color lookup for a unit sphere direction (nx, ny, nz).
  * `rawHeightNorm` is unclipped `h / maxHeight` in [-1, 1].
  */
@@ -56,8 +129,9 @@ export function getBiomeColor(
   seaLevel: number,
   out: THREE.Color,
 ): THREE.Color {
-  const temperature = computeTemperature(nx, ny, nz, rawHeightNorm);
-  const moisture = computeMoisture(nx, ny, nz);
+  sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, _biomeSample);
+  const temperature = _biomeSample.T;
+  const moisture = _biomeSample.M;
 
   if (rawHeightNorm <= seaLevel) {
     const depthNorm = THREE.MathUtils.clamp(
@@ -130,41 +204,6 @@ export function getBiomeName(
   rawHeightNorm: number,
   seaLevel: number,
 ): string {
-  const temperature = computeTemperature(nx, ny, nz, rawHeightNorm);
-  if (temperature < 0.15) {
-    return 'Neve/Gelo';
-  }
-
-  if (rawHeightNorm <= seaLevel) {
-    return 'Oceano';
-  }
-
-  if (rawHeightNorm < seaLevel + 0.05) {
-    return 'Praia';
-  }
-
-  const snowLine = THREE.MathUtils.lerp(0.55, 0.95, temperature);
-  if (rawHeightNorm >= snowLine) {
-    return 'Neve/Gelo';
-  }
-
-  if (rawHeightNorm >= 0.5) {
-    return 'Montanha';
-  }
-
-  const moisture = computeMoisture(nx, ny, nz);
-  if (
-    temperature >= 0.35 &&
-    temperature <= 0.65 &&
-    moisture >= 0.35 &&
-    moisture <= 0.65
-  ) {
-    return 'Pradaria';
-  }
-
-  if (temperature < 0.5) {
-    return moisture < 0.5 ? 'Tundra' : 'Taiga';
-  }
-
-  return moisture < 0.5 ? 'Deserto' : 'Floresta/Selva';
+  sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, _biomeSample);
+  return BIOME_NAMES[_biomeSample.biome];
 }

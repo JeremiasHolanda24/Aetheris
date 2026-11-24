@@ -206,6 +206,7 @@ interface ControlDockProps {
   activeSliderId: string | null;
   autoQuality: boolean;
   qualityLevel: QualityLevel;
+  floraInstances: number;
   onActiveSliderChange: (id: string | null) => void;
   onToggleAutoQuality: () => void;
   onCloseDock: () => void;
@@ -283,6 +284,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
     activeSliderId,
     autoQuality,
     qualityLevel,
+    floraInstances,
     onActiveSliderChange,
     onToggleAutoQuality,
     onCloseDock,
@@ -602,11 +604,49 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                     }))
                   }
                 />
+                <SliderRow
+                  id="floraDensity"
+                  label="Densidade da flora"
+                  value={config.flora.density}
+                  min={0}
+                  max={1.5}
+                  step={0.05}
+                  decimals={2}
+                  activeSliderId={activeSliderId}
+                  onStartDrag={onActiveSliderChange}
+                  onChange={(v) =>
+                    onUpdateConfig((prev) => ({
+                      ...prev,
+                      flora: { ...prev.flora, density: v },
+                    }))
+                  }
+                />
                 <div
-                  className={`flex items-center gap-2 col-span-2 sm:col-span-1 transition-opacity duration-150 ${
+                  className={`flex items-center gap-2 col-span-2 sm:col-span-3 transition-opacity duration-150 ${
                     isDraggingAny ? 'opacity-15' : 'opacity-100'
                   }`}
                 >
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={config.flora.enabled}
+                    onClick={() =>
+                      onUpdateConfig((prev) => ({
+                        ...prev,
+                        flora: {
+                          ...prev.flora,
+                          enabled: !prev.flora.enabled,
+                        },
+                      }))
+                    }
+                    className={`flex-1 px-2.5 py-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer flex items-center justify-center gap-2 ${
+                      config.flora.enabled
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50'
+                        : 'bg-slate-800 text-slate-300 border-white/10'
+                    }`}
+                  >
+                    <span>Flora</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() =>
@@ -781,10 +821,18 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
               </span>
               <span className="font-medium">Qualidade automática</span>
             </button>
-            <span className="font-mono-tabular text-slate-300">
-              Qualidade:{' '}
-              <strong className="text-sky-300 font-medium">{qualityLevel}</strong>
-            </span>
+            <div className="flex items-center gap-3 font-mono-tabular text-slate-300">
+              <span className="text-slate-400">
+                Flora:{' '}
+                <strong className="text-slate-200 font-medium">
+                  {floraInstances}
+                </strong>
+              </span>
+              <span>
+                Qualidade:{' '}
+                <strong className="text-sky-300 font-medium">{qualityLevel}</strong>
+              </span>
+            </div>
           </div>
         </section>
       </div>

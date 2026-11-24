@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { LandingState } from '../types/simulation';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
 
-export const GEAR_REST_HEIGHT = 1.7;
+export const GEAR_REST_HEIGHT = 0.72;
 export const MAX_LAND_ALTITUDE = 45;
 export const MAX_LAND_SPEED = 30;
 export const MAX_SLOPE_DEG = 28;
@@ -389,7 +389,7 @@ export class LandingController {
 
       const bounce =
         this.stateTime < 0.8
-          ? 0.18 * Math.exp(-6 * this.stateTime) * Math.cos(18 * this.stateTime)
+          ? 0.1 * Math.exp(-6 * this.stateTime) * Math.cos(18 * this.stateTime)
           : 0;
 
       if (this.landedBody === 'moon') {

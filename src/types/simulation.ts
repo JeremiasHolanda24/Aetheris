@@ -28,10 +28,16 @@ export interface BackdropParams {
   indicatorMargin: number; // default 0.1
 }
 
+export interface FloraParams {
+  enabled: boolean; // default true
+  density: number;  // default 1 (0..1.5)
+}
+
 export interface SimulationConfig {
   ship: ShipParams;
   planet: PlanetParams;
   backdrop: BackdropParams;
+  flora: FloraParams;
   cameraMode: CameraMode;
 }
 
@@ -61,6 +67,7 @@ export interface TelemetrySnapshot {
   isThrusting: boolean;
   isBoosting: boolean;
   qualityLevel: QualityLevel;
+  floraInstances: number;
   landingState: LandingState;
   canLand: boolean;
   landHint: string;
@@ -90,6 +97,10 @@ export const DEFAULT_CONFIG: SimulationConfig = {
     maxStarSize: 4.5,
     nebulaOpacity: 0.52,
     indicatorMargin: 0.1,
+  },
+  flora: {
+    enabled: true,
+    density: 1,
   },
   cameraMode: 'chase',
 };
