@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { LandingState } from '../types/simulation';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
 
-export const GEAR_REST_HEIGHT = 0.72;
+export const GEAR_REST_HEIGHT = 1.08;
 export const MAX_LAND_ALTITUDE = 45;
 export const MAX_LAND_SPEED = 30;
 export const MAX_SLOPE_DEG = 28;
@@ -76,7 +76,7 @@ export class LandingController {
     } else {
       _radialDir.copy(_unitY);
     }
-    const planetSurfR = planetManager.getSurfaceRadiusAt(
+    const planetSurfR = planetManager.getRenderedSupportRadiusAt(
       _radialDir.x,
       _radialDir.y,
       _radialDir.z,
@@ -118,7 +118,7 @@ export class LandingController {
         _radialDir.copy(_unitY);
       }
 
-      const surfR = planetManager.getSurfaceRadiusAt(
+      const surfR = planetManager.getRenderedSupportRadiusAt(
         _radialDir.x,
         _radialDir.y,
         _radialDir.z,
@@ -316,7 +316,7 @@ export class LandingController {
         _radialDir.copy(_unitY);
       }
 
-      const surfR = planetManager.getSurfaceRadiusAt(
+      const surfR = planetManager.getRenderedSupportRadiusAt(
         _radialDir.x,
         _radialDir.y,
         _radialDir.z,
@@ -355,7 +355,7 @@ export class LandingController {
       if (newDist > 0.0001) {
         _radialDir.copy(ship.root.position).divideScalar(newDist);
       }
-      const newSurfR = planetManager.getSurfaceRadiusAt(
+      const newSurfR = planetManager.getRenderedSupportRadiusAt(
         _radialDir.x,
         _radialDir.y,
         _radialDir.z,
@@ -406,7 +406,7 @@ export class LandingController {
         return;
       }
 
-      const surfR = planetManager.getSurfaceRadiusAt(
+      const surfR = planetManager.getRenderedSupportRadiusAt(
         this.landedDir.x,
         this.landedDir.y,
         this.landedDir.z,
@@ -504,7 +504,7 @@ export class LandingController {
       if (newDist > 0.0001) {
         _radialDir.copy(ship.root.position).divideScalar(newDist);
       }
-      const newSurfR = planetManager.getSurfaceRadiusAt(
+      const newSurfR = planetManager.getRenderedSupportRadiusAt(
         _radialDir.x,
         _radialDir.y,
         _radialDir.z,

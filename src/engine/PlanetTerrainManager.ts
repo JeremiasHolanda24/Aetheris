@@ -1,20 +1,20 @@
 import * as THREE from 'three';
 import { PlanetParams } from '../types/simulation';
-import { getBiomeColor } from './biomes';
+import { BiomeSample, getBiomeColor, getGrassCoverage } from './biomes';
 import {
   getPlanetSurfaceHeight,
   getPlanetTerrainHeight,
   spherifyCubePoint,
 } from './terrainMath';
 
-interface CubeFaceBasis {
+export interface CubeFaceBasis {
   normal: [number, number, number];
   uAxis: [number, number, number];
   vAxis: [number, number, number];
 }
 
 // All 6 faces satisfy cross(uAxis, vAxis) === normal for consistent outward FrontSide winding
-const CUBE_FACES: CubeFaceBasis[] = [
+export const CUBE_FACES: CubeFaceBasis[] = [
   { normal: [0, 1, 0], uAxis: [1, 0, 0], vAxis: [0, 0, -1] },  // +Y
   { normal: [0, -1, 0], uAxis: [1, 0, 0], vAxis: [0, 0, 1] },  // -Y
   { normal: [1, 0, 0], uAxis: [0, 0, -1], vAxis: [0, 1, 0] },  // +X
@@ -27,6 +27,8 @@ const PATCH_SUBDIV = 4;
 const PATCH_SEGMENTS = 20;
 const MOON_RADIUS_RATIO = 0.145;
 const _camDir = new THREE.Vector3();
+const _cullProjScreenMatrix = new THREE.Matrix4();
+const _cullFrustum = new THREE.Frustum();
 const _nDir = new THREE.Vector3();
 const _nT1 = new THREE.Vector3();
 const _nT2 = new THREE.Vector3();
@@ -37,6 +39,31 @@ const _nP2a = new THREE.Vector3();
 const _nP2b = new THREE.Vector3();
 const _nD1 = new THREE.Vector3();
 const _nD2 = new THREE.Vector3();
+const _mPtl = new THREE.Vector3();
+const _mPtr = new THREE.Vector3();
+const _mPbl = new THREE.Vector3();
+const _mPbr = new THREE.Vector3();
+const _rDir = new THREE.Vector3();
+const _rS0 = new THREE.Vector3();
+const _rSu = new THREE.Vector3();
+const _rSv = new THREE.Vector3();
+const _rRes = new THREE.Vector3();
+const _rTriA = new THREE.Vector3();
+const _rTriB = new THREE.Vector3();
+const _rTriC = new THREE.Vector3();
+const _rEdge1 = new THREE.Vector3();
+const _rEdge2 = new THREE.Vector3();
+const _rTriN = new THREE.Vector3();
+const _sDir = new THREE.Vector3();
+const _sT1 = new THREE.Vector3();
+const _sT2 = new THREE.Vector3();
+const _sSample = new THREE.Vector3();
+const _biomeSample: BiomeSample = { biome: 'ocean', T: 0.5, M: 0.5 };
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
 
 function hash2(x: number, y: number): number {
   const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
@@ -132,6 +159,8 @@ export class PlanetTerrainManager {
     geometry: THREE.BufferGeometry;
     centerDir: THREE.Vector3;
     angularRadius: number;
+    sinAngR: number;
+    cosAngR: number;
   }> = [];
 
   private sharedIndices: THREE.BufferAttribute;
@@ -139,6 +168,8 @@ export class PlanetTerrainManager {
   private surfaceTexture: THREE.CanvasTexture;
   private terrainMaterial: THREE.MeshStandardMaterial;
   private contourUniform = { value: 1.0 };
+  private grassDetailUniform = { value: 1.0 };
+  private timeUniform = { value: 0.0 };
 
   private atmosphereMesh: THREE.Mesh;
   private atmosphereGeo: THREE.SphereGeometry;
@@ -149,10 +180,8 @@ export class PlanetTerrainManager {
   private moonGeo: THREE.IcosahedronGeometry;
   private moonMat: THREE.MeshStandardMaterial;
   private readonly moonCenter = new THREE.Vector3();
-  private readonly prevMoonCenter = new THREE.Vector3();
   private readonly moonVelocity = new THREE.Vector3();
   private readonly moonWorldQuat = new THREE.Quaternion();
-  private lastUpdateElapsed = 0;
   private readonly moonState = {
     center: this.moonCenter,
     radius: 0,
@@ -205,23 +234,28 @@ export class PlanetTerrainManager {
       vertexColors: true,
       roughness: 0.72,
       metalness: 0.12,
-      envMapIntensity: 0.4,
-      emissive: new THREE.Color(0x0a0f14),
-      emissiveIntensity: 0.25,
+      envMapIntensity: 0.16,
+      emissive: new THREE.Color(0x050810),
+      emissiveIntensity: 0.04,
       wireframe: initialParams.wireframe,
       side: THREE.FrontSide,
     });
 
     this.contourUniform.value = initialParams.showContours ? 1.0 : 0.0;
+    this.terrainMaterial.customProgramCacheKey = () => 'planet-terrain-grass-v1';
 
     this.terrainMaterial.onBeforeCompile = (shader) => {
       shader.uniforms.uShowContours = this.contourUniform;
       shader.uniforms.uDetailTex = { value: this.surfaceTexture };
+      shader.uniforms.uGrassDetail = this.grassDetailUniform;
+      shader.uniforms.uTime = this.timeUniform;
 
       shader.vertexShader = shader.vertexShader
         .replace(
           '#include <common>',
           `#include <common>
+          attribute float aGrass;
+          varying float vGrass;
           varying vec3 vPlanetPos;
           varying vec3 vPlanetNormal;`,
         )
@@ -229,7 +263,8 @@ export class PlanetTerrainManager {
           '#include <worldpos_vertex>',
           `#include <worldpos_vertex>
           vPlanetPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
-          vPlanetNormal = normalize(mat3(modelMatrix) * objectNormal);`,
+          vPlanetNormal = normalize(mat3(modelMatrix) * objectNormal);
+          vGrass = aGrass;`,
         );
 
       shader.fragmentShader = shader.fragmentShader
@@ -238,14 +273,89 @@ export class PlanetTerrainManager {
           `#include <common>
           varying vec3 vPlanetPos;
           varying vec3 vPlanetNormal;
+          varying float vGrass;
           uniform float uShowContours;
-          uniform sampler2D uDetailTex;`,
+          uniform float uGrassDetail;
+          uniform float uTime;
+          uniform sampler2D uDetailTex;
+
+          float grassHash31(vec3 p) {
+            p = fract(p * 0.1031);
+            p += dot(p, p.yzx + 33.33);
+            return fract((p.x + p.y) * p.z);
+          }
+
+          vec3 grassHash33(vec3 p) {
+            p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+            p += dot(p, p.yxz + 33.33);
+            return fract((p.xxy + p.yxx) * p.zyx);
+          }
+
+          float grassNoise3D(vec3 p) {
+            vec3 i = floor(p);
+            vec3 f = fract(p);
+            vec3 u = f * f * (3.0 - 2.0 * f);
+            return mix(
+              mix(
+                mix(grassHash31(i + vec3(0.0, 0.0, 0.0)), grassHash31(i + vec3(1.0, 0.0, 0.0)), u.x),
+                mix(grassHash31(i + vec3(0.0, 1.0, 0.0)), grassHash31(i + vec3(1.0, 1.0, 0.0)), u.x),
+                u.y
+              ),
+              mix(
+                mix(grassHash31(i + vec3(0.0, 0.0, 1.0)), grassHash31(i + vec3(1.0, 0.0, 1.0)), u.x),
+                mix(grassHash31(i + vec3(0.0, 1.0, 1.0)), grassHash31(i + vec3(1.0, 1.0, 1.0)), u.x),
+                u.y
+              ),
+              u.z
+            );
+          }
+
+          vec2 grassVoronoi3D(vec3 p) {
+            vec3 i = floor(p);
+            vec3 f = fract(p);
+            float minD = 8.0;
+            float cellId = 0.0;
+            for (int z = -1; z <= 1; z++) {
+              for (int y = -1; y <= 1; y++) {
+                for (int x = -1; x <= 1; x++) {
+                  vec3 neighbor = vec3(float(x), float(y), float(z));
+                  vec3 rnd = grassHash33(i + neighbor);
+                  vec3 diff = neighbor + rnd - f;
+                  float d = dot(diff, diff);
+                  if (d < minD) {
+                    minD = d;
+                    cellId = rnd.x;
+                  }
+                }
+              }
+            }
+            return vec2(sqrt(minD), cellId);
+          }
+
+          vec3 grassPerturbNormalArb(vec3 surf_pos, vec3 surf_norm, vec2 dHdxy, float faceDir) {
+            vec3 dPosX = dFdx(surf_pos.xyz);
+            vec3 dPosY = dFdy(surf_pos.xyz);
+            float lenX = length(dPosX);
+            float lenY = length(dPosY);
+            if (lenX < 1e-6 || lenY < 1e-6) return surf_norm;
+            vec3 vSigmaX = dPosX / lenX;
+            vec3 vSigmaY = dPosY / lenY;
+            vec3 vN = surf_norm;
+            vec3 R1 = cross(vSigmaY, vN);
+            vec3 R2 = cross(vN, vSigmaX);
+            float fDet = dot(vSigmaX, R1) * faceDir;
+            float denom = abs(fDet);
+            if (denom < 1e-6) return surf_norm;
+            vec3 vGrad = sign(fDet) * (dHdxy.x * R1 + dHdxy.y * R2);
+            return normalize(denom * surf_norm - vGrad);
+          }`,
         )
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
           vec3 triW = abs(vPlanetNormal);
-          triW = pow(triW, vec3(4.0));
+          triW *= triW;
+          triW *= triW;
           triW /= max(triW.x + triW.y + triW.z, 0.0001);
           float texScale = 0.018;
           vec3 tx = texture2D(uDetailTex, vPlanetPos.yz * texScale).rgb;
@@ -255,7 +365,58 @@ export class PlanetTerrainManager {
           float lum = dot(detailTint, vec3(0.299, 0.587, 0.114));
           diffuseColor.rgb *= mix(1.0, lum * 1.5, 0.45);
 
-          if (uShowContours > 0.5) {
+          float grassCamDist = distance(cameraPosition, vPlanetPos);
+          float grassNearFade = 1.0 - smoothstep(35.0, 150.0, grassCamDist);
+          float grassBumpH = 0.0;
+
+          if (vGrass > 0.001) {
+            // 1. Macro patches (~0.035)
+            float patchN = grassNoise3D(vPlanetPos * 0.035);
+            vec3 grassTint = mix(vec3(0.62, 0.78, 0.30), vec3(0.24, 0.62, 0.38), patchN);
+            float grassTintMean = (grassTint.r + grassTint.g + grassTint.b) / 3.0;
+            diffuseColor.rgb *= mix(vec3(1.0), grassTint / max(grassTintMean, 0.001), vGrass * 0.75);
+
+            // 2. Medium scale (~0.25) +-12%
+            float medN = grassNoise3D(vPlanetPos * 0.25 + vec3(5.2, 13.7, 9.1));
+            diffuseColor.rgb *= 1.0 + (medN * 2.0 - 1.0) * 0.12 * vGrass;
+
+            // 5. Subtle wind brightness wave
+            if (uGrassDetail > 0.3 && grassNearFade > 0.001) {
+              float windWave = 0.04 * sin(uTime * 1.2 + dot(vPlanetPos, vec3(0.3, 0.2, 0.4)));
+              diffuseColor.rgb *= 1.0 + windWave * grassNearFade * vGrass;
+            }
+
+            // 3. Close fur layers (~4 and ~9) + synthetic height for bump (only on grassy nearby pixels)
+            if (uGrassDetail > 0.3 && grassNearFade > 0.001) {
+              float gN1 = grassNoise3D(vPlanetPos * 4.0);
+              float gN2 = grassNoise3D(vPlanetPos * 9.0 + vec3(17.3, 31.7, 11.1));
+              float gTips = smoothstep(0.55, 0.9, gN1);
+              float gTufts = smoothstep(0.5, 0.85, gN2);
+              grassBumpH = gTips - gTufts * 0.65;
+              float furShade = (gTips - gTufts) * 0.18;
+              diffuseColor.rgb *= 1.0 + furShade * grassNearFade * uGrassDetail * vGrass;
+            }
+
+            // 4. Flowers (Voronoi ~1.4, ~12% cells)
+            if (uGrassDetail > 0.5 && vGrass > 0.6 && grassCamDist < 60.0) {
+              vec2 vor = grassVoronoi3D(vPlanetPos * 1.4);
+              if (vor.y < 0.12) {
+                float dotMask = (1.0 - smoothstep(0.06, 0.14, vor.x)) * (1.0 - smoothstep(45.0, 60.0, grassCamDist));
+                if (dotMask > 0.001) {
+                  float colPick = fract(vor.y * 83.71);
+                  vec3 flowerCol = colPick < 0.333
+                    ? vec3(0.98, 0.98, 0.95)
+                    : colPick < 0.666
+                      ? vec3(0.98, 0.86, 0.25)
+                      : vec3(0.96, 0.52, 0.72);
+                  float flowerBlend = dotMask * smoothstep(0.6, 0.78, vGrass) * 0.9;
+                  diffuseColor.rgb = mix(diffuseColor.rgb, flowerCol, flowerBlend);
+                }
+              }
+            }
+          }
+
+          if (uShowContours > 0.5 && grassCamDist < 220.0) {
             float r = length(vPlanetPos);
             float e = abs(fract(r * 0.18 - 0.5) - 0.5) / max(fwidth(r * 0.18), 0.0001);
             float contourLine = 1.0 - min(e, 1.0);
@@ -267,9 +428,20 @@ export class PlanetTerrainManager {
             float gLon = abs(fract(lon - 0.5) - 0.5) / max(fwidth(lon), 0.0001);
             float gridLine = 1.0 - min(min(gLat, gLon), 1.0);
 
-            float distFade = 1.0 - smoothstep(60.0, 220.0, distance(cameraPosition, vPlanetPos));
+            float distFade = 1.0 - smoothstep(60.0, 220.0, grassCamDist);
             diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.82, 1.0), gridLine * 0.08 * distFade);
             diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.8, 0.55, 1.0), contourLine * 0.12 * distFade);
+          }`,
+        )
+        .replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>
+          if (uGrassDetail > 0.3 && vGrass > 0.001 && grassNearFade > 0.001) {
+            float grassBumpAmp = 0.35 * grassNearFade * uGrassDetail * vGrass;
+            if (grassBumpAmp > 0.001) {
+              vec2 grassDH = vec2(dFdx(grassBumpH), dFdy(grassBumpH));
+              normal = grassPerturbNormalArb(-vViewPosition, normal, grassDH * grassBumpAmp, faceDirection);
+            }
           }`,
         );
     };
@@ -296,6 +468,10 @@ export class PlanetTerrainManager {
           geometry.setAttribute(
             'normal',
             new THREE.BufferAttribute(new Float32Array(vc * 3), 3),
+          );
+          geometry.setAttribute(
+            'aGrass',
+            new THREE.BufferAttribute(new Float32Array(vc), 1),
           );
           geometry.setAttribute('uv', this.sharedUvs);
           geometry.setIndex(this.sharedIndices);
@@ -342,17 +518,21 @@ export class PlanetTerrainManager {
             geometry,
             centerDir,
             angularRadius,
+            sinAngR: Math.sin(angularRadius),
+            cosAngR: Math.cos(angularRadius),
           });
         }
       }
     }
 
-    // Cyan-to-Violet Atmospheric Fresnel Glow Shell
+    // Cyan-to-Violet Atmospheric Fresnel Glow Shell with Day/Night Terminator
     this.atmosphereGeo = new THREE.SphereGeometry(1, 36, 24);
     this.atmosphereMat = new THREE.ShaderMaterial({
       uniforms: {
         uColorInner: { value: new THREE.Color(0x38bdf8) },
         uColorOuter: { value: new THREE.Color(0x7c3aed) },
+        uColorSunset: { value: new THREE.Color(0xf97316) },
+        uSunDir: { value: new THREE.Vector3(0.5, 0.7, 0.5).normalize() },
       },
       vertexShader: `
         varying vec3 vNormalWorld;
@@ -369,11 +549,18 @@ export class PlanetTerrainManager {
         varying vec3 vWorldPos;
         uniform vec3 uColorInner;
         uniform vec3 uColorOuter;
+        uniform vec3 uColorSunset;
+        uniform vec3 uSunDir;
         void main() {
           vec3 viewDir = normalize(cameraPosition - vWorldPos);
-          float rim = clamp(0.65 - dot(viewDir, -vNormalWorld), 0.0, 1.0);
-          float intensity = pow(rim, 2.5) * 0.85;
-          vec3 col = mix(uColorOuter, uColorInner, pow(rim, 1.4));
+          vec3 normW = normalize(vNormalWorld);
+          float rim = clamp(0.65 - dot(viewDir, -normW), 0.0, 1.0);
+          float sunDot = dot(normW, normalize(uSunDir));
+          float dayMask = smoothstep(-0.32, 0.35, sunDot);
+          float terminator = exp(-pow(sunDot * 3.8, 2.0));
+          float intensity = pow(rim, 2.5) * mix(0.10, 0.90, dayMask);
+          vec3 dayCol = mix(uColorOuter, uColorInner, pow(rim, 1.4));
+          vec3 col = mix(dayCol, uColorSunset, terminator * 0.55);
           gl_FragColor = vec4(col, intensity);
         }
       `,
@@ -392,7 +579,7 @@ export class PlanetTerrainManager {
       color: 0x8b92c4,
       roughness: 0.85,
       metalness: 0.1,
-      envMapIntensity: 0.35,
+      envMapIntensity: 0.14,
       flatShading: true,
     });
     this.moonMesh = new THREE.Mesh(this.moonGeo, this.moonMat);
@@ -406,15 +593,24 @@ export class PlanetTerrainManager {
     return this.patches.length;
   }
 
+  public getVisiblePatchCount(): number {
+    let count = 0;
+    for (let i = 0; i < this.patches.length; i++) {
+      if (this.patches[i].mesh.visible) count++;
+    }
+    return count;
+  }
+
+  public setGrassDetail(detail: number): void {
+    this.grassDetailUniform.value = THREE.MathUtils.clamp(detail, 0, 1);
+  }
+
   public getMoonState(): {
     center: THREE.Vector3;
     radius: number;
     moonVelocity: THREE.Vector3;
     moonQuat: THREE.Quaternion;
   } {
-    this.moonMesh.getWorldPosition(this.moonCenter);
-    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
-    this.moonState.radius = this.params.planetRadius * MOON_RADIUS_RATIO;
     return this.moonState;
   }
 
@@ -500,6 +696,227 @@ export class PlanetTerrainManager {
     return out;
   }
 
+  private evalCubeSphereDir(
+    face: CubeFaceBasis,
+    u: number,
+    v: number,
+    out: THREE.Vector3,
+  ): void {
+    const x = face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0];
+    const y = face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1];
+    const z = face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2];
+    const x2 = x * x;
+    const y2 = y * y;
+    const z2 = z * z;
+    const nx = x * Math.sqrt(Math.max(0, 1 - y2 * 0.5 - z2 * 0.5 + (y2 * z2) / 3));
+    const ny = y * Math.sqrt(Math.max(0, 1 - z2 * 0.5 - x2 * 0.5 + (z2 * x2) / 3));
+    const nz = z * Math.sqrt(Math.max(0, 1 - x2 * 0.5 - y2 * 0.5 + (x2 * y2) / 3));
+    out.set(nx, ny, nz);
+  }
+
+  private sampleCubeGridVertex(
+    face: CubeFaceBasis,
+    u: number,
+    v: number,
+    out: THREE.Vector3,
+  ): void {
+    this.evalCubeSphereDir(face, u, v, out);
+    const r = this.getSurfaceRadiusAt(out.x, out.y, out.z);
+    out.multiplyScalar(r);
+  }
+
+  public getRenderedSurfaceRadiusAt(
+    nx: number,
+    ny: number,
+    nz: number,
+  ): number {
+    _rDir.set(nx, ny, nz);
+    const lenSq = _rDir.lengthSq();
+    if (lenSq < 1e-10) {
+      _rDir.set(0, 1, 0);
+    } else {
+      _rDir.divideScalar(Math.sqrt(lenSq));
+    }
+
+    const ax = Math.abs(_rDir.x);
+    const ay = Math.abs(_rDir.y);
+    const az = Math.abs(_rDir.z);
+    let faceIdx: number;
+    if (ay >= ax && ay >= az) {
+      faceIdx = _rDir.y >= 0 ? 0 : 1;
+    } else if (ax >= ay && ax >= az) {
+      faceIdx = _rDir.x >= 0 ? 2 : 3;
+    } else {
+      faceIdx = _rDir.z >= 0 ? 4 : 5;
+    }
+    const face = CUBE_FACES[faceIdx];
+
+    const maxAbs = Math.max(ax, ay, az, 1e-8);
+    const cx = _rDir.x / maxAbs;
+    const cy = _rDir.y / maxAbs;
+    const cz = _rDir.z / maxAbs;
+    let u = THREE.MathUtils.clamp(
+      cx * face.uAxis[0] + cy * face.uAxis[1] + cz * face.uAxis[2],
+      -1,
+      1,
+    );
+    let v = THREE.MathUtils.clamp(
+      cx * face.vAxis[0] + cy * face.vAxis[1] + cz * face.vAxis[2],
+      -1,
+      1,
+    );
+
+    const eps = 1e-4;
+    const invEps = 1 / eps;
+    for (let iter = 0; iter < 3; iter++) {
+      this.evalCubeSphereDir(face, u, v, _rS0);
+      this.evalCubeSphereDir(face, u + eps, v, _rSu);
+      this.evalCubeSphereDir(face, u, v + eps, _rSv);
+
+      _rSu.sub(_rS0).multiplyScalar(invEps);
+      _rSv.sub(_rS0).multiplyScalar(invEps);
+      _rRes.subVectors(_rS0, _rDir);
+
+      const j00 = _rSu.dot(_rSu);
+      const j01 = _rSu.dot(_rSv);
+      const j11 = _rSv.dot(_rSv);
+      const det = j00 * j11 - j01 * j01;
+      if (Math.abs(det) < 1e-12) break;
+
+      const rhs0 = -_rSu.dot(_rRes);
+      const rhs1 = -_rSv.dot(_rRes);
+      const du = (rhs0 * j11 - rhs1 * j01) / det;
+      const dv = (j00 * rhs1 - j01 * rhs0) / det;
+      u = THREE.MathUtils.clamp(u + du, -1, 1);
+      v = THREE.MathUtils.clamp(v + dv, -1, 1);
+    }
+
+    const grid = PATCH_SUBDIV * PATCH_SEGMENTS;
+    const gu = (u + 1) * 0.5 * grid;
+    const gv = (v + 1) * 0.5 * grid;
+    const i = Math.min(Math.max(Math.floor(gu), 0), grid - 1);
+    const j = Math.min(Math.max(Math.floor(gv), 0), grid - 1);
+    const fu = gu - i;
+    const fv = gv - j;
+
+    const invGrid2 = 2 / grid;
+    const u0 = -1 + i * invGrid2;
+    const u1 = -1 + (i + 1) * invGrid2;
+    const v0 = -1 + j * invGrid2;
+    const v1 = -1 + (j + 1) * invGrid2;
+
+    if (fu + fv <= 1) {
+      this.sampleCubeGridVertex(face, u0, v0, _rTriA); // tl
+      this.sampleCubeGridVertex(face, u1, v0, _rTriB); // tr
+      this.sampleCubeGridVertex(face, u0, v1, _rTriC); // bl
+    } else {
+      this.sampleCubeGridVertex(face, u1, v0, _rTriA); // tr
+      this.sampleCubeGridVertex(face, u1, v1, _rTriB); // br
+      this.sampleCubeGridVertex(face, u0, v1, _rTriC); // bl
+    }
+
+    _rEdge1.subVectors(_rTriB, _rTriA);
+    _rEdge2.subVectors(_rTriC, _rTriA);
+    _rTriN.crossVectors(_rEdge1, _rEdge2);
+
+    const denom = _rTriN.dot(_rDir);
+    if (Math.abs(denom) < 1e-8) {
+      return this.getSurfaceRadiusAt(_rDir.x, _rDir.y, _rDir.z);
+    }
+    const t = _rTriN.dot(_rTriA) / denom;
+    if (!Number.isFinite(t) || t <= 0) {
+      return this.getSurfaceRadiusAt(_rDir.x, _rDir.y, _rDir.z);
+    }
+    return t;
+  }
+
+  public getRenderedSupportRadiusAt(
+    nx: number,
+    ny: number,
+    nz: number,
+    footprint = 1.6,
+  ): number {
+    _sDir.set(nx, ny, nz);
+    const lenSq = _sDir.lengthSq();
+    if (lenSq < 1e-10) {
+      _sDir.set(0, 1, 0);
+    } else {
+      _sDir.divideScalar(Math.sqrt(lenSq));
+    }
+
+    let maxR = this.getRenderedSurfaceRadiusAt(_sDir.x, _sDir.y, _sDir.z);
+
+    if (Math.abs(_sDir.y) < 0.9) {
+      _sT1.set(0, 1, 0);
+    } else {
+      _sT1.set(1, 0, 0);
+    }
+    _sT1.crossVectors(_sT1, _sDir).normalize();
+    _sT2.crossVectors(_sDir, _sT1).normalize();
+
+    const ang = footprint / Math.max(maxR, 1);
+
+    _sSample.copy(_sDir).addScaledVector(_sT1, ang).normalize();
+    const r1 = this.getRenderedSurfaceRadiusAt(_sSample.x, _sSample.y, _sSample.z);
+    if (r1 > maxR) maxR = r1;
+
+    _sSample.copy(_sDir).addScaledVector(_sT1, -ang).normalize();
+    const r2 = this.getRenderedSurfaceRadiusAt(_sSample.x, _sSample.y, _sSample.z);
+    if (r2 > maxR) maxR = r2;
+
+    _sSample.copy(_sDir).addScaledVector(_sT2, ang).normalize();
+    const r3 = this.getRenderedSurfaceRadiusAt(_sSample.x, _sSample.y, _sSample.z);
+    if (r3 > maxR) maxR = r3;
+
+    _sSample.copy(_sDir).addScaledVector(_sT2, -ang).normalize();
+    const r4 = this.getRenderedSurfaceRadiusAt(_sSample.x, _sSample.y, _sSample.z);
+    if (r4 > maxR) maxR = r4;
+
+    return maxR;
+  }
+
+  public getMeshPointAtCubeUV(
+    faceIdx: number,
+    u: number,
+    v: number,
+    out: THREE.Vector3,
+  ): THREE.Vector3 {
+    const face = CUBE_FACES[faceIdx];
+    const grid = PATCH_SUBDIV * PATCH_SEGMENTS;
+    const cu = THREE.MathUtils.clamp(u, -1, 1);
+    const cv = THREE.MathUtils.clamp(v, -1, 1);
+    const gu = (cu + 1) * 0.5 * grid;
+    const gv = (cv + 1) * 0.5 * grid;
+    const i = Math.min(Math.max(Math.floor(gu), 0), grid - 1);
+    const j = Math.min(Math.max(Math.floor(gv), 0), grid - 1);
+    const fu = gu - i;
+    const fv = gv - j;
+
+    const invGrid2 = 2 / grid;
+    const u0 = -1 + i * invGrid2;
+    const u1 = -1 + (i + 1) * invGrid2;
+    const v0 = -1 + j * invGrid2;
+    const v1 = -1 + (j + 1) * invGrid2;
+
+    this.sampleCubeGridVertex(face, u0, v0, _mPtl);
+    this.sampleCubeGridVertex(face, u1, v0, _mPtr);
+    this.sampleCubeGridVertex(face, u0, v1, _mPbl);
+    this.sampleCubeGridVertex(face, u1, v1, _mPbr);
+
+    if (fu + fv <= 1) {
+      out
+        .copy(_mPtl)
+        .addScaledVector(_nD1.subVectors(_mPtr, _mPtl), fu)
+        .addScaledVector(_nD2.subVectors(_mPbl, _mPtl), fv);
+    } else {
+      out
+        .copy(_mPbr)
+        .addScaledVector(_nD1.subVectors(_mPbl, _mPbr), 1 - fu)
+        .addScaledVector(_nD2.subVectors(_mPtr, _mPbr), 1 - fv);
+    }
+    return out;
+  }
+
   public findLandDirection(
     startIndex: number,
     out: THREE.Vector3,
@@ -549,46 +966,51 @@ export class PlanetTerrainManager {
     return out.set(bestNx, bestNy, bestNz).normalize();
   }
 
-  public update(elapsed: number, cameraPos?: THREE.Vector3, dt?: number): void {
-    this.moonMesh.getWorldPosition(this.prevMoonCenter);
-    this.moonPivot.rotation.y = elapsed * 0.035;
-    this.moonMesh.rotation.y = elapsed * 0.08;
-    this.moonMesh.getWorldPosition(this.moonCenter);
-    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
-
-    const stepDt = dt !== undefined ? dt : elapsed - this.lastUpdateElapsed;
-    this.lastUpdateElapsed = elapsed;
-    if (stepDt > 0.0001) {
-      this.moonVelocity
-        .subVectors(this.moonCenter, this.prevMoonCenter)
-        .divideScalar(stepDt);
-    } else {
-      this.moonVelocity.set(0, 0, 0);
-    }
-
-    if (cameraPos) {
-      this.updateHorizonCulling(cameraPos);
+  public update(elapsed: number, sunDir?: THREE.Vector3): void {
+    this.timeUniform.value = elapsed;
+    if (sunDir) {
+      this.atmosphereMat.uniforms.uSunDir.value.copy(sunDir).normalize();
     }
   }
 
-  public updateHorizonCulling(cameraPos: THREE.Vector3): void {
+  public updateHorizonCulling(
+    cameraPos: THREE.Vector3,
+    camera?: THREE.Camera,
+  ): void {
     const camDist = cameraPos.length();
-    if (camDist <= this.params.planetRadius) {
-      for (let i = 0; i < this.patches.length; i++) {
-        this.patches[i].mesh.visible = true;
-      }
-      return;
+    const applyHorizon = camDist > this.params.planetRadius;
+
+    let horizonAngle = Math.PI;
+    let cosH = -1;
+    let sinH = 0;
+    if (applyHorizon) {
+      _camDir.copy(cameraPos).divideScalar(camDist);
+      horizonAngle = Math.acos(this.params.planetRadius / camDist) + 0.05;
+      cosH = Math.cos(horizonAngle);
+      sinH = Math.sin(horizonAngle);
     }
 
-    _camDir.copy(cameraPos).divideScalar(camDist);
-    const horizonAngle =
-      Math.acos(this.params.planetRadius / camDist) + 0.05;
+    if (camera) {
+      camera.updateMatrixWorld();
+      _cullProjScreenMatrix.multiplyMatrices(
+        camera.projectionMatrix,
+        camera.matrixWorldInverse,
+      );
+      _cullFrustum.setFromProjectionMatrix(_cullProjScreenMatrix);
+    }
 
     for (let i = 0; i < this.patches.length; i++) {
       const patch = this.patches[i];
-      const dot = THREE.MathUtils.clamp(_camDir.dot(patch.centerDir), -1, 1);
-      const angle = Math.acos(dot);
-      patch.mesh.visible = angle <= horizonAngle + patch.angularRadius;
+      let visible = true;
+      if (applyHorizon && horizonAngle + patch.angularRadius < Math.PI) {
+        visible =
+          _camDir.dot(patch.centerDir) >=
+          cosH * patch.cosAngR - sinH * patch.sinAngR;
+      }
+      if (visible && camera && patch.geometry.boundingSphere) {
+        visible = _cullFrustum.intersectsSphere(patch.geometry.boundingSphere);
+      }
+      patch.mesh.visible = visible;
     }
   }
 
@@ -618,12 +1040,16 @@ export class PlanetTerrainManager {
     const { planetRadius, atmosphereHeight } = this.params;
     const atmoRadius = planetRadius + Math.max(15, atmosphereHeight * 1.15);
     this.atmosphereMesh.scale.setScalar(atmoRadius);
-    this.moonMesh.scale.setScalar(planetRadius * MOON_RADIUS_RATIO);
+    const moonRadius = planetRadius * MOON_RADIUS_RATIO;
+    this.moonMesh.scale.setScalar(moonRadius);
     this.moonMesh.position.set(planetRadius * 2.55, planetRadius * 0.45, 0);
+    this.moonPivot.rotation.set(0, 0, 0);
+    this.moonMesh.rotation.set(0, 0, 0);
+    this.moonPivot.updateMatrixWorld(true);
     this.moonMesh.getWorldPosition(this.moonCenter);
-    this.prevMoonCenter.copy(this.moonCenter);
     this.moonVelocity.set(0, 0, 0);
-    this.moonMesh.getWorldQuaternion(this.moonWorldQuat);
+    this.moonWorldQuat.identity();
+    this.moonState.radius = moonRadius;
   }
 
   private computeSmoothTerrainNormal(
@@ -716,10 +1142,14 @@ export class PlanetTerrainManager {
       const normAttr = patch.geometry.getAttribute(
         'normal',
       ) as THREE.BufferAttribute;
+      const grassAttr = patch.geometry.getAttribute(
+        'aGrass',
+      ) as THREE.BufferAttribute;
 
       const positions = posAttr.array as Float32Array;
       const colors = colAttr.array as Float32Array;
       const normals = normAttr.array as Float32Array;
+      const grass = grassAttr.array as Float32Array;
 
       let vi = 0;
       for (let py = 0; py <= PATCH_SEGMENTS; py++) {
@@ -764,11 +1194,32 @@ export class PlanetTerrainManager {
           normals[vi * 3 + 2] = snz;
 
           const rawHeightNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
-          getBiomeColor(nx, ny, nz, rawHeightNorm, seaLevel, this.tempColor);
+          getBiomeColor(
+            nx,
+            ny,
+            nz,
+            rawHeightNorm,
+            seaLevel,
+            this.tempColor,
+            _biomeSample,
+          );
 
           colors[vi * 3] = this.tempColor.r;
           colors[vi * 3 + 1] = this.tempColor.g;
           colors[vi * 3 + 2] = this.tempColor.b;
+
+          const dotSlope = THREE.MathUtils.clamp(
+            snx * nx + sny * ny + snz * nz,
+            0,
+            1,
+          );
+          grass[vi] =
+            getGrassCoverage(
+              _biomeSample.T,
+              _biomeSample.M,
+              rawHeightNorm,
+              seaLevel,
+            ) * smoothstep(0.8, 0.92, dotSlope);
           vi++;
         }
       }
@@ -776,6 +1227,7 @@ export class PlanetTerrainManager {
       posAttr.needsUpdate = true;
       colAttr.needsUpdate = true;
       normAttr.needsUpdate = true;
+      grassAttr.needsUpdate = true;
       patch.geometry.computeBoundingSphere();
     }
 

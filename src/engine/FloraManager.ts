@@ -1,10 +1,9 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { FloraParams, PlanetParams, QualityLevel } from '../types/simulation';
+import { PlanetParams, FloraParams, QualityLevel } from '../types/simulation';
 import { BiomeId, BiomeSample, sampleBiome } from './biomes';
-import { PlanetTerrainManager } from './PlanetTerrainManager';
+import { CUBE_FACES, PlanetTerrainManager } from './PlanetTerrainManager';
 import {
-  getPlanetSurfaceHeight,
   getPlanetTerrainHeight,
   simplex3,
   spherifyCubePoint,
@@ -16,11 +15,10 @@ type SpeciesId =
   | 'palm'
   | 'cactus'
   | 'shrub'
-  | 'grass'
   | 'rock'
   | 'mushroom';
 
-type FloraCategory = 'tree' | 'small' | 'grass';
+type FloraCategory = 'tree' | 'small';
 
 export interface TreeCollider {
   x: number;
@@ -49,33 +47,19 @@ interface BiomeFloraEntry {
 
 interface BiomeFloraProfile {
   density: number;
-  grassWeight: number;
   foliageHex: number;
   entries: BiomeFloraEntry[];
 }
 
-interface CubeFaceBasis {
-  normal: [number, number, number];
-  uAxis: [number, number, number];
-  vAxis: [number, number, number];
-}
-
-// Same 6 cube-sphere faces as PlanetTerrainManager
-const CUBE_FACES: CubeFaceBasis[] = [
-  { normal: [0, 1, 0], uAxis: [1, 0, 0], vAxis: [0, 0, -1] },
-  { normal: [0, -1, 0], uAxis: [1, 0, 0], vAxis: [0, 0, 1] },
-  { normal: [1, 0, 0], uAxis: [0, 0, -1], vAxis: [0, 1, 0] },
-  { normal: [-1, 0, 0], uAxis: [0, 0, 1], vAxis: [0, 1, 0] },
-  { normal: [0, 0, 1], uAxis: [1, 0, 0], vAxis: [0, 1, 0] },
-  { normal: [0, 0, -1], uAxis: [-1, 0, 0], vAxis: [0, 1, 0] },
-];
-
 const SEED_FIXA = 0x4f7a9c2b;
 const VARIANTS_PER_SPECIES = 3;
-const CELL_CACHE_LIMIT = 600;
-const MAX_CELLS_PER_FRAME = 12;
-const INSTANCE_STRIDE = 13; // px, py, pz, nx, ny, nz, yaw, scale, speciesIdx, variantIdx, r, g, b
+const GROUP_CACHE_LIMIT = 400;
+const TIME_BUDGET_MS = 2.0;
+const MAX_GROUP_MEMBERS = 256;
+const COS_8_DEG = Math.cos(THREE.MathUtils.degToRad(8));
+const COS_24_DEG = Math.cos(THREE.MathUtils.degToRad(24));
 const COS_32_DEG = Math.cos(THREE.MathUtils.degToRad(32));
+const MAX_ROCK_TILT_RAD = THREE.MathUtils.degToRad(12);
 
 const SPECIES_LIST: SpeciesSpec[] = [
   { id: 'conifer', category: 'tree', maxDist: 230, minAboveSea: 0.04, maxRawNorm: 0.55 },
@@ -83,7 +67,6 @@ const SPECIES_LIST: SpeciesSpec[] = [
   { id: 'palm', category: 'tree', maxDist: 230, minAboveSea: 0.0, maxRawNorm: 0.28 },
   { id: 'cactus', category: 'small', maxDist: 150, minAboveSea: 0.04, maxRawNorm: 0.46 },
   { id: 'shrub', category: 'small', maxDist: 150, minAboveSea: 0.04, maxRawNorm: 0.52 },
-  { id: 'grass', category: 'grass', maxDist: 65, minAboveSea: 0.04, maxRawNorm: 0.5 },
   { id: 'rock', category: 'small', maxDist: 150, minAboveSea: 0.02, maxRawNorm: 0.9 },
   { id: 'mushroom', category: 'small', maxDist: 150, minAboveSea: 0.04, maxRawNorm: 0.48 },
 ];
@@ -94,16 +77,136 @@ const SPECIES_INDEX: Record<SpeciesId, number> = {
   palm: 2,
   cactus: 3,
   shrub: 4,
-  grass: 5,
-  rock: 6,
-  mushroom: 7,
+  rock: 5,
+  mushroom: 6,
 };
+
+interface GroupSpec {
+  minCount: number;
+  maxCount: number;
+  areaPerMember: number;
+  minDist: number;
+  slopeLimitCos: number;
+  lod0Dist: number;
+  lod1Dist: number;
+}
+
+const SPECIES_GROUP_SPEC: Record<SpeciesId, GroupSpec> = {
+  conifer: {
+    minCount: 40,
+    maxCount: 80,
+    areaPerMember: 22,
+    minDist: 2.5,
+    slopeLimitCos: COS_24_DEG,
+    lod0Dist: 110,
+    lod1Dist: 230,
+  },
+  broadleaf: {
+    minCount: 40,
+    maxCount: 80,
+    areaPerMember: 22,
+    minDist: 2.5,
+    slopeLimitCos: COS_24_DEG,
+    lod0Dist: 110,
+    lod1Dist: 230,
+  },
+  palm: {
+    minCount: 12,
+    maxCount: 30,
+    areaPerMember: 30,
+    minDist: 3.5,
+    slopeLimitCos: COS_24_DEG,
+    lod0Dist: 110,
+    lod1Dist: 230,
+  },
+  cactus: {
+    minCount: 15,
+    maxCount: 35,
+    areaPerMember: 30,
+    minDist: 3.0,
+    slopeLimitCos: COS_24_DEG,
+    lod0Dist: 70,
+    lod1Dist: 150,
+  },
+  shrub: {
+    minCount: 30,
+    maxCount: 60,
+    areaPerMember: 9,
+    minDist: 1.4,
+    slopeLimitCos: COS_32_DEG,
+    lod0Dist: 70,
+    lod1Dist: 150,
+  },
+  rock: {
+    minCount: 12,
+    maxCount: 30,
+    areaPerMember: 14,
+    minDist: 1.5,
+    slopeLimitCos: COS_32_DEG,
+    lod0Dist: 70,
+    lod1Dist: 150,
+  },
+  mushroom: {
+    minCount: 25,
+    maxCount: 50,
+    areaPerMember: 2.5,
+    minDist: 0.35,
+    slopeLimitCos: COS_32_DEG,
+    lod0Dist: 70,
+    lod1Dist: 150,
+  },
+};
+
+export interface FloraStats {
+  groupsActive: number;
+  groupsLod0: number;
+  groupsLod1: number;
+  instancesDrawn: number;
+  activeMeshes: number;
+}
+
+interface FloraGroupRecord {
+  id: number;
+  cellIdx: number;
+  faceIdx: number;
+  u: number;
+  v: number;
+  cx: number;
+  cy: number;
+  cz: number;
+  nx: number;
+  ny: number;
+  nz: number;
+  speciesIdx: number;
+  tintR: number;
+  tintG: number;
+  tintB: number;
+  baseCount: number;
+  baseRadius: number;
+  radius: number;
+  seed: number;
+  maxAllowedNorm: number;
+  lodState: -1 | 0 | 1 | 2;
+  priorityScore: number;
+}
+
+interface GeneratedGroup {
+  count: number;
+  matrices: Float32Array;
+  colors: Float32Array;
+  variants: Uint8Array;
+}
+
+interface VisibleGroupEntry {
+  group: FloraGroupRecord;
+  lod: 0 | 1;
+  sortDist: number;
+}
 
 // Editable biome -> species table
 const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   desert: {
     density: 0.5,
-    grassWeight: 0,
     foliageHex: 0x7f914e,
     entries: [
       { species: 'cactus', weight: 45 },
@@ -113,7 +216,6 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   grassland: {
     density: 0.8,
-    grassWeight: 1,
     foliageHex: 0x68ba45,
     entries: [
       { species: 'shrub', weight: 35 },
@@ -124,7 +226,6 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   forest: {
     density: 1.3,
-    grassWeight: 1,
     foliageHex: 0x2da64b,
     entries: [
       { species: 'broadleaf', weight: 50 },
@@ -136,7 +237,6 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   taiga: {
     density: 1.0,
-    grassWeight: 1,
     foliageHex: 0x225235,
     entries: [
       { species: 'conifer', weight: 65 },
@@ -147,7 +247,6 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   tundra: {
     density: 0.5,
-    grassWeight: 1,
     foliageHex: 0x7a8050,
     entries: [
       { species: 'shrub', weight: 40 },
@@ -157,7 +256,6 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   mountain: {
     density: 0.4,
-    grassWeight: 0,
     foliageHex: 0x29593e,
     entries: [
       { species: 'rock', weight: 75 },
@@ -166,19 +264,16 @@ const BIOME_FLORA_TABLE: Record<BiomeId, BiomeFloraProfile> = {
   },
   beach: {
     density: 0.15,
-    grassWeight: 0,
     foliageHex: 0x4aad43,
     entries: [{ species: 'palm', weight: 100, minT: 0.55 }],
   },
   ocean: {
     density: 0,
-    grassWeight: 0,
     foliageHex: 0x4a7c59,
     entries: [],
   },
   ice: {
     density: 0,
-    grassWeight: 0,
     foliageHex: 0x4a7c59,
     entries: [],
   },
@@ -188,22 +283,48 @@ const MAX_BIOME_DENSITY = 1.3;
 
 // Pre-allocated scratch helpers (Zero GC during update/streaming/queries)
 const _shipDir = new THREE.Vector3();
-const _queryDir = new THREE.Vector3();
 const _candDir = new THREE.Vector3();
 const _candNormal = new THREE.Vector3();
+const _memDir = new THREE.Vector3();
+const _memNormal = new THREE.Vector3();
+const _memRadial = new THREE.Vector3();
+const _meshPt = new THREE.Vector3();
+const _camPos = new THREE.Vector3();
+const _camDir = new THREE.Vector3();
+const _camForward = new THREE.Vector3();
+const _toGroup = new THREE.Vector3();
 const _instPos = new THREE.Vector3();
-const _instNormal = new THREE.Vector3();
+const _instUp = new THREE.Vector3();
 const _instScale = new THREE.Vector3();
 const _instQuat = new THREE.Quaternion();
 const _alignQuat = new THREE.Quaternion();
 const _yawQuat = new THREE.Quaternion();
+const _tiltQuat = new THREE.Quaternion();
+const _tiltAxis = new THREE.Vector3();
 const _unitY = new THREE.Vector3(0, 1, 0);
 const _instMatrix = new THREE.Matrix4();
 const _instColor = new THREE.Color();
 const _baseTintColor = new THREE.Color();
+const _partColor = new THREE.Color();
+const _cullCamera = new THREE.PerspectiveCamera();
+const _projScreenMatrix = new THREE.Matrix4();
+const _frustum = new THREE.Frustum();
+const _groupSphere = new THREE.Sphere();
 const _biomeSample: BiomeSample = { biome: 'ocean', T: 0.5, M: 0.5 };
-const _eligibleWeights = new Float32Array(8);
-const _eligibleIndices = new Int32Array(8);
+const _eligibleWeights = new Float32Array(10);
+const _eligibleIndices = new Int32Array(10);
+const _eligibleMaxNorm = new Float32Array(10);
+
+// Pre-allocated temporary buffers for lazy group generation (Zero GC)
+const _genMat = new Float32Array(MAX_GROUP_MEMBERS * 16);
+const _genCol = new Float32Array(MAX_GROUP_MEMBERS * 3);
+const _genVar = new Uint8Array(MAX_GROUP_MEMBERS);
+const _genRank = new Float32Array(MAX_GROUP_MEMBERS);
+const _genOrder = new Int32Array(MAX_GROUP_MEMBERS);
+const _placedX = new Float32Array(MAX_GROUP_MEMBERS);
+const _placedY = new Float32Array(MAX_GROUP_MEMBERS);
+const _gridHead = new Int32Array(1024);
+const _gridNext = new Int32Array(MAX_GROUP_MEMBERS);
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -222,9 +343,49 @@ function hashCell(face: number, i: number, j: number, seed: number): number {
   return (h ^ (h >>> 15)) >>> 0;
 }
 
+function hashGroupSeed(groupId: number, seed: number): number {
+  let h = seed ^ Math.imul(groupId + 1, 0x9e3779b1);
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function uploadAttribute(
+  attr: THREE.InstancedBufferAttribute,
+  count: number,
+): void {
+  const ext = attr as THREE.InstancedBufferAttribute & {
+    addUpdateRange?: (start: number, count: number) => void;
+    clearUpdateRanges?: () => void;
+  };
+  if (typeof ext.addUpdateRange === 'function') {
+    ext.clearUpdateRanges?.();
+    ext.addUpdateRange(0, count * attr.itemSize);
+  }
+  attr.needsUpdate = true;
+}
+
 function smoothstep(edge0: number, edge1: number, x: number): number {
   const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1);
   return t * t * (3 - 2 * t);
+}
+
+function prepPartHex(
+  geo: THREE.BufferGeometry,
+  hex: number,
+  tint: number,
+  shade = 1,
+  deform?: (pos: THREE.BufferAttribute) => void,
+): THREE.BufferGeometry {
+  _partColor.setHex(hex).multiplyScalar(shade);
+  return prepPart(
+    geo,
+    _partColor.r,
+    _partColor.g,
+    _partColor.b,
+    tint,
+    deform,
+  );
 }
 
 function prepPart(
@@ -282,6 +443,21 @@ function mergeParts(parts: THREE.BufferGeometry[]): THREE.BufferGeometry {
   return merged;
 }
 
+function getSpeciesTrunkRadius(species: SpeciesId, variantIdx: number): number {
+  switch (species) {
+    case 'conifer':
+      return 0.34 + variantIdx * 0.07;
+    case 'broadleaf':
+      return 0.36 + variantIdx * 0.08;
+    case 'palm':
+      return 0.38;
+    case 'cactus':
+      return 0.38 + variantIdx * 0.05;
+    default:
+      return 0;
+  }
+}
+
 function buildConiferVariant(variantIdx: number): THREE.BufferGeometry {
   const rng = mulberry32(0x10101 + variantIdx * 977);
   const layers = 3 + variantIdx; // 3, 4, 5 cones
@@ -290,9 +466,17 @@ function buildConiferVariant(variantIdx: number): THREE.BufferGeometry {
   const trunkR = 0.34 + variantIdx * 0.07;
 
   const parts: THREE.BufferGeometry[] = [];
-  const trunk = new THREE.CylinderGeometry(trunkR * 0.65, trunkR, trunkH, 6);
-  trunk.translate(0, trunkH * 0.5, 0);
-  parts.push(prepPart(trunk, 0.34, 0.22, 0.14, 0));
+  const trunk = new THREE.CylinderGeometry(trunkR * 0.65, trunkR, trunkH + 0.9, 6);
+  trunk.translate(0, (trunkH - 0.9) * 0.5, 0);
+  parts.push(prepPartHex(trunk, 0x5b3a24, 0));
+
+  const rootFlare = new THREE.CylinderGeometry(trunkR * 0.95, trunkR * 1.6, 0.5, 6);
+  rootFlare.translate(0, 0.25, 0);
+  parts.push(prepPartHex(rootFlare, 0x5b3a24, 0, 0.92));
+
+  const rootBuried = new THREE.CylinderGeometry(trunkR * 1.6, trunkR * 1.35, 0.9, 6);
+  rootBuried.translate(0, -0.45, 0);
+  parts.push(prepPartHex(rootBuried, 0x5b3a24, 0, 0.85));
 
   const crownSpan = totalHeight - trunkH * 0.55;
   for (let l = 0; l < layers; l++) {
@@ -318,9 +502,17 @@ function buildBroadleafVariant(variantIdx: number): THREE.BufferGeometry {
   const trunkR = 0.36 + variantIdx * 0.08;
 
   const parts: THREE.BufferGeometry[] = [];
-  const trunk = new THREE.CylinderGeometry(trunkR * 0.68, trunkR * 1.15, trunkH, 6);
-  trunk.translate(0, trunkH * 0.5, 0);
-  parts.push(prepPart(trunk, 0.38, 0.25, 0.16, 0));
+  const trunk = new THREE.CylinderGeometry(trunkR * 0.68, trunkR * 1.15, trunkH + 0.9, 6);
+  trunk.translate(0, (trunkH - 0.9) * 0.5, 0);
+  parts.push(prepPartHex(trunk, 0x6a4429, 0));
+
+  const rootFlare = new THREE.CylinderGeometry(trunkR * 1.05, trunkR * 1.6, 0.5, 6);
+  rootFlare.translate(0, 0.25, 0);
+  parts.push(prepPartHex(rootFlare, 0x6a4429, 0, 0.92));
+
+  const rootBuried = new THREE.CylinderGeometry(trunkR * 1.6, trunkR * 1.35, 0.9, 6);
+  rootBuried.translate(0, -0.45, 0);
+  parts.push(prepPartHex(rootBuried, 0x6a4429, 0, 0.85));
 
   for (let p = 0; p < puffs; p++) {
     const angle = (p / puffs) * Math.PI * 2 + rng() * 0.5;
@@ -339,7 +531,7 @@ function buildBroadleafVariant(variantIdx: number): THREE.BufferGeometry {
       branch.rotateZ(-Math.PI * 0.32);
       branch.rotateY(-angle);
       branch.translate(ox * 0.48, trunkH * 0.86, oz * 0.48);
-      parts.push(prepPart(branch, 0.38, 0.25, 0.16, 0));
+      parts.push(prepPartHex(branch, 0x6a4429, 0));
     }
 
     const puff = new THREE.IcosahedronGeometry(rad, 0);
@@ -363,8 +555,17 @@ function buildPalmVariant(variantIdx: number): THREE.BufferGeometry {
   const leanX = Math.cos(leanDirAngle);
   const leanZ = Math.sin(leanDirAngle);
   const curveAmp = 1.1 + variantIdx * 0.35;
+  const baseR = 0.38;
 
   const parts: THREE.BufferGeometry[] = [];
+  const rootFlare = new THREE.CylinderGeometry(baseR * 0.95, baseR * 1.6, 0.5, 6);
+  rootFlare.translate(0, 0.25, 0);
+  parts.push(prepPartHex(rootFlare, 0x6f5236, 0));
+
+  const rootBuried = new THREE.CylinderGeometry(baseR * 1.6, baseR * 1.35, 0.9, 6);
+  rootBuried.translate(0, -0.45, 0);
+  parts.push(prepPartHex(rootBuried, 0x6f5236, 0));
+
   let curX = 0;
   let curY = 0;
   let curZ = 0;
@@ -376,8 +577,8 @@ function buildPalmVariant(variantIdx: number): THREE.BufferGeometry {
     const nextY = t1 * trunkH;
     const nextZ = leanZ * curveAmp * t1 * t1;
 
-    const rBot = THREE.MathUtils.lerp(0.38, 0.22, t0);
-    const rTop = THREE.MathUtils.lerp(0.38, 0.22, t1);
+    const rBot = THREE.MathUtils.lerp(baseR, 0.22, t0);
+    const rTop = THREE.MathUtils.lerp(baseR, 0.22, t1);
     const seg = new THREE.CylinderGeometry(rTop, rBot, segH * 1.08, 6);
 
     const dx = nextX - curX;
@@ -390,7 +591,7 @@ function buildPalmVariant(variantIdx: number): THREE.BufferGeometry {
     );
     seg.applyQuaternion(q);
     seg.translate((curX + nextX) * 0.5, (curY + nextY) * 0.5, (curZ + nextZ) * 0.5);
-    parts.push(prepPart(seg, 0.45, 0.34, 0.22, 0));
+    parts.push(prepPartHex(seg, s % 2 === 0 ? 0x8a6a45 : 0x6f5236, 0));
 
     curX = nextX;
     curY = nextY;
@@ -420,9 +621,13 @@ function buildCactusVariant(variantIdx: number): THREE.BufferGeometry {
   const rad = 0.38 + variantIdx * 0.05;
 
   const parts: THREE.BufferGeometry[] = [];
+  const buriedRoot = new THREE.CylinderGeometry(rad * 0.96, rad * 0.9, 0.98, 7);
+  buriedRoot.translate(0, -0.42, 0);
+  parts.push(prepPartHex(buriedRoot, 0x4f7a3a, 0, 0.92));
+
   const body = new THREE.CapsuleGeometry(rad, Math.max(1.2, height - rad * 2), 4, 7);
   body.translate(0, height * 0.5, 0);
-  parts.push(prepPart(body, 0.86, 0.96, 0.84, 1));
+  parts.push(prepPartHex(body, 0x4f7a3a, 0));
 
   const actualArms = variantIdx === 0 ? 1 : armCount + 1;
   for (let a = 0; a < actualArms; a++) {
@@ -437,13 +642,13 @@ function buildCactusVariant(variantIdx: number): THREE.BufferGeometry {
     horiz.translate(armOut * 0.5, 0, 0);
     horiz.rotateY(angle);
     horiz.translate(0, armY, 0);
-    parts.push(prepPart(horiz, 0.84, 0.95, 0.82, 1));
+    parts.push(prepPartHex(horiz, 0x4f7a3a, 0, 0.96));
 
     const vert = new THREE.CapsuleGeometry(armR * 0.95, armUp, 3, 6);
     vert.translate(armOut, armUp * 0.5, 0);
     vert.rotateY(angle);
     vert.translate(0, armY, 0);
-    parts.push(prepPart(vert, 0.88, 0.98, 0.86, 1));
+    parts.push(prepPartHex(vert, 0x4f7a3a, 0, 1.04));
   }
 
   return mergeParts(parts);
@@ -455,6 +660,10 @@ function buildShrubVariant(variantIdx: number): THREE.BufferGeometry {
   const baseH = 1.2 + variantIdx * 0.38;
 
   const parts: THREE.BufferGeometry[] = [];
+  const buriedBase = new THREE.CylinderGeometry(baseH * 0.42, baseH * 0.32, 1.05, 6);
+  buriedBase.translate(0, -0.38, 0);
+  parts.push(prepPart(buriedBase, 0.72, 0.78, 0.68, 1));
+
   for (let p = 0; p < puffs; p++) {
     const r = baseH * (0.55 + rng() * 0.2);
     const geo = new THREE.IcosahedronGeometry(r, 0);
@@ -469,41 +678,6 @@ function buildShrubVariant(variantIdx: number): THREE.BufferGeometry {
     );
     const shade = 0.86 + rng() * 0.16;
     parts.push(prepPart(geo, shade * 0.92, shade, shade * 0.88, 1));
-  }
-
-  return mergeParts(parts);
-}
-
-function buildGrassVariant(variantIdx: number): THREE.BufferGeometry {
-  const rng = mulberry32(0x60606 + variantIdx * 887);
-  const blades = 5 + variantIdx;
-  const baseH = 0.82 + variantIdx * 0.22;
-
-  const parts: THREE.BufferGeometry[] = [];
-  for (let b = 0; b < blades; b++) {
-    const angle = (b / blades) * Math.PI * 2 + (rng() - 0.5) * 0.35;
-    const bh = baseH * (0.85 + rng() * 0.3);
-    const bw = 0.14 + rng() * 0.06;
-    const lean = 0.25 + rng() * 0.32;
-    const spreadR = rng() * 0.22;
-
-    const geo = new THREE.BufferGeometry();
-    const verts = new Float32Array([
-      -bw, 0, 0,
-      bw, 0, 0,
-      0, bh, lean,
-    ]);
-    geo.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-    geo.rotateY(angle);
-    geo.translate(Math.cos(angle) * spreadR, 0, Math.sin(angle) * spreadR);
-
-    const prepared = prepPart(geo, 1, 1, 1, 1);
-    const colAttr = prepared.getAttribute('color') as THREE.BufferAttribute;
-    colAttr.setXYZ(0, 0.58, 0.65, 0.52);
-    colAttr.setXYZ(1, 0.58, 0.65, 0.52);
-    colAttr.setXYZ(2, 0.98, 1.0, 0.94);
-    colAttr.needsUpdate = true;
-    parts.push(prepared);
   }
 
   return mergeParts(parts);
@@ -530,7 +704,10 @@ function buildRockVariant(variantIdx: number): THREE.BufferGeometry {
         z * 0.8 + seedOffZ,
       );
       const disp = 1 + n * 0.28;
-      pos.setXYZ(i, x * disp, Math.max(-radius * 0.35, y * disp + radius * 0.25), z * disp);
+      const outY = y < -radius * 0.22
+        ? -0.9
+        : Math.max(-0.22, y * disp + radius * 0.25);
+      pos.setXYZ(i, x * disp, outY, z * disp);
     }
   });
 
@@ -546,16 +723,16 @@ function buildRockVariant(variantIdx: number): THREE.BufferGeometry {
 
 function buildMushroomVariant(variantIdx: number): THREE.BufferGeometry {
   const rng = mulberry32(0x80808 + variantIdx * 839);
-  const height = 2.0 + variantIdx * 1.0 + rng() * 0.45;
-  const stalkH = height * 0.74;
-  const stalkR = 0.18 + variantIdx * 0.05;
-  const capR = 0.85 + variantIdx * 0.32;
+  const height = 0.55 + variantIdx * 0.25 + rng() * 0.15;
+  const stalkH = height * 0.72;
+  const stalkR = 0.05 + variantIdx * 0.02;
+  const capR = 0.22 + variantIdx * 0.1 + rng() * 0.08;
   const capH = height * 0.38;
 
   const parts: THREE.BufferGeometry[] = [];
-  const stalk = new THREE.CylinderGeometry(stalkR * 0.72, stalkR * 1.15, stalkH, 6);
-  stalk.translate(0, stalkH * 0.5, 0);
-  parts.push(prepPart(stalk, 0.85, 0.84, 0.92, 0));
+  const stalk = new THREE.CylinderGeometry(stalkR * 0.72, stalkR * 1.15, stalkH + 0.9, 6);
+  stalk.translate(0, (stalkH - 0.9) * 0.5, 0);
+  parts.push(prepPartHex(stalk, 0xe9e4d8, 0));
 
   const cap = new THREE.ConeGeometry(capR, capH, 7);
   cap.rotateY(rng() * Math.PI);
@@ -577,8 +754,6 @@ function buildSpeciesGeometry(species: SpeciesId, variantIdx: number): THREE.Buf
       return buildCactusVariant(variantIdx);
     case 'shrub':
       return buildShrubVariant(variantIdx);
-    case 'grass':
-      return buildGrassVariant(variantIdx);
     case 'rock':
       return buildRockVariant(variantIdx);
     case 'mushroom':
@@ -588,12 +763,14 @@ function buildSpeciesGeometry(species: SpeciesId, variantIdx: number): THREE.Buf
 
 function createFloraMaterial(options: {
   cacheKey: string;
-  windAmplitude: number; // 0 for rocks, 0.04 for trees, 0.12 for grass
+  windAmplitude: number; // 0 for rocks, 0.04 for trees
   doubleSide?: boolean;
   glowing?: boolean;
   uTime: { value: number };
   uWind: { value: number };
   uSunDir: { value: THREE.Vector3 };
+  uFadeStart: { value: number };
+  uFadeEnd: { value: number };
 }): THREE.MeshStandardMaterial {
   const mat = new THREE.MeshStandardMaterial({
     flatShading: true,
@@ -611,17 +788,45 @@ function createFloraMaterial(options: {
     shader.uniforms.uTime = options.uTime;
     shader.uniforms.uWind = options.uWind;
     shader.uniforms.uSunDir = options.uSunDir;
+    shader.uniforms.uFadeStart = options.uFadeStart;
+    shader.uniforms.uFadeEnd = options.uFadeEnd;
 
     const extraVertDecl = [
       'attribute float aTint;',
       'attribute float aWindH;',
       'uniform float uTime;',
       'uniform float uWind;',
+      'uniform float uFadeStart;',
+      'uniform float uFadeEnd;',
       options.glowing ? 'uniform vec3 uSunDir;' : '',
       options.glowing ? 'varying vec3 vFloraGlow;' : '',
     ]
       .filter(Boolean)
       .join('\n');
+
+    const glowColorChunk = options.glowing
+      ? `vFloraGlow = vec3( 0.0 );
+    #ifdef USE_INSTANCING_COLOR
+      vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, aTint );
+      float mPhase = instanceMatrix[3].x * 0.37 + instanceMatrix[3].y * 0.53 + instanceMatrix[3].z * 0.41;
+      float mPulse = 1.1 + 0.3 * sin(uTime * 2.0944 + mPhase);
+      vec3 mInstNormal = normalize(instanceMatrix[1].xyz);
+      float mNight = 1.0 + 1.5 * (1.0 - smoothstep(-0.3, 0.2, dot(mInstNormal, uSunDir)));
+      vFloraGlow = instanceColor.rgb * aTint * mPulse * mNight;
+    #endif`
+      : `#ifdef USE_INSTANCING_COLOR
+      vColor.rgb *= mix( vec3( 1.0 ), instanceColor.rgb, aTint );
+    #endif`;
+
+    const windSnippet =
+      options.windAmplitude > 0
+        ? `if (fadeScale > 0.001) {
+              float windPhase = uTime * 1.6 + instanceMatrix[3].x * 0.31 + instanceMatrix[3].z * 0.27;
+              float sway = sin(windPhase) * uWind * ${options.windAmplitude.toFixed(3)} * aWindH * aWindH;
+              transformed.x += sway;
+              transformed.z += sway * 0.7;
+            }`
+        : '';
 
     shader.vertexShader = shader.vertexShader
       .replace(
@@ -630,27 +835,34 @@ function createFloraMaterial(options: {
       )
       .replace(
         '#include <begin_vertex>',
-        options.windAmplitude > 0
-          ? `#include <begin_vertex>
-          #ifdef USE_INSTANCING
-            float windPhase = uTime * 1.6 + instanceMatrix[3].x * 0.31 + instanceMatrix[3].z * 0.27;
-            float sway = sin(windPhase) * uWind * ${options.windAmplitude.toFixed(3)} * aWindH * aWindH;
-            transformed.x += sway;
-            transformed.z += sway * 0.7;
-          #endif`
-          : '#include <begin_vertex>',
+        `#include <begin_vertex>
+        #ifdef USE_INSTANCING
+          float fadeDist = distance(instanceMatrix[3].xyz, cameraPosition);
+          float fadeScale = 1.0 - smoothstep(uFadeStart, uFadeEnd, fadeDist);
+          ${windSnippet}
+          transformed *= fadeScale;
+        #endif`,
       )
       .replace(
-        'vColor.rgb *= instanceColor.rgb;',
-        options.glowing
-          ? `vColor.rgb *= mix(vec3(1.0), instanceColor.rgb, aTint);
-          float mPhase = instanceMatrix[3].x * 0.37 + instanceMatrix[3].y * 0.53 + instanceMatrix[3].z * 0.41;
-          float mPulse = 1.1 + 0.3 * sin(uTime * 2.0944 + mPhase);
-          vec3 mInstNormal = normalize(instanceMatrix[1].xyz);
-          float mNight = 1.0 + 1.5 * (1.0 - smoothstep(-0.3, 0.2, dot(mInstNormal, uSunDir)));
-          vFloraGlow = instanceColor.rgb * aTint * mPulse * mNight;`
-          : 'vColor.rgb *= mix(vec3(1.0), instanceColor.rgb, aTint);',
+        '#include <color_vertex>',
+        `#if defined( USE_COLOR ) || defined( USE_COLOR_ALPHA ) || defined( USE_INSTANCING_COLOR ) || defined( USE_BATCHING_COLOR )
+      vColor = vec4( 1.0 );
+    #endif
+    #ifdef USE_COLOR_ALPHA
+      vColor *= color;
+    #elif defined( USE_COLOR )
+      vColor.rgb *= color;
+    #endif
+    ${glowColorChunk}
+    #ifdef USE_BATCHING_COLOR
+      vColor *= getBatchingColor( getIndirectIndex( gl_DrawID ) );
+    #endif
+    /*flora-tint*/`,
       );
+
+    if (!shader.vertexShader.includes('/*flora-tint*/')) {
+      console.warn('Flora: tint shader não aplicado');
+    }
 
     if (options.glowing) {
       shader.fragmentShader = shader.fragmentShader
@@ -671,9 +883,9 @@ function createFloraMaterial(options: {
 }
 
 /**
- * Deterministic Cube-Sphere procedural flora system with wind animation,
- * day/night pulsing glowing mushrooms, landing clearings, tree collision queries,
- * frame-budgeted streaming queue, and LRU cell cache.
+ * Deterministic Cube-Sphere procedural horde-based flora system with lazy
+ * Poisson-sampled groups, precomputed matrix/color buffers, expanded frustum +
+ * horizon culling, LOD hysteresis, 2ms time-budget queue, and LRU cache.
  */
 export class FloraManager {
   private readonly scene: THREE.Scene;
@@ -683,49 +895,69 @@ export class FloraManager {
   private readonly uTime = { value: 0 };
   private readonly uWind = { value: 1 };
   private readonly uSunDir = { value: new THREE.Vector3(0.58, 0.71, 0.4) };
+  private readonly uTreeFadeStart = { value: 230 * 0.82 };
+  private readonly uTreeFadeEnd = { value: 230 };
+  private readonly uSmallFadeStart = { value: 150 * 0.82 };
+  private readonly uSmallFadeEnd = { value: 150 };
 
   private readonly treeMat: THREE.MeshStandardMaterial;
   private readonly smallPlantMat: THREE.MeshStandardMaterial;
   private readonly rockMat: THREE.MeshStandardMaterial;
-  private readonly grassMat: THREE.MeshStandardMaterial;
   private readonly mushroomMat: THREE.MeshStandardMaterial;
 
-  // Flat list [speciesIdx * 3 + variantIdx]
-  private readonly meshes: THREE.InstancedMesh[] = [];
-  private readonly geometries: THREE.BufferGeometry[] = [];
-  private readonly meshCapacities: number[] = [];
-  private readonly meshHeights: number[] = [];
-  private readonly meshSpecies: SpeciesSpec[] = [];
-  private readonly meshCounts = new Int32Array(
+  // Primary meshes [speciesIdx * 3 + variantIdx] (trees here are LOD0 shadow-eligible)
+  private readonly primaryMeshes: THREE.InstancedMesh[] = [];
+  private readonly primaryCapacities: number[] = [];
+  private readonly primaryCounts = new Int32Array(
     SPECIES_LIST.length * VARIANTS_PER_SPECIES,
   );
 
-  // Cube-sphere cell grid metadata
+  // Separate non-shadow-casting LOD1 meshes for tree species [0..2 * 3 + variantIdx]
+  private readonly treeLod1Meshes: THREE.InstancedMesh[] = [];
+  private readonly treeLod1Capacities: number[] = [];
+  private readonly treeLod1Counts = new Int32Array(3 * VARIANTS_PER_SPECIES);
+
+  private readonly allMeshes: THREE.InstancedMesh[] = [];
+  private readonly geometries: THREE.BufferGeometry[] = [];
+  private readonly meshHeights: number[] = [];
+  private readonly speciesMaxHeights = new Float32Array(SPECIES_LIST.length);
+
+  // Cube-sphere cell grid & group registry (at most 1 group per cell)
+  private cachedPlanetSig = '';
   private cachedPlanetRadius = -1;
-  private gridN = 8;
   private cellCount = 0;
   private cellCenters = new Float32Array(0);
   private cellAngRadii = new Float32Array(0);
+  private cellGroups: (FloraGroupRecord | null)[] = [];
+  private maxGroupRadius = 24;
+  private registryInvalidated = true;
 
-  // LRU cell instance cache & streaming state
-  private readonly cellCache = new Map<number, Float32Array>();
+  // Lazy group cache (LRU up to 400 generated groups) & 2ms budget queue
+  private readonly groupCache = new Map<number, GeneratedGroup>();
+  private readonly visibleGroups: VisibleGroupEntry[] = [];
   private readonly activeCellList: number[] = [];
-  private readonly genQueue: number[] = [];
+  private readonly genQueue: FloraGroupRecord[] = [];
   private readonly queuedSet = new Set<number>();
 
   // Landing clearing state
   private clearingActive = false;
   private readonly clearingPos = new THREE.Vector3();
   private clearingRadiusSq = 0;
+  private clearingDirty = false;
 
+  // Visibility, stats & rebuild throttling
   private activeInstanceCount = 0;
-  private needsRebuild = true;
+  private activeMeshCount = 0;
+  private statsGroupsActive = 0;
+  private statsGroupsLod0 = 0;
+  private statsGroupsLod1 = 0;
   private wasVisible = false;
-  private timeSinceRebuild = 99;
   private timeSinceFill = 99;
-  private readonly lastRebuildShipPos = new THREE.Vector3(1e9, 1e9, 1e9);
-  private lastDensityFactor = -1;
-  private readonly tempInstances: number[] = [];
+  private lastFillSignature = 0;
+  private readonly lastEvalShipPos = new THREE.Vector3(1e9, 1e9, 1e9);
+  private readonly lastEvalCamForward = new THREE.Vector3(0, 0, -1);
+  private lastUserDensity = -1;
+  private lastFadeViewRatio = -1;
 
   constructor(
     scene: THREE.Scene,
@@ -741,6 +973,8 @@ export class FloraManager {
       uTime: this.uTime,
       uWind: this.uWind,
       uSunDir: this.uSunDir,
+      uFadeStart: this.uTreeFadeStart,
+      uFadeEnd: this.uTreeFadeEnd,
     });
     this.smallPlantMat = createFloraMaterial({
       cacheKey: 'flora-small',
@@ -748,6 +982,8 @@ export class FloraManager {
       uTime: this.uTime,
       uWind: this.uWind,
       uSunDir: this.uSunDir,
+      uFadeStart: this.uSmallFadeStart,
+      uFadeEnd: this.uSmallFadeEnd,
     });
     this.rockMat = createFloraMaterial({
       cacheKey: 'flora-rock',
@@ -755,14 +991,8 @@ export class FloraManager {
       uTime: this.uTime,
       uWind: this.uWind,
       uSunDir: this.uSunDir,
-    });
-    this.grassMat = createFloraMaterial({
-      cacheKey: 'flora-grass',
-      windAmplitude: 0.12,
-      doubleSide: true,
-      uTime: this.uTime,
-      uWind: this.uWind,
-      uSunDir: this.uSunDir,
+      uFadeStart: this.uSmallFadeStart,
+      uFadeEnd: this.uSmallFadeEnd,
     });
     this.mushroomMat = createFloraMaterial({
       cacheKey: 'flora-mushroom',
@@ -771,37 +1001,36 @@ export class FloraManager {
       uTime: this.uTime,
       uWind: this.uWind,
       uSunDir: this.uSunDir,
+      uFadeStart: this.uSmallFadeStart,
+      uFadeEnd: this.uSmallFadeEnd,
     });
 
     for (let s = 0; s < SPECIES_LIST.length; s++) {
       const spec = SPECIES_LIST[s];
       const mat =
-        spec.id === 'grass'
-          ? this.grassMat
-          : spec.id === 'mushroom'
-            ? this.mushroomMat
-            : spec.id === 'rock'
-              ? this.rockMat
-              : spec.category === 'tree'
-                ? this.treeMat
-                : this.smallPlantMat;
+        spec.id === 'mushroom'
+          ? this.mushroomMat
+          : spec.id === 'rock'
+            ? this.rockMat
+            : spec.category === 'tree'
+              ? this.treeMat
+              : this.smallPlantMat;
 
       const capacity =
         spec.category === 'tree'
           ? this.isMobileOrSoftware
-            ? 1200
-            : 2500
-          : spec.category === 'small'
-            ? this.isMobileOrSoftware
-              ? 1500
-              : 3000
-            : this.isMobileOrSoftware
-              ? 2500
-              : 6000;
+            ? 2500
+            : 6000
+          : this.isMobileOrSoftware
+            ? 5000
+            : 6000;
 
+      let spMaxH = 0.5;
       for (let v = 0; v < VARIANTS_PER_SPECIES; v++) {
         const geo = buildSpeciesGeometry(spec.id, v);
         const height = Math.max(geo.boundingBox?.max.y ?? 1, 0.1);
+        if (height > spMaxH) spMaxH = height;
+
         const mesh = new THREE.InstancedMesh(geo, mat, capacity);
         mesh.frustumCulled = false;
         mesh.castShadow = spec.category === 'tree' ? this.castShadows : false;
@@ -812,11 +1041,27 @@ export class FloraManager {
 
         this.scene.add(mesh);
         this.geometries.push(geo);
-        this.meshes.push(mesh);
-        this.meshCapacities.push(capacity);
+        this.primaryMeshes.push(mesh);
+        this.primaryCapacities.push(capacity);
+        this.allMeshes.push(mesh);
         this.meshHeights.push(height);
-        this.meshSpecies.push(spec);
+
+        if (spec.category === 'tree') {
+          const lod1Mesh = new THREE.InstancedMesh(geo, mat, capacity);
+          lod1Mesh.frustumCulled = false;
+          lod1Mesh.castShadow = false;
+          lod1Mesh.receiveShadow = false;
+          lod1Mesh.count = 0;
+          lod1Mesh.visible = false;
+          lod1Mesh.setColorAt(0, _instColor.setHex(0xffffff));
+
+          this.scene.add(lod1Mesh);
+          this.treeLod1Meshes.push(lod1Mesh);
+          this.treeLod1Capacities.push(capacity);
+          this.allMeshes.push(lod1Mesh);
+        }
       }
+      this.speciesMaxHeights[s] = spMaxH * 1.25;
     }
   }
 
@@ -824,62 +1069,89 @@ export class FloraManager {
     return this.activeInstanceCount;
   }
 
+  public getStats(): FloraStats {
+    return {
+      groupsActive: this.statsGroupsActive,
+      groupsLod0: this.statsGroupsLod0,
+      groupsLod1: this.statsGroupsLod1,
+      instancesDrawn: this.activeInstanceCount,
+      activeMeshes: this.activeMeshCount,
+    };
+  }
+
   public setClearing(position: THREE.Vector3 | null, radius = 8): void {
     if (position === null) {
       if (this.clearingActive) {
         this.clearingActive = false;
         this.clearingRadiusSq = 0;
-        this.timeSinceFill = 99;
+        this.clearingDirty = true;
       }
       return;
     }
     this.clearingActive = true;
     this.clearingPos.copy(position);
     this.clearingRadiusSq = radius * radius;
-    this.timeSinceFill = 99;
+    this.clearingDirty = true;
   }
 
   public setCastShadows(enabled: boolean): void {
     if (this.castShadows === enabled) return;
     this.castShadows = enabled;
-    for (let i = 0; i < this.meshes.length; i++) {
-      if (this.meshSpecies[i].category === 'tree') {
-        this.meshes[i].castShadow = enabled;
+    for (let s = 0; s < 3; s++) {
+      for (let v = 0; v < VARIANTS_PER_SPECIES; v++) {
+        this.primaryMeshes[s * VARIANTS_PER_SPECIES + v].castShadow = enabled;
       }
     }
   }
 
   public invalidate(): void {
-    this.cellCache.clear();
+    this.groupCache.clear();
     this.genQueue.length = 0;
     this.queuedSet.clear();
+    this.visibleGroups.length = 0;
     this.activeCellList.length = 0;
-    this.needsRebuild = true;
-    this.timeSinceRebuild = 99;
+    this.registryInvalidated = true;
+    this.lastFillSignature = 0;
     this.timeSinceFill = 99;
     this.hideAllMeshes();
   }
 
   private hideAllMeshes(): void {
-    for (let i = 0; i < this.meshes.length; i++) {
-      this.meshes[i].count = 0;
-      this.meshes[i].visible = false;
+    for (let i = 0; i < this.allMeshes.length; i++) {
+      this.allMeshes[i].count = 0;
+      this.allMeshes[i].visible = false;
     }
     this.activeInstanceCount = 0;
+    this.activeMeshCount = 0;
+    this.statsGroupsActive = 0;
+    this.statsGroupsLod0 = 0;
+    this.statsGroupsLod1 = 0;
     this.wasVisible = false;
   }
 
-  private ensureCellGrid(planetRadius: number): void {
-    if (planetRadius === this.cachedPlanetRadius) return;
-    this.cachedPlanetRadius = planetRadius;
+  private ensureGroupRegistry(
+    planetManager: PlanetTerrainManager,
+    planet: PlanetParams,
+    userDensityFactor: number,
+  ): void {
+    const sig = `${planet.planetRadius}|${planet.noiseScale}|${planet.maxHeight}|${planet.seaLevel}`;
+    if (!this.registryInvalidated && sig === this.cachedPlanetSig) {
+      return;
+    }
+    this.cachedPlanetSig = sig;
+    this.cachedPlanetRadius = planet.planetRadius;
+    this.registryInvalidated = false;
 
-    const n = Math.max(8, Math.round((planetRadius * (Math.PI * 0.5)) / 32));
-    this.gridN = n;
+    const n = Math.max(8, Math.round((planet.planetRadius * (Math.PI * 0.5)) / 32));
     this.cellCount = 6 * n * n;
     this.cellCenters = new Float32Array(this.cellCount * 3);
     this.cellAngRadii = new Float32Array(this.cellCount);
+    this.cellGroups = new Array<FloraGroupRecord | null>(this.cellCount).fill(null);
 
     const step = 2 / n;
+    const safeMaxH = Math.max(planet.maxHeight, 0.001);
+    const densitySqrt = Math.sqrt(Math.max(0.05, userDensityFactor));
+    let maxR = 24;
     let cellIdx = 0;
 
     for (let f = 0; f < CUBE_FACES.length; f++) {
@@ -927,48 +1199,439 @@ export class FloraManager {
             }
           }
           this.cellAngRadii[cellIdx] = maxAng;
+
+          // At most 1 candidate group per cell on a jittered grid
+          const seed = hashCell(f, i, j, SEED_FIXA);
+          const rng = mulberry32(seed ^ 0x13579bdf);
+          const u = u0 + rng() * step;
+          const v = v0 + rng() * step;
+
+          const gp = spherifyCubePoint(
+            face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
+            face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
+            face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
+          );
+          _candDir.set(gp.nx, gp.ny, gp.nz).normalize();
+
+          const rawH = getPlanetTerrainHeight(
+            _candDir.x,
+            _candDir.y,
+            _candDir.z,
+            planet.planetRadius,
+            planet.noiseScale,
+            planet.maxHeight,
+          );
+          const rawNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
+          sampleBiome(
+            _candDir.x,
+            _candDir.y,
+            _candDir.z,
+            rawNorm,
+            planet.seaLevel,
+            _biomeSample,
+          );
+
+          const biome = _biomeSample.biome;
+          const profile = BIOME_FLORA_TABLE[biome];
+
+          if (
+            biome !== 'ocean' &&
+            biome !== 'ice' &&
+            profile.density > 0 &&
+            profile.entries.length > 0
+          ) {
+            const patchNoise = simplex3(
+              _candDir.x * 5 + 17,
+              _candDir.y * 5,
+              _candDir.z * 5,
+            );
+            const patchMask = THREE.MathUtils.lerp(
+              0.15,
+              1,
+              smoothstep(-0.2, 0.4, patchNoise),
+            );
+            if (rng() <= (profile.density / MAX_BIOME_DENSITY) * patchMask) {
+              planetManager.getSurfaceNormalAt(
+                _candDir.x,
+                _candDir.y,
+                _candDir.z,
+                _candNormal,
+              );
+              const seedCosSlope = _candNormal.dot(_candDir);
+              if (seedCosSlope >= COS_32_DEG) {
+                let eligibleCount = 0;
+                let totalWeight = 0;
+
+                for (let e = 0; e < profile.entries.length; e++) {
+                  const entry = profile.entries[e];
+                  if (entry.minT !== undefined && _biomeSample.T <= entry.minT) {
+                    continue;
+                  }
+                  if (
+                    entry.maxRawNorm !== undefined &&
+                    rawNorm >= entry.maxRawNorm
+                  ) {
+                    continue;
+                  }
+
+                  const spIdx = SPECIES_INDEX[entry.species];
+                  const spec = SPECIES_LIST[spIdx];
+                  const grp = SPECIES_GROUP_SPEC[spec.id];
+                  if (seedCosSlope < grp.slopeLimitCos) continue;
+                  if (
+                    rawNorm <= planet.seaLevel + spec.minAboveSea ||
+                    rawNorm >= spec.maxRawNorm
+                  ) {
+                    continue;
+                  }
+
+                  _eligibleIndices[eligibleCount] = spIdx;
+                  _eligibleWeights[eligibleCount] = entry.weight;
+                  _eligibleMaxNorm[eligibleCount] =
+                    entry.maxRawNorm !== undefined
+                      ? Math.min(spec.maxRawNorm, entry.maxRawNorm)
+                      : spec.maxRawNorm;
+                  totalWeight += entry.weight;
+                  eligibleCount++;
+                }
+
+                if (eligibleCount > 0 && totalWeight > 0) {
+                  let pick = rng() * totalWeight;
+                  let chosenSpIdx = _eligibleIndices[0];
+                  let maxAllowedNorm = _eligibleMaxNorm[0];
+                  for (let e = 0; e < eligibleCount; e++) {
+                    pick -= _eligibleWeights[e];
+                    if (pick <= 0) {
+                      chosenSpIdx = _eligibleIndices[e];
+                      maxAllowedNorm = _eligibleMaxNorm[e];
+                      break;
+                    }
+                  }
+
+                  const chosenId = SPECIES_LIST[chosenSpIdx].id;
+                  const grpSpec = SPECIES_GROUP_SPEC[chosenId];
+                  const baseCount =
+                    grpSpec.minCount +
+                    Math.floor(rng() * (grpSpec.maxCount - grpSpec.minCount + 1));
+                  const baseRadius = Math.sqrt(
+                    (baseCount * grpSpec.areaPerMember) / Math.PI,
+                  );
+                  const radius = baseRadius * densitySqrt;
+                  if (radius > maxR) maxR = radius;
+
+                  if (chosenId === 'mushroom') {
+                    _baseTintColor.setHex(
+                      biome === 'grassland'
+                        ? rng() < 0.5
+                          ? 0xf472b6
+                          : 0x38bdf8
+                        : rng() < 0.5
+                          ? 0x22d3ee
+                          : 0xe879f9,
+                    );
+                  } else {
+                    _baseTintColor.setHex(profile.foliageHex);
+                  }
+
+                  planetManager.getMeshPointAtCubeUV(f, u, v, _meshPt);
+                  const mLen = _meshPt.length() || 1;
+
+                  this.cellGroups[cellIdx] = {
+                    id: cellIdx,
+                    cellIdx,
+                    faceIdx: f,
+                    u,
+                    v,
+                    cx: _meshPt.x,
+                    cy: _meshPt.y,
+                    cz: _meshPt.z,
+                    nx: _meshPt.x / mLen,
+                    ny: _meshPt.y / mLen,
+                    nz: _meshPt.z / mLen,
+                    speciesIdx: chosenSpIdx,
+                    tintR: _baseTintColor.r,
+                    tintG: _baseTintColor.g,
+                    tintB: _baseTintColor.b,
+                    baseCount,
+                    baseRadius,
+                    radius,
+                    seed,
+                    maxAllowedNorm,
+                    lodState: -1,
+                    priorityScore: 0,
+                  };
+                }
+              }
+            }
+          }
+
           cellIdx++;
         }
       }
     }
 
-    this.invalidate();
+    this.maxGroupRadius = maxR;
+    this.lastUserDensity = userDensityFactor;
+    this.groupCache.clear();
+    this.genQueue.length = 0;
+    this.queuedSet.clear();
+    this.visibleGroups.length = 0;
+    this.lastFillSignature = 0;
+  }
+
+  private setCachedGroup(groupId: number, data: GeneratedGroup): void {
+    if (this.groupCache.has(groupId)) {
+      this.groupCache.delete(groupId);
+    }
+    this.groupCache.set(groupId, data);
+    while (this.groupCache.size > GROUP_CACHE_LIMIT) {
+      const oldest = this.groupCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.groupCache.delete(oldest);
+    }
+  }
+
+  private generateGroupData(
+    group: FloraGroupRecord,
+    planetManager: PlanetTerrainManager,
+    planet: PlanetParams,
+    userDensityFactor: number,
+  ): GeneratedGroup {
+    const spIdx = group.speciesIdx;
+    const spec = SPECIES_LIST[spIdx];
+    const spId = spec.id;
+    const grpSpec = SPECIES_GROUP_SPEC[spId];
+    const face = CUBE_FACES[group.faceIdx];
+
+    const rng = mulberry32(hashGroupSeed(group.id, SEED_FIXA));
+    const targetCount = Math.min(
+      MAX_GROUP_MEMBERS,
+      Math.max(1, Math.round(group.baseCount * userDensityFactor)),
+    );
+    const radius = group.radius;
+    const minDist = grpSpec.minDist;
+    const minDistSq = minDist * minDist;
+    const invGridStep = 1 / Math.max(minDist, 0.05);
+    const safeMaxH = Math.max(planet.maxHeight, 0.001);
+    const invFaceScale = 1 / Math.max(planet.planetRadius * 0.785, 1);
+
+    _gridHead.fill(-1);
+    let placed = 0;
+
+    for (let m = 0; m < targetCount; m++) {
+      const maxAttempts = m === 0 ? 1 : 6;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        let dxWorld = 0;
+        let dyWorld = 0;
+        let mu = group.u;
+        let mv = group.v;
+
+        if (m > 0) {
+          const distFrac = Math.sqrt(rng());
+          const falloffProb = 1 - smoothstep(0.55, 1.0, distFrac);
+          if (rng() > falloffProb) continue;
+
+          const ang = rng() * Math.PI * 2;
+          const radWorld = distFrac * radius;
+          dxWorld = Math.cos(ang) * radWorld;
+          dyWorld = Math.sin(ang) * radWorld;
+          mu = group.u + dxWorld * invFaceScale;
+          mv = group.v + dyWorld * invFaceScale;
+          if (mu < -1 || mu > 1 || mv < -1 || mv > 1) continue;
+
+          // Spatial grid Poisson check in 3x3 cells around candidate
+          const gx = Math.floor((dxWorld + radius) * invGridStep);
+          const gy = Math.floor((dyWorld + radius) * invGridStep);
+          let tooClose = false;
+          for (let oy = -1; oy <= 1 && !tooClose; oy++) {
+            const cy = gy + oy;
+            for (let ox = -1; ox <= 1; ox++) {
+              const cx = gx + ox;
+              const bucket = ((Math.imul(cx, 73856093) ^ Math.imul(cy, 19349663)) >>> 0) & 1023;
+              let idx = _gridHead[bucket];
+              while (idx !== -1) {
+                const pdx = dxWorld - _placedX[idx];
+                const pdy = dyWorld - _placedY[idx];
+                if (pdx * pdx + pdy * pdy < minDistSq) {
+                  tooClose = true;
+                  break;
+                }
+                idx = _gridNext[idx];
+              }
+              if (tooClose) break;
+            }
+          }
+          if (tooClose) continue;
+        }
+
+        const mp = spherifyCubePoint(
+          face.normal[0] + mu * face.uAxis[0] + mv * face.vAxis[0],
+          face.normal[1] + mu * face.uAxis[1] + mv * face.vAxis[1],
+          face.normal[2] + mu * face.uAxis[2] + mv * face.vAxis[2],
+        );
+        _memDir.set(mp.nx, mp.ny, mp.nz).normalize();
+
+        if (m > 0) {
+          const memRawH = getPlanetTerrainHeight(
+            _memDir.x,
+            _memDir.y,
+            _memDir.z,
+            planet.planetRadius,
+            planet.noiseScale,
+            planet.maxHeight,
+          );
+          const memRawNorm = THREE.MathUtils.clamp(memRawH / safeMaxH, -1, 1);
+          if (
+            memRawNorm <= planet.seaLevel + spec.minAboveSea ||
+            memRawNorm >= group.maxAllowedNorm
+          ) {
+            continue;
+          }
+        }
+
+        planetManager.getSurfaceNormalAt(
+          _memDir.x,
+          _memDir.y,
+          _memDir.z,
+          _memNormal,
+        );
+        if (m > 0 && _memNormal.dot(_memDir) < grpSpec.slopeLimitCos) {
+          continue;
+        }
+
+        planetManager.getMeshPointAtCubeUV(group.faceIdx, mu, mv, _meshPt);
+
+        const variantIdx = Math.floor(rng() * VARIANTS_PER_SPECIES);
+        const scale =
+          m === 0
+            ? 1.05 + rng() * 0.15
+            : spId === 'rock'
+              ? 0.55 + rng() * 0.5
+              : 0.7 + rng() * 0.45;
+        const yaw = rng() * Math.PI * 2;
+        const lum = 0.9 + rng() * 0.2;
+
+        _memRadial.copy(_meshPt).normalize();
+        const c = THREE.MathUtils.clamp(_memNormal.dot(_memRadial), 0.01, 1);
+        const tanSlope = Math.sqrt(1 - c * c) / c;
+        const trunkR = getSpeciesTrunkRadius(spId, variantIdx);
+        _meshPt.addScaledVector(
+          _memRadial,
+          -(0.2 * scale + trunkR * scale * tanSlope),
+        );
+
+        if (
+          spId === 'conifer' ||
+          spId === 'broadleaf' ||
+          spId === 'palm' ||
+          spId === 'cactus'
+        ) {
+          _instUp.copy(_memRadial);
+        } else if (spId === 'rock') {
+          _instUp.copy(_memNormal);
+        } else {
+          _instUp
+            .copy(_memRadial)
+            .multiplyScalar(0.7)
+            .addScaledVector(_memNormal, 0.3)
+            .normalize();
+        }
+
+        _alignQuat.setFromUnitVectors(_unitY, _instUp);
+        _yawQuat.setFromAxisAngle(_unitY, yaw);
+
+        if (spId === 'rock') {
+          const tiltFrac = Math.abs(
+            Math.sin(yaw * 17.31 + _meshPt.x * 0.13 + _meshPt.z * 0.17),
+          );
+          const tiltAz = Math.cos(yaw * 29.17 + _meshPt.y * 0.19) * Math.PI;
+          _tiltAxis.set(Math.cos(tiltAz), 0, Math.sin(tiltAz));
+          _tiltQuat.setFromAxisAngle(_tiltAxis, tiltFrac * MAX_ROCK_TILT_RAD);
+          _instQuat.copy(_alignQuat).multiply(_tiltQuat).multiply(_yawQuat);
+        } else {
+          _instQuat.copy(_alignQuat).multiply(_yawQuat);
+        }
+
+        _instPos.copy(_meshPt);
+        _instScale.setScalar(scale);
+        _instMatrix.compose(_instPos, _instQuat, _instScale);
+
+        const mOff = placed * 16;
+        const elems = _instMatrix.elements;
+        for (let e = 0; e < 16; e++) {
+          _genMat[mOff + e] = elems[e];
+        }
+
+        const cOff = placed * 3;
+        _genCol[cOff] = group.tintR * lum;
+        _genCol[cOff + 1] = group.tintG * lum;
+        _genCol[cOff + 2] = group.tintB * lum;
+        _genVar[placed] = variantIdx;
+        _genRank[placed] = m === 0 ? -1 : rng();
+        _genOrder[placed] = placed;
+
+        // Register in spatial hash grid
+        _placedX[placed] = dxWorld;
+        _placedY[placed] = dyWorld;
+        const gx = Math.floor((dxWorld + radius) * invGridStep);
+        const gy = Math.floor((dyWorld + radius) * invGridStep);
+        const bucket = ((Math.imul(gx, 73856093) ^ Math.imul(gy, 19349663)) >>> 0) & 1023;
+        _gridNext[placed] = _gridHead[bucket];
+        _gridHead[bucket] = placed;
+
+        placed++;
+        break;
+      }
+    }
+
+    // Sort members by fixed random ranking so LOD1 keeps the first ceil(0.35 * N)
+    const orderView = _genOrder.subarray(0, placed);
+    orderView.sort((a, b) => _genRank[a] - _genRank[b]);
+
+    const matrices = new Float32Array(placed * 16);
+    const colors = new Float32Array(placed * 3);
+    const variants = new Uint8Array(placed);
+
+    for (let i = 0; i < placed; i++) {
+      const srcIdx = _genOrder[i];
+      matrices.set(_genMat.subarray(srcIdx * 16, srcIdx * 16 + 16), i * 16);
+      colors.set(_genCol.subarray(srcIdx * 3, srcIdx * 3 + 3), i * 3);
+      variants[i] = _genVar[srcIdx];
+    }
+
+    return { count: placed, matrices, colors, variants };
   }
 
   public queryTrees(pos: THREE.Vector3, out: TreeCollider[]): number {
     if (this.cellCount === 0 || this.cachedPlanetRadius <= 0) return 0;
 
-    const lenSq = pos.lengthSq();
-    if (lenSq < 0.0001) return 0;
-    _queryDir.copy(pos).divideScalar(Math.sqrt(lenSq));
-
-    // Only inspect nearby cells (~current cell + 8 neighbors, radius ~48 units)
-    const maxAngle = 48 / Math.max(this.cachedPlanetRadius, 1);
-    const centers = this.cellCenters;
-    const angRadii = this.cellAngRadii;
     let count = 0;
+    for (let g = 0; g < this.visibleGroups.length; g++) {
+      const entry = this.visibleGroups[g];
+      if (entry.lod !== 0) continue;
 
-    for (let c = 0; c < this.activeCellList.length; c++) {
-      const cellIdx = this.activeCellList[c];
-      const thresholdAngle = maxAngle + angRadii[cellIdx];
-      if (thresholdAngle < Math.PI) {
-        const dot =
-          centers[cellIdx * 3] * _queryDir.x +
-          centers[cellIdx * 3 + 1] * _queryDir.y +
-          centers[cellIdx * 3 + 2] * _queryDir.z;
-        if (dot <= Math.cos(thresholdAngle)) continue;
-      }
+      const group = entry.group;
+      if (SPECIES_LIST[group.speciesIdx].category !== 'tree') continue;
 
-      const data = this.cellCache.get(cellIdx);
-      if (!data || data.length === 0) continue;
+      const maxReach = 60 + group.radius;
+      const gdx = group.cx - pos.x;
+      const gdy = group.cy - pos.y;
+      const gdz = group.cz - pos.z;
+      if (gdx * gdx + gdy * gdy + gdz * gdz > maxReach * maxReach) continue;
 
-      for (let offset = 0; offset < data.length; offset += INSTANCE_STRIDE) {
-        const spIdx = data[offset + 8];
-        if (SPECIES_LIST[spIdx].category !== 'tree') continue;
+      const gen = this.groupCache.get(group.id);
+      if (!gen) continue;
 
-        const px = data[offset];
-        const py = data[offset + 1];
-        const pz = data[offset + 2];
+      const mat = gen.matrices;
+      const vars = gen.variants;
+      const spBase = group.speciesIdx * VARIANTS_PER_SPECIES;
+
+      for (let m = 0; m < gen.count; m++) {
+        const mOff = m * 16;
+        const px = mat[mOff + 12];
+        const py = mat[mOff + 13];
+        const pz = mat[mOff + 14];
 
         if (this.clearingActive) {
           const cdx = px - this.clearingPos.x;
@@ -979,27 +1642,30 @@ export class FloraManager {
           }
         }
 
-        const varIdx = data[offset + 9];
-        const scale = data[offset + 7];
-        const height = this.meshHeights[spIdx * VARIANTS_PER_SPECIES + varIdx] * scale;
+        const scale = Math.hypot(mat[mOff], mat[mOff + 1], mat[mOff + 2]);
+        const height = this.meshHeights[spBase + vars[m]] * scale;
+        const pLen = Math.hypot(px, py, pz) || 1;
+        const rnx = px / pLen;
+        const rny = py / pLen;
+        const rnz = pz / pLen;
 
         if (count < out.length) {
           const item = out[count];
           item.x = px;
           item.y = py;
           item.z = pz;
-          item.nx = data[offset + 3];
-          item.ny = data[offset + 4];
-          item.nz = data[offset + 5];
+          item.nx = rnx;
+          item.ny = rny;
+          item.nz = rnz;
           item.height = height;
         } else {
           out.push({
             x: px,
             y: py,
             z: pz,
-            nx: data[offset + 3],
-            ny: data[offset + 4],
-            nz: data[offset + 5],
+            nx: rnx,
+            ny: rny,
+            nz: rnz,
             height,
           });
         }
@@ -1023,8 +1689,11 @@ export class FloraManager {
       qualityLevel: QualityLevel;
     },
     sunDir?: THREE.Vector3,
+    camera?: THREE.Camera,
   ): void {
-    this.ensureCellGrid(planet.planetRadius);
+    const userDensityFactor =
+      flora.density * (this.isMobileOrSoftware ? 0.6 : 1.0);
+    this.ensureGroupRegistry(planetManager, planet, userDensityFactor);
 
     this.uTime.value += dt;
     this.uWind.value = quality.qualityLevel >= 2 ? 0 : 1;
@@ -1032,14 +1701,24 @@ export class FloraManager {
       this.uSunDir.value.copy(sunDir);
     }
 
-    // Compute radial altitude relative to planet surface so moon flight never turns planet flora on
+    if (quality.floraViewRatio !== this.lastFadeViewRatio) {
+      this.lastFadeViewRatio = quality.floraViewRatio;
+      const treeMax = Math.max(140, 230 * quality.floraViewRatio);
+      this.uTreeFadeEnd.value = treeMax;
+      this.uTreeFadeStart.value = treeMax * 0.82;
+      const smallMax = Math.max(90, 150 * quality.floraViewRatio);
+      this.uSmallFadeEnd.value = smallMax;
+      this.uSmallFadeStart.value = smallMax * 0.82;
+    }
+
     const shipDist = shipPos.length();
     if (shipDist > 0.0001) {
       _shipDir.copy(shipPos).divideScalar(shipDist);
     } else {
       _shipDir.set(0, 1, 0);
     }
-    const planetAltitude = shipDist - planet.planetRadius - planet.maxHeight * 0.5;
+    const planetAltitude =
+      shipDist - planet.planetRadius - planet.maxHeight * 0.5;
 
     if (!flora.enabled || flora.density <= 0 || planetAltitude >= 150) {
       if (this.wasVisible) {
@@ -1048,492 +1727,433 @@ export class FloraManager {
       return;
     }
 
-    const densityFactor =
-      flora.density *
-      quality.floraDensityRatio *
-      (this.isMobileOrSoftware ? 0.6 : 1.0);
-    if (Math.abs(densityFactor - this.lastDensityFactor) > 0.02) {
-      this.lastDensityFactor = densityFactor;
-      this.invalidate();
-    }
-
-    this.timeSinceRebuild += dt;
-    this.timeSinceFill += dt;
-
-    const movedDistSq = this.lastRebuildShipPos.distanceToSquared(shipPos);
-    const shouldRebuildCells =
-      this.needsRebuild ||
-      !this.wasVisible ||
-      (movedDistSq > 625 && this.timeSinceRebuild >= 0.4);
-
-    if (shouldRebuildCells) {
-      this.rebuildActiveCellList(
-        shipPos,
-        planet.planetRadius,
-        quality.floraViewRatio,
-      );
-      this.needsRebuild = false;
-      this.timeSinceRebuild = 0;
-      this.lastRebuildShipPos.copy(shipPos);
-
-      if (this.genQueue.length === 0) {
-        this.fillInstancedMeshes(shipPos, quality.floraViewRatio);
-        this.timeSinceFill = 0;
-      }
-    }
-
-    let queueEmptied = false;
-    if (this.genQueue.length > 0) {
-      const budget = Math.min(MAX_CELLS_PER_FRAME, this.genQueue.length);
-      for (let g = 0; g < budget; g++) {
-        const cellIdx = this.genQueue.pop();
-        if (cellIdx === undefined) break;
-        this.queuedSet.delete(cellIdx);
-        if (!this.cellCache.has(cellIdx)) {
-          const data = this.generateCellInstances(
-            cellIdx,
-            planetManager,
-            planet,
-            densityFactor,
-          );
-          this.setCachedCell(cellIdx, data);
+    if (Math.abs(userDensityFactor - this.lastUserDensity) > 0.02) {
+      this.lastUserDensity = userDensityFactor;
+      const densitySqrt = Math.sqrt(Math.max(0.05, userDensityFactor));
+      for (let i = 0; i < this.cellGroups.length; i++) {
+        const g = this.cellGroups[i];
+        if (g) {
+          g.radius = g.baseRadius * densitySqrt;
+          g.lodState = -1;
+          if (g.radius > this.maxGroupRadius) {
+            this.maxGroupRadius = g.radius;
+          }
         }
       }
-      if (this.genQueue.length === 0) {
-        queueEmptied = true;
+      this.groupCache.clear();
+      this.genQueue.length = 0;
+      this.queuedSet.clear();
+      this.lastFillSignature = 0;
+      this.timeSinceFill = 99;
+    }
+
+    // Update camera culling helpers (30% expanded FOV frustum + forward direction)
+    let hasFrustum = false;
+    if (camera) {
+      camera.updateMatrixWorld();
+      camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+      camera.getWorldPosition(_camPos);
+      camera.getWorldDirection(_camForward);
+
+      if (camera instanceof THREE.PerspectiveCamera) {
+        const targetFov = Math.min(165, camera.fov * 1.3);
+        if (
+          _cullCamera.fov !== targetFov ||
+          _cullCamera.aspect !== camera.aspect ||
+          _cullCamera.near !== camera.near ||
+          _cullCamera.far !== camera.far
+        ) {
+          _cullCamera.fov = targetFov;
+          _cullCamera.aspect = camera.aspect;
+          _cullCamera.near = camera.near;
+          _cullCamera.far = camera.far;
+          _cullCamera.updateProjectionMatrix();
+        }
+        _projScreenMatrix.multiplyMatrices(
+          _cullCamera.projectionMatrix,
+          camera.matrixWorldInverse,
+        );
+        _frustum.setFromProjectionMatrix(_projScreenMatrix);
+        hasFrustum = true;
+      }
+    } else {
+      _camPos.copy(shipPos);
+      _camForward.copy(_shipDir);
+    }
+
+    const camLen = _camPos.length();
+    if (camLen > 0.0001) {
+      _camDir.copy(_camPos).divideScalar(camLen);
+    } else {
+      _camDir.set(0, 1, 0);
+    }
+
+    this.timeSinceFill += dt;
+    const movedDistSq = this.lastEvalShipPos.distanceToSquared(shipPos);
+    const camRotated = _camForward.dot(this.lastEvalCamForward) < COS_8_DEG;
+
+    const shouldEvaluate =
+      !this.wasVisible ||
+      this.clearingDirty ||
+      this.timeSinceFill >= 0.15 ||
+      movedDistSq > 144 ||
+      camRotated;
+
+    let generatedThisFrame = 0;
+
+    if (shouldEvaluate) {
+      this.evaluateVisibleGroups(
+        shipPos,
+        planet,
+        quality.floraViewRatio,
+        hasFrustum,
+      );
+      this.lastEvalShipPos.copy(shipPos);
+      this.lastEvalCamForward.copy(_camForward);
+    }
+
+    // Process lazy group generation queue under 2ms time budget
+    if (this.genQueue.length > 0) {
+      const tStart = performance.now();
+      while (this.genQueue.length > 0) {
+        const group = this.genQueue.pop();
+        if (!group) break;
+        this.queuedSet.delete(group.id);
+        if (!this.groupCache.has(group.id)) {
+          const gen = this.generateGroupData(
+            group,
+            planetManager,
+            planet,
+            userDensityFactor,
+          );
+          this.setCachedGroup(group.id, gen);
+          generatedThisFrame++;
+        }
+        if (performance.now() - tStart >= TIME_BUDGET_MS) {
+          break;
+        }
       }
     }
 
-    if (queueEmptied || this.timeSinceFill >= 0.3 || !this.wasVisible) {
-      this.fillInstancedMeshes(shipPos, quality.floraViewRatio);
-      this.timeSinceFill = 0;
+    // Rebuild InstancedMesh buffers when visible/LOD/cache signature changes (throttled to <= 0.15s) or clearing updated
+    if (
+      this.clearingDirty ||
+      !this.wasVisible ||
+      ((shouldEvaluate || generatedThisFrame > 0) && this.timeSinceFill >= 0.15)
+    ) {
+      const sig = this.computeSignature(quality.floraDensityRatio);
+      if (sig !== this.lastFillSignature || this.clearingDirty || !this.wasVisible) {
+        this.fillInstancedMeshes(quality.floraDensityRatio);
+        this.lastFillSignature = sig;
+        this.clearingDirty = false;
+        this.timeSinceFill = 0;
+      } else {
+        this.timeSinceFill = 0;
+      }
     }
 
     this.wasVisible = true;
   }
 
-  private rebuildActiveCellList(
+  private evaluateVisibleGroups(
     shipPos: THREE.Vector3,
-    planetRadius: number,
-    viewRatio: number,
-  ): void {
-    this.activeCellList.length = 0;
-    this.genQueue.length = 0;
-    this.queuedSet.clear();
-
-    const maxRange = 230 * viewRatio;
-    const baseAngle = maxRange / Math.max(planetRadius, 1);
-
-    for (let idx = 0; idx < this.cellCount; idx++) {
-      const maxAng = baseAngle + this.cellAngRadii[idx];
-      let visible = false;
-      if (maxAng >= Math.PI) {
-        visible = true;
-      } else {
-        const cx = this.cellCenters[idx * 3];
-        const cy = this.cellCenters[idx * 3 + 1];
-        const cz = this.cellCenters[idx * 3 + 2];
-        const dot =
-          cx * _shipDir.x + cy * _shipDir.y + cz * _shipDir.z;
-        if (dot > Math.cos(maxAng)) {
-          visible = true;
-        }
-      }
-
-      if (visible) {
-        this.activeCellList.push(idx);
-        if (!this.cellCache.has(idx)) {
-          this.genQueue.push(idx);
-          this.queuedSet.add(idx);
-        }
-      }
-    }
-
-    if (this.genQueue.length > 1) {
-      const sx = _shipDir.x;
-      const sy = _shipDir.y;
-      const sz = _shipDir.z;
-      const centers = this.cellCenters;
-      this.genQueue.sort((a, b) => {
-        const da =
-          centers[a * 3] * sx +
-          centers[a * 3 + 1] * sy +
-          centers[a * 3 + 2] * sz;
-        const db =
-          centers[b * 3] * sx +
-          centers[b * 3 + 1] * sy +
-          centers[b * 3 + 2] * sz;
-        return da - db;
-      });
-    }
-
-    void shipPos;
-  }
-
-  private setCachedCell(cellIdx: number, data: Float32Array): void {
-    if (this.cellCache.has(cellIdx)) {
-      this.cellCache.delete(cellIdx);
-    }
-    this.cellCache.set(cellIdx, data);
-    while (this.cellCache.size > CELL_CACHE_LIMIT) {
-      const oldest = this.cellCache.keys().next().value;
-      if (oldest === undefined) break;
-      this.cellCache.delete(oldest);
-    }
-  }
-
-  private generateCellInstances(
-    cellIdx: number,
-    planetManager: PlanetTerrainManager,
     planet: PlanetParams,
-    densityFactor: number,
-  ): Float32Array {
-    const n = this.gridN;
-    const perFace = n * n;
-    const faceIdx = Math.floor(cellIdx / perFace);
-    const rem = cellIdx - faceIdx * perFace;
-    const j = Math.floor(rem / n);
-    const i = rem - j * n;
+    viewRatio: number,
+    hasFrustum: boolean,
+  ): void {
+    this.visibleGroups.length = 0;
+    this.activeCellList.length = 0;
 
-    const face = CUBE_FACES[faceIdx];
-    const step = 2 / n;
-    const uStart = -1 + i * step;
-    const vStart = -1 + j * step;
+    const maxTreeDist = Math.max(140, 230 * viewRatio);
+    const maxSearchDist = maxTreeDist + Math.max(24, this.maxGroupRadius);
+    const baseAngle = maxSearchDist / Math.max(planet.planetRadius, 1);
 
-    const cellSeed = hashCell(faceIdx, i, j, SEED_FIXA);
-    const rngLarge = mulberry32(cellSeed ^ 0x13579bdf);
-    const rngGrass = mulberry32(cellSeed ^ 0x2468ace1);
+    const camLen = _camPos.length();
+    const horizonR = Math.max(
+      1,
+      planet.planetRadius + Math.min(0, planet.seaLevel * planet.maxHeight) - 4,
+    );
+    const camHorizonAngle = Math.acos(
+      THREE.MathUtils.clamp(horizonR / Math.max(camLen, horizonR), -1, 1),
+    );
 
-    const safeMaxH = Math.max(planet.maxHeight, 0.001);
-    const out = this.tempInstances;
-    out.length = 0;
+    const centers = this.cellCenters;
+    const angRadii = this.cellAngRadii;
+    let newlyQueued = false;
 
-    // Pass 1: Large flora
-    const largeCandidates = Math.round(14 * MAX_BIOME_DENSITY * densityFactor);
-    const largeCols = Math.max(1, Math.ceil(Math.sqrt(largeCandidates)));
-    const largeRows = Math.max(1, Math.ceil(largeCandidates / largeCols));
-
-    for (let k = 0; k < largeCandidates; k++) {
-      const gx = k % largeCols;
-      const gy = Math.floor(k / largeCols);
-      const u = uStart + ((gx + rngLarge()) / largeCols) * step;
-      const v = vStart + ((gy + rngLarge()) / largeRows) * step;
-
-      const { nx, ny, nz } = spherifyCubePoint(
-        face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
-        face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
-        face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
-      );
-      _candDir.set(nx, ny, nz).normalize();
-
-      const rawH = getPlanetTerrainHeight(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        planet.planetRadius,
-        planet.noiseScale,
-        planet.maxHeight,
-      );
-      const rawNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
-      sampleBiome(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        rawNorm,
-        planet.seaLevel,
-        _biomeSample,
-      );
-
-      const biome = _biomeSample.biome;
-      if (biome === 'ocean' || biome === 'ice') continue;
-
-      const profile = BIOME_FLORA_TABLE[biome];
-      if (profile.density <= 0 || profile.entries.length === 0) continue;
-      if (rngLarge() > profile.density / MAX_BIOME_DENSITY) continue;
-
-      planetManager.getSurfaceNormalAt(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        _candNormal,
-      );
-      if (_candNormal.dot(_candDir) < COS_32_DEG) continue;
-
-      let eligibleCount = 0;
-      let totalWeight = 0;
-      for (let e = 0; e < profile.entries.length; e++) {
-        const entry = profile.entries[e];
-        if (entry.minT !== undefined && _biomeSample.T <= entry.minT) continue;
-        if (entry.maxRawNorm !== undefined && rawNorm >= entry.maxRawNorm) continue;
-
-        const spIdx = SPECIES_INDEX[entry.species];
-        const spec = SPECIES_LIST[spIdx];
-        if (
-          rawNorm <= planet.seaLevel + spec.minAboveSea ||
-          rawNorm >= spec.maxRawNorm
-        ) {
-          continue;
-        }
-        _eligibleIndices[eligibleCount] = spIdx;
-        _eligibleWeights[eligibleCount] = entry.weight;
-        totalWeight += entry.weight;
-        eligibleCount++;
+    for (let cellIdx = 0; cellIdx < this.cellCount; cellIdx++) {
+      const maxAng = baseAngle + angRadii[cellIdx];
+      if (maxAng < Math.PI) {
+        const dot =
+          centers[cellIdx * 3] * _shipDir.x +
+          centers[cellIdx * 3 + 1] * _shipDir.y +
+          centers[cellIdx * 3 + 2] * _shipDir.z;
+        if (dot <= Math.cos(maxAng)) continue;
       }
 
-      if (eligibleCount === 0 || totalWeight <= 0) continue;
+      this.activeCellList.push(cellIdx);
+      const group = this.cellGroups[cellIdx];
+      if (!group) continue;
 
-      let pick = rngLarge() * totalWeight;
-      let chosenSpIdx = _eligibleIndices[0];
-      for (let e = 0; e < eligibleCount; e++) {
-        pick -= _eligibleWeights[e];
-        if (pick <= 0) {
-          chosenSpIdx = _eligibleIndices[e];
-          break;
+      const spIdx = group.speciesIdx;
+      const spec = SPECIES_LIST[spIdx];
+      const grpSpec = SPECIES_GROUP_SPEC[spec.id];
+      const sphereR = group.radius + this.speciesMaxHeights[spIdx];
+
+      const sdx = group.cx - shipPos.x;
+      const sdy = group.cy - shipPos.y;
+      const sdz = group.cz - shipPos.z;
+      const shipDist = Math.sqrt(sdx * sdx + sdy * sdy + sdz * sdz);
+      const edgeDist = Math.max(0, shipDist - group.radius);
+
+      // LOD thresholds with ±8% hysteresis and quality-safe minimums
+      const isTree = spec.category === 'tree';
+      const t0 = Math.max(isTree ? 70 : 45, grpSpec.lod0Dist * viewRatio);
+      const t1 = Math.max(isTree ? 140 : 90, grpSpec.lod1Dist * viewRatio);
+      let nextLod: 0 | 1 | 2;
+
+      if (group.lodState === -1) {
+        if (edgeDist <= t0) nextLod = 0;
+        else if (edgeDist <= t1) nextLod = 1;
+        else nextLod = 2;
+      } else if (group.lodState === 0) {
+        if (edgeDist > t0 * 1.08) {
+          nextLod = edgeDist <= t1 * 1.08 ? 1 : 2;
+        } else {
+          nextLod = 0;
         }
-      }
-
-      const chosenId = SPECIES_LIST[chosenSpIdx].id;
-      const variantIdx = Math.floor(rngLarge() * VARIANTS_PER_SPECIES);
-      const scale = 0.85 + rngLarge() * 0.32;
-      const yaw = rngLarge() * Math.PI * 2;
-      const surfH = getPlanetSurfaceHeight(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        planet.planetRadius,
-        planet.noiseScale,
-        planet.maxHeight,
-        planet.seaLevel,
-      );
-      const r = planet.planetRadius + surfH - 0.15 * scale;
-
-      if (chosenId === 'mushroom') {
-        _baseTintColor.setHex(
-          biome === 'grassland'
-            ? rngLarge() < 0.5
-              ? 0xf472b6
-              : 0x38bdf8
-            : rngLarge() < 0.5
-              ? 0x22d3ee
-              : 0xe879f9,
-        );
+      } else if (group.lodState === 1) {
+        if (edgeDist < t0 * 0.92) nextLod = 0;
+        else if (edgeDist > t1 * 1.08) nextLod = 2;
+        else nextLod = 1;
       } else {
-        _baseTintColor.setHex(profile.foliageHex);
+        if (edgeDist < t0 * 0.92) nextLod = 0;
+        else if (edgeDist < t1 * 0.92) nextLod = 1;
+        else nextLod = 2;
       }
-      const lum = 0.9 + rngLarge() * 0.2;
-      _baseTintColor.multiplyScalar(lum);
+      group.lodState = nextLod;
+      if (nextLod === 2) continue;
 
-      out.push(
-        _candDir.x * r,
-        _candDir.y * r,
-        _candDir.z * r,
-        _candNormal.x,
-        _candNormal.y,
-        _candNormal.z,
-        yaw,
-        scale,
-        chosenSpIdx,
-        variantIdx,
-        _baseTintColor.r,
-        _baseTintColor.g,
-        _baseTintColor.b,
+      // Planet horizon dot culling
+      const grpR = Math.hypot(group.cx, group.cy, group.cz);
+      const grpHorizonAngle = Math.acos(
+        THREE.MathUtils.clamp(horizonR / Math.max(grpR, horizonR), -1, 1),
       );
-    }
-
-    // Pass 2: Cover pass (grass)
-    const grassCandidates = Math.round(70 * densityFactor);
-    const grassCols = Math.max(1, Math.ceil(Math.sqrt(grassCandidates)));
-    const grassRows = Math.max(1, Math.ceil(grassCandidates / grassCols));
-    const grassSpec = SPECIES_LIST[SPECIES_INDEX.grass];
-    const grassSpIdx = SPECIES_INDEX.grass;
-
-    for (let k = 0; k < grassCandidates; k++) {
-      const gx = k % grassCols;
-      const gy = Math.floor(k / grassCols);
-      const u = uStart + ((gx + rngGrass()) / grassCols) * step;
-      const v = vStart + ((gy + rngGrass()) / grassRows) * step;
-
-      const { nx, ny, nz } = spherifyCubePoint(
-        face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
-        face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
-        face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
-      );
-      _candDir.set(nx, ny, nz).normalize();
-
-      const rawH = getPlanetTerrainHeight(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        planet.planetRadius,
-        planet.noiseScale,
-        planet.maxHeight,
-      );
-      const rawNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
-      if (
-        rawNorm <= planet.seaLevel + grassSpec.minAboveSea ||
-        rawNorm >= grassSpec.maxRawNorm
-      ) {
-        continue;
+      const maxVisAngle =
+        camHorizonAngle + grpHorizonAngle + sphereR / horizonR;
+      if (maxVisAngle < Math.PI) {
+        const hDot =
+          _camDir.x * group.nx +
+          _camDir.y * group.ny +
+          _camDir.z * group.nz;
+        if (hDot < Math.cos(maxVisAngle)) continue;
       }
 
-      sampleBiome(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        rawNorm,
-        planet.seaLevel,
-        _biomeSample,
-      );
+      // Expanded frustum culling (always keep within 60u of camera)
+      const cdx = group.cx - _camPos.x;
+      const cdy = group.cy - _camPos.y;
+      const cdz = group.cz - _camPos.z;
+      const camDistSq = cdx * cdx + cdy * cdy + cdz * cdz;
+      if (hasFrustum && camDistSq >= 3600) {
+        _groupSphere.center.set(group.cx, group.cy, group.cz);
+        _groupSphere.radius = sphereR;
+        if (!_frustum.intersectsSphere(_groupSphere)) continue;
+      }
 
-      const biome = _biomeSample.biome;
-      const profile = BIOME_FLORA_TABLE[biome];
-      if (profile.grassWeight <= 0) continue;
-      if (rngGrass() > Math.min(1, profile.density)) continue;
+      this.visibleGroups.push({
+        group,
+        lod: nextLod,
+        sortDist: edgeDist,
+      });
 
-      planetManager.getSurfaceNormalAt(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        _candNormal,
-      );
-      if (_candNormal.dot(_candDir) < COS_32_DEG) continue;
-
-      const variantIdx = Math.floor(rngGrass() * VARIANTS_PER_SPECIES);
-      const scale = 0.85 + rngGrass() * 0.3;
-      const yaw = rngGrass() * Math.PI * 2;
-      const surfH = getPlanetSurfaceHeight(
-        _candDir.x,
-        _candDir.y,
-        _candDir.z,
-        planet.planetRadius,
-        planet.noiseScale,
-        planet.maxHeight,
-        planet.seaLevel,
-      );
-      const r = planet.planetRadius + surfH - 0.15 * scale;
-
-      _baseTintColor.setHex(profile.foliageHex);
-      const lum = 0.9 + rngGrass() * 0.2;
-      _baseTintColor.multiplyScalar(lum);
-
-      out.push(
-        _candDir.x * r,
-        _candDir.y * r,
-        _candDir.z * r,
-        _candNormal.x,
-        _candNormal.y,
-        _candNormal.z,
-        yaw,
-        scale,
-        grassSpIdx,
-        variantIdx,
-        _baseTintColor.r,
-        _baseTintColor.g,
-        _baseTintColor.b,
-      );
+      if (!this.groupCache.has(group.id) && !this.queuedSet.has(group.id)) {
+        const camDist = Math.sqrt(camDistSq) || 1;
+        _toGroup.set(cdx / camDist, cdy / camDist, cdz / camDist);
+        const fwdDot = THREE.MathUtils.clamp(_toGroup.dot(_camForward), -1, 1);
+        group.priorityScore = shipDist * (1.35 - 0.55 * fwdDot);
+        this.genQueue.push(group);
+        this.queuedSet.add(group.id);
+        newlyQueued = true;
+      }
     }
 
-    return new Float32Array(out);
+    // Sort visible groups ascending by distance so overflow drops the farthest members first
+    if (this.visibleGroups.length > 1) {
+      this.visibleGroups.sort((a, b) => a.sortDist - b.sortDist);
+    }
+
+    // Sort queue descending by priorityScore so pop() gets closest & ahead-of-camera first
+    if (newlyQueued && this.genQueue.length > 1) {
+      this.genQueue.sort((a, b) => b.priorityScore - a.priorityScore);
+    }
   }
 
-  private fillInstancedMeshes(
-    shipPos: THREE.Vector3,
-    viewRatio: number,
-  ): void {
-    this.meshCounts.fill(0);
+  private computeSignature(densityRatio: number): number {
+    let sig = 0x811c9dc5;
+    sig = Math.imul(sig ^ Math.round(densityRatio * 100), 0x01000193);
+    sig = Math.imul(sig ^ (this.clearingActive ? 1 : 0), 0x01000193);
 
-    for (let c = 0; c < this.activeCellList.length; c++) {
-      const cellIdx = this.activeCellList[c];
-      const data = this.cellCache.get(cellIdx);
-      if (!data || data.length === 0) continue;
+    for (let i = 0; i < this.visibleGroups.length; i++) {
+      const entry = this.visibleGroups[i];
+      if (!this.groupCache.has(entry.group.id)) continue;
+      sig = Math.imul(
+        sig ^ (entry.group.id * 4 + entry.lod + 1),
+        0x01000193,
+      );
+    }
+    return sig >>> 0;
+  }
 
-      this.cellCache.delete(cellIdx);
-      this.cellCache.set(cellIdx, data);
+  private fillInstancedMeshes(qualityDensityRatio: number): void {
+    this.primaryCounts.fill(0);
+    this.treeLod1Counts.fill(0);
 
-      for (let offset = 0; offset < data.length; offset += INSTANCE_STRIDE) {
-        const px = data[offset];
-        const py = data[offset + 1];
-        const pz = data[offset + 2];
+    let groupsLod0 = 0;
+    let groupsLod1 = 0;
 
+    for (let g = 0; g < this.visibleGroups.length; g++) {
+      const entry = this.visibleGroups[g];
+      const group = entry.group;
+      const gen = this.groupCache.get(group.id);
+      if (!gen || gen.count === 0) continue;
+
+      // Refresh LRU position
+      this.groupCache.delete(group.id);
+      this.groupCache.set(group.id, gen);
+
+      if (entry.lod === 0) groupsLod0++;
+      else groupsLod1++;
+
+      const spIdx = group.speciesIdx;
+      const isTreeLod1 =
+        SPECIES_LIST[spIdx].category === 'tree' && entry.lod === 1;
+      const baseSlot = spIdx * VARIANTS_PER_SPECIES;
+
+      const rawDraw =
+        qualityDensityRatio >= 0.999
+          ? gen.count
+          : Math.min(gen.count, Math.max(1, Math.ceil(gen.count * qualityDensityRatio)));
+      const drawCount =
+        entry.lod === 1
+          ? Math.min(gen.count, Math.max(1, Math.ceil(rawDraw * 0.35)))
+          : rawDraw;
+      const applyLodScale = entry.lod === 1;
+
+      const srcMats = gen.matrices;
+      const srcCols = gen.colors;
+      const srcVars = gen.variants;
+
+      for (let m = 0; m < drawCount; m++) {
+        const slot = baseSlot + srcVars[m];
+        const mesh = isTreeLod1
+          ? this.treeLod1Meshes[slot]
+          : this.primaryMeshes[slot];
+        const cap = isTreeLod1
+          ? this.treeLod1Capacities[slot]
+          : this.primaryCapacities[slot];
+        const outIdx = isTreeLod1
+          ? this.treeLod1Counts[slot]
+          : this.primaryCounts[slot];
+
+        if (outIdx >= cap) continue;
+
+        const matArr = mesh.instanceMatrix.array as Float32Array;
+        const colArr = mesh.instanceColor!.array as Float32Array;
+        const dstM = outIdx * 16;
+        const dstC = outIdx * 3;
+        const srcM = m * 16;
+        const srcC = m * 3;
+
+        matArr.set(srcMats.subarray(srcM, srcM + 16), dstM);
+        colArr.set(srcCols.subarray(srcC, srcC + 3), dstC);
+
+        let cleared = false;
         if (this.clearingActive) {
-          const cdx = px - this.clearingPos.x;
-          const cdy = py - this.clearingPos.y;
-          const cdz = pz - this.clearingPos.z;
+          const cdx = matArr[dstM + 12] - this.clearingPos.x;
+          const cdy = matArr[dstM + 13] - this.clearingPos.y;
+          const cdz = matArr[dstM + 14] - this.clearingPos.z;
           if (cdx * cdx + cdy * cdy + cdz * cdz < this.clearingRadiusSq) {
-            continue;
+            for (let e = 0; e < 11; e++) {
+              matArr[dstM + e] = 0;
+            }
+            cleared = true;
           }
         }
 
-        const dx = px - shipPos.x;
-        const dy = py - shipPos.y;
-        const dz = pz - shipPos.z;
-        const distSq = dx * dx + dy * dy + dz * dz;
+        if (!cleared && applyLodScale) {
+          matArr[dstM] *= 1.25;
+          matArr[dstM + 1] *= 1.25;
+          matArr[dstM + 2] *= 1.25;
+          matArr[dstM + 4] *= 1.25;
+          matArr[dstM + 5] *= 1.25;
+          matArr[dstM + 6] *= 1.25;
+          matArr[dstM + 8] *= 1.25;
+          matArr[dstM + 9] *= 1.25;
+          matArr[dstM + 10] *= 1.25;
+        }
 
-        const spIdx = data[offset + 8];
-        const varIdx = data[offset + 9];
-        const meshIdx = spIdx * VARIANTS_PER_SPECIES + varIdx;
-
-        const count = this.meshCounts[meshIdx];
-        if (count >= this.meshCapacities[meshIdx]) continue;
-
-        const maxDist = SPECIES_LIST[spIdx].maxDist * viewRatio;
-        if (distSq >= maxDist * maxDist) continue;
-
-        const dist = Math.sqrt(distSq);
-        const fade = smoothstep(maxDist, maxDist * 0.85, dist);
-        if (fade <= 0.02) continue;
-
-        const scale = data[offset + 7] * fade;
-        _instPos.set(px, py, pz);
-        _instNormal.set(data[offset + 3], data[offset + 4], data[offset + 5]);
-        _alignQuat.setFromUnitVectors(_unitY, _instNormal);
-        _yawQuat.setFromAxisAngle(_unitY, data[offset + 6]);
-        _instQuat.copy(_alignQuat).multiply(_yawQuat);
-        _instScale.setScalar(scale);
-
-        _instMatrix.compose(_instPos, _instQuat, _instScale);
-        const mesh = this.meshes[meshIdx];
-        mesh.setMatrixAt(count, _instMatrix);
-
-        _instColor.setRGB(
-          data[offset + 10],
-          data[offset + 11],
-          data[offset + 12],
-        );
-        mesh.setColorAt(count, _instColor);
-
-        this.meshCounts[meshIdx] = count + 1;
+        if (isTreeLod1) {
+          this.treeLod1Counts[slot] = outIdx + 1;
+        } else {
+          this.primaryCounts[slot] = outIdx + 1;
+        }
       }
     }
 
     let totalActive = 0;
-    for (let i = 0; i < this.meshes.length; i++) {
-      const mesh = this.meshes[i];
-      const count = this.meshCounts[i];
+    let activeMeshes = 0;
+    for (let i = 0; i < this.primaryMeshes.length; i++) {
+      const mesh = this.primaryMeshes[i];
+      const count = this.primaryCounts[i];
       mesh.count = count;
       mesh.visible = count > 0;
       totalActive += count;
       if (count > 0) {
-        mesh.instanceMatrix.needsUpdate = true;
+        activeMeshes++;
+        uploadAttribute(mesh.instanceMatrix, count);
         if (mesh.instanceColor) {
-          mesh.instanceColor.needsUpdate = true;
+          uploadAttribute(mesh.instanceColor, count);
         }
       }
     }
+
+    for (let i = 0; i < this.treeLod1Meshes.length; i++) {
+      const mesh = this.treeLod1Meshes[i];
+      const count = this.treeLod1Counts[i];
+      mesh.count = count;
+      mesh.visible = count > 0;
+      totalActive += count;
+      if (count > 0) {
+        activeMeshes++;
+        uploadAttribute(mesh.instanceMatrix, count);
+        if (mesh.instanceColor) {
+          uploadAttribute(mesh.instanceColor, count);
+        }
+      }
+    }
+
     this.activeInstanceCount = totalActive;
+    this.activeMeshCount = activeMeshes;
+    this.statsGroupsLod0 = groupsLod0;
+    this.statsGroupsLod1 = groupsLod1;
+    this.statsGroupsActive = groupsLod0 + groupsLod1;
   }
 
   public dispose(): void {
-    this.cellCache.clear();
+    this.groupCache.clear();
     this.genQueue.length = 0;
     this.queuedSet.clear();
+    this.visibleGroups.length = 0;
     this.activeCellList.length = 0;
+    this.cellGroups.length = 0;
 
-    for (let i = 0; i < this.meshes.length; i++) {
-      this.scene.remove(this.meshes[i]);
-      this.meshes[i].dispose();
+    for (let i = 0; i < this.allMeshes.length; i++) {
+      this.scene.remove(this.allMeshes[i]);
+      this.allMeshes[i].dispose();
     }
-    this.meshes.length = 0;
+    this.allMeshes.length = 0;
+    this.primaryMeshes.length = 0;
+    this.treeLod1Meshes.length = 0;
 
     for (let i = 0; i < this.geometries.length; i++) {
       this.geometries[i].dispose();
@@ -1543,7 +2163,6 @@ export class FloraManager {
     this.treeMat.dispose();
     this.smallPlantMat.dispose();
     this.rockMat.dispose();
-    this.grassMat.dispose();
     this.mushroomMat.dispose();
   }
 }

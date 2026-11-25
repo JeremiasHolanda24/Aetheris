@@ -1,8 +1,9 @@
 import React, { useEffect, useImperativeHandle, useRef } from 'react';
-import { OffScreenIndicatorState } from '../types/simulation';
+import { HorizonHudState, OffScreenIndicatorState } from '../types/simulation';
 
 export interface OffScreenHudHandle {
   updateIndicator: (indicator: OffScreenIndicatorState) => void;
+  updateHorizon: (horizon: HorizonHudState) => void;
   flashHitmarker: (kind: 'beacon' | 'terrain') => void;
 }
 
@@ -33,6 +34,16 @@ export const OffScreenHud = React.forwardRef<
 
   const hitmarkerRef = useRef<SVGSVGElement | null>(null);
   const hitTimerRef = useRef<number | null>(null);
+
+  const horizonSvgRef = useRef<SVGSVGElement | null>(null);
+  const horizonGlowRef = useRef<SVGPathElement | null>(null);
+  const horizonCoreRef = useRef<SVGPathElement | null>(null);
+  const horizonMaskRectRef = useRef<SVGRectElement | null>(null);
+  const horizonXGradRef = useRef<SVGLinearGradientElement | null>(null);
+  const horizonHoleRef = useRef<SVGRadialGradientElement | null>(null);
+  const horizonHoleCircleRef = useRef<SVGCircleElement | null>(null);
+  const lastHorizonWRef = useRef(0);
+  const lastHorizonHRef = useRef(0);
 
   useEffect(() => {
     return () => {
@@ -108,6 +119,47 @@ export const OffScreenHud = React.forwardRef<
         }
       }, 150);
     },
+
+    updateHorizon: (horizon: HorizonHudState) => {
+      const svg = horizonSvgRef.current;
+      const glow = horizonGlowRef.current;
+      const core = horizonCoreRef.current;
+      if (!svg || !glow || !core) return;
+
+      if (!horizon.visible || !horizon.pathD || horizon.opacity <= 0.01) {
+        svg.style.opacity = '0';
+        return;
+      }
+
+      if (
+        horizon.viewportW !== lastHorizonWRef.current ||
+        horizon.viewportH !== lastHorizonHRef.current
+      ) {
+        const w = horizon.viewportW;
+        const h = horizon.viewportH;
+        lastHorizonWRef.current = w;
+        lastHorizonHRef.current = h;
+
+        const spanHalf = Math.min(w * 0.38, 380);
+        const cx = w * 0.5;
+        const cy = h * 0.5;
+
+        horizonXGradRef.current?.setAttribute('x1', `${(cx - spanHalf).toFixed(1)}`);
+        horizonXGradRef.current?.setAttribute('x2', `${(cx + spanHalf).toFixed(1)}`);
+        horizonMaskRectRef.current?.setAttribute('width', `${w}`);
+        horizonMaskRectRef.current?.setAttribute('height', `${h}`);
+        horizonHoleRef.current?.setAttribute('cx', `${cx.toFixed(1)}`);
+        horizonHoleRef.current?.setAttribute('cy', `${cy.toFixed(1)}`);
+        horizonHoleCircleRef.current?.setAttribute('cx', `${cx.toFixed(1)}`);
+        horizonHoleCircleRef.current?.setAttribute('cy', `${cy.toFixed(1)}`);
+      }
+
+      glow.setAttribute('d', horizon.pathD);
+      glow.setAttribute('stroke', horizon.color);
+      core.setAttribute('d', horizon.pathD);
+      core.setAttribute('stroke', horizon.color);
+      svg.style.opacity = horizon.opacity.toFixed(3);
+    },
   }));
 
   const showReentry = reentryIntensity > 0.2;
@@ -126,6 +178,81 @@ export const OffScreenHud = React.forwardRef<
           }}
         />
       )}
+
+      {/* Subtle Glowing Curvature Horizon Line */}
+      <svg
+        ref={horizonSvgRef}
+        aria-hidden="true"
+        className="fixed inset-0 w-full h-full pointer-events-none"
+        style={{ opacity: 0 }}
+      >
+        <defs>
+          <linearGradient
+            ref={horizonXGradRef}
+            id="hud-horizon-xgrad"
+            gradientUnits="userSpaceOnUse"
+            x1="150"
+            y1="0"
+            x2="850"
+            y2="0"
+          >
+            <stop offset="0%" stopColor="black" />
+            <stop offset="18%" stopColor="white" />
+            <stop offset="82%" stopColor="white" />
+            <stop offset="100%" stopColor="black" />
+          </linearGradient>
+          <radialGradient
+            ref={horizonHoleRef}
+            id="hud-horizon-hole"
+            gradientUnits="userSpaceOnUse"
+            cx="500"
+            cy="500"
+            r="46"
+          >
+            <stop offset="0%" stopColor="black" stopOpacity="1" />
+            <stop offset="62%" stopColor="black" stopOpacity="1" />
+            <stop offset="100%" stopColor="black" stopOpacity="0" />
+          </radialGradient>
+          <mask
+            id="hud-horizon-mask"
+            maskUnits="userSpaceOnUse"
+          >
+            <rect
+              ref={horizonMaskRectRef}
+              x="0"
+              y="0"
+              width="1000"
+              height="1000"
+              fill="url(#hud-horizon-xgrad)"
+            />
+            <circle
+              ref={horizonHoleCircleRef}
+              cx="500"
+              cy="500"
+              r="46"
+              fill="url(#hud-horizon-hole)"
+            />
+          </mask>
+        </defs>
+        <g mask="url(#hud-horizon-mask)">
+          <path
+            ref={horizonGlowRef}
+            fill="none"
+            stroke="#38bdf8"
+            strokeWidth="6"
+            strokeOpacity="0.22"
+            strokeLinecap="round"
+          />
+          <path
+            ref={horizonCoreRef}
+            fill="none"
+            stroke="#38bdf8"
+            strokeWidth="1.35"
+            strokeOpacity="0.82"
+            strokeLinecap="round"
+          />
+        </g>
+      </svg>
 
       {/* Centered Combat Crosshair (Mira Centralizada) */}
       <div

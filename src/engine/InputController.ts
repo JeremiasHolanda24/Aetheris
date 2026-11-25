@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CameraMode } from '../types/simulation';
+import { CameraMode, PlayerMode } from '../types/simulation';
 
 export interface VirtualInputs {
   thrust: number; // -0.5..1
@@ -7,6 +7,8 @@ export interface VirtualInputs {
   pitch: number; // -1..1 (climb/dive)
   boost: boolean;
   firing: boolean;
+  charUp?: boolean;
+  charDown?: boolean;
 }
 
 export interface FlightInputSample {
@@ -18,8 +20,21 @@ export interface FlightInputSample {
   wantsFire: boolean;
 }
 
+export interface CharacterInputSample {
+  forward: number;
+  strafe: number;
+  up: boolean;
+  down: boolean;
+  sprint: boolean;
+  jumpEdge: boolean;
+  lookDeltaX: number;
+  lookDeltaY: number;
+  keyYaw: number;
+  keyPitch: number;
+}
+
 /**
- * Manages keyboard, multi-touch pointer firing, virtual inputs,
+ * Manages keyboard, multi-touch pointer firing/drag-look, virtual inputs,
  * input-focus guards, and focus-loss key release.
  */
 export class InputController {
@@ -28,16 +43,30 @@ export class InputController {
   private readonly onUnlockAudio: () => void;
   private readonly onVisibilityChange: (hidden: boolean) => void;
   private readonly onLandToggle?: () => void;
+  private readonly onToggleJetpack?: () => void;
+  private readonly onToggleDampeners?: () => void;
+  private readonly onToggleCharacterCamera?: () => void;
 
+  private playerMode: PlayerMode = 'ship';
   private keysDown = new Set<string>();
   private activeFirePointerIds = new Set<number>();
+  private activeLookPointerId: number | null = null;
+  private prevLookX = 0;
+  private prevLookY = 0;
+  private pendingLookDX = 0;
+  private pendingLookDY = 0;
+  private pendingJumpEdge = false;
+
   private virtualInputs: VirtualInputs = {
     thrust: 0,
     turn: 0,
     pitch: 0,
     boost: false,
     firing: false,
+    charUp: false,
+    charDown: false,
   };
+  private prevVirtualUp = false;
 
   private readonly sample: FlightInputSample = {
     turn: 0,
@@ -48,11 +77,25 @@ export class InputController {
     wantsFire: false,
   };
 
+  private readonly charSample: CharacterInputSample = {
+    forward: 0,
+    strafe: 0,
+    up: false,
+    down: false,
+    sprint: false,
+    jumpEdge: false,
+    lookDeltaX: 0,
+    lookDeltaY: 0,
+    keyYaw: 0,
+    keyPitch: 0,
+  };
+
   private readonly boundOnBlur: () => void;
   private readonly boundOnVisibilityChange: () => void;
   private readonly boundOnKeyDown: (e: KeyboardEvent) => void;
   private readonly boundOnKeyUp: (e: KeyboardEvent) => void;
   private readonly boundOnPointerDown: (e: PointerEvent) => void;
+  private readonly boundOnPointerMove: (e: PointerEvent) => void;
   private readonly boundOnPointerUp: (e: PointerEvent) => void;
   private readonly boundUnlockAudio: () => void;
   private readonly boundOnContextMenu: (e: Event) => void;
@@ -64,6 +107,9 @@ export class InputController {
       onUnlockAudio: () => void;
       onVisibilityChange: (hidden: boolean) => void;
       onLandToggle?: () => void;
+      onToggleJetpack?: () => void;
+      onToggleDampeners?: () => void;
+      onToggleCharacterCamera?: () => void;
     },
   ) {
     this.domElement = domElement;
@@ -71,6 +117,9 @@ export class InputController {
     this.onUnlockAudio = options.onUnlockAudio;
     this.onVisibilityChange = options.onVisibilityChange;
     this.onLandToggle = options.onLandToggle;
+    this.onToggleJetpack = options.onToggleJetpack;
+    this.onToggleDampeners = options.onToggleDampeners;
+    this.onToggleCharacterCamera = options.onToggleCharacterCamera;
 
     this.boundOnBlur = () => this.releaseAllInputs();
     this.boundOnVisibilityChange = () => {
@@ -81,15 +130,36 @@ export class InputController {
     this.boundOnKeyUp = this.handleKeyUp.bind(this);
     this.boundOnPointerDown = (e: PointerEvent) => {
       this.onUnlockAudio();
-      if (
-        this.getCameraMode() !== 'orbit' &&
-        (e.pointerType !== 'mouse' || e.button === 0)
-      ) {
+      if (this.getCameraMode() === 'orbit') return;
+      if (this.playerMode === 'character') {
+        if (this.activeLookPointerId === null) {
+          this.activeLookPointerId = e.pointerId;
+          this.prevLookX = e.clientX;
+          this.prevLookY = e.clientY;
+        }
+        return;
+      }
+      if (e.pointerType !== 'mouse' || e.button === 0) {
         this.activeFirePointerIds.add(e.pointerId);
+      }
+    };
+    this.boundOnPointerMove = (e: PointerEvent) => {
+      if (
+        this.playerMode === 'character' &&
+        this.getCameraMode() !== 'orbit' &&
+        this.activeLookPointerId === e.pointerId
+      ) {
+        this.pendingLookDX += e.clientX - this.prevLookX;
+        this.pendingLookDY += e.clientY - this.prevLookY;
+        this.prevLookX = e.clientX;
+        this.prevLookY = e.clientY;
       }
     };
     this.boundOnPointerUp = (e: PointerEvent) => {
       this.activeFirePointerIds.delete(e.pointerId);
+      if (this.activeLookPointerId === e.pointerId) {
+        this.activeLookPointerId = null;
+      }
     };
     this.boundUnlockAudio = () => {
       this.onUnlockAudio();
@@ -108,13 +178,29 @@ export class InputController {
     window.addEventListener('keydown', this.boundUnlockAudio, {
       passive: true,
     });
+    window.addEventListener('pointermove', this.boundOnPointerMove);
     window.addEventListener('pointerup', this.boundOnPointerUp);
     window.addEventListener('pointercancel', this.boundOnPointerUp);
     this.domElement.addEventListener('pointerdown', this.boundOnPointerDown);
     this.domElement.addEventListener('contextmenu', this.boundOnContextMenu);
   }
 
+  public setPlayerMode(mode: PlayerMode): void {
+    if (this.playerMode === mode) return;
+    this.playerMode = mode;
+    this.activeFirePointerIds.clear();
+    this.activeLookPointerId = null;
+    this.pendingLookDX = 0;
+    this.pendingLookDY = 0;
+    this.pendingJumpEdge = false;
+  }
+
   public setVirtualInputs(inputs: VirtualInputs): void {
+    const curUp = Boolean(inputs.charUp);
+    if (curUp && !this.prevVirtualUp && this.playerMode === 'character') {
+      this.pendingJumpEdge = true;
+    }
+    this.prevVirtualUp = curUp;
     this.virtualInputs = { ...inputs };
   }
 
@@ -125,6 +211,10 @@ export class InputController {
   public releaseAllInputs(): void {
     this.keysDown.clear();
     this.activeFirePointerIds.clear();
+    this.activeLookPointerId = null;
+    this.pendingLookDX = 0;
+    this.pendingLookDY = 0;
+    this.pendingJumpEdge = false;
   }
 
   public sampleFlightInputs(invertPitch: boolean): FlightInputSample {
@@ -155,10 +245,11 @@ export class InputController {
       this.keysDown.has('ShiftLeft');
 
     const wantsFire =
-      this.virtualInputs.firing ||
-      this.keysDown.has('KeyF') ||
-      (this.activeFirePointerIds.size > 0 &&
-        this.getCameraMode() !== 'orbit');
+      this.playerMode === 'ship' &&
+      (this.virtualInputs.firing ||
+        this.keysDown.has('KeyF') ||
+        (this.activeFirePointerIds.size > 0 &&
+          this.getCameraMode() !== 'orbit'));
 
     this.sample.turn = turnInput;
     this.sample.pitch = pitchInput;
@@ -169,13 +260,75 @@ export class InputController {
     return this.sample;
   }
 
+  public sampleCharacterInputs(): CharacterInputSample {
+    let forward = this.virtualInputs.pitch;
+    if (this.keysDown.has('KeyW')) forward += 1;
+    if (this.keysDown.has('KeyS')) forward -= 1;
+    forward = THREE.MathUtils.clamp(forward, -1, 1);
+
+    let strafe = -this.virtualInputs.turn;
+    if (this.keysDown.has('KeyD')) strafe += 1;
+    if (this.keysDown.has('KeyA')) strafe -= 1;
+    strafe = THREE.MathUtils.clamp(strafe, -1, 1);
+
+    let keyYaw = 0;
+    if (this.keysDown.has('ArrowLeft')) keyYaw += 1;
+    if (this.keysDown.has('ArrowRight')) keyYaw -= 1;
+
+    let keyPitch = 0;
+    if (this.keysDown.has('ArrowUp')) keyPitch += 1;
+    if (this.keysDown.has('ArrowDown')) keyPitch -= 1;
+
+    const up = Boolean(this.keysDown.has('Space') || this.virtualInputs.charUp);
+    const down = Boolean(
+      this.keysDown.has('KeyC') ||
+        this.keysDown.has('ControlLeft') ||
+        this.keysDown.has('ControlRight') ||
+        this.virtualInputs.charDown,
+    );
+    const sprint = Boolean(
+      this.keysDown.has('ShiftLeft') ||
+        this.keysDown.has('ShiftRight') ||
+        this.virtualInputs.boost,
+    );
+
+    this.charSample.forward = forward;
+    this.charSample.strafe = strafe;
+    this.charSample.up = up;
+    this.charSample.down = down;
+    this.charSample.sprint = sprint;
+    this.charSample.jumpEdge = this.pendingJumpEdge;
+    this.charSample.lookDeltaX = this.pendingLookDX;
+    this.charSample.lookDeltaY = this.pendingLookDY;
+    this.charSample.keyYaw = keyYaw;
+    this.charSample.keyPitch = keyPitch;
+
+    this.pendingJumpEdge = false;
+    this.pendingLookDX = 0;
+    this.pendingLookDY = 0;
+
+    return this.charSample;
+  }
+
   private handleKeyDown(e: KeyboardEvent): void {
     const tag = document.activeElement?.tagName;
     if (tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (tag === 'INPUT' && e.code.startsWith('Arrow')) return;
 
-    if (e.code === 'KeyL' && !e.repeat) {
-      this.onLandToggle?.();
+    if (!e.repeat) {
+      if (e.code === 'KeyL') {
+        this.onLandToggle?.();
+      } else if (this.playerMode === 'character') {
+        if (e.code === 'KeyX' || e.code === 'KeyJ') {
+          this.onToggleJetpack?.();
+        } else if (e.code === 'KeyZ') {
+          this.onToggleDampeners?.();
+        } else if (e.code === 'KeyV') {
+          this.onToggleCharacterCamera?.();
+        } else if (e.code === 'Space') {
+          this.pendingJumpEdge = true;
+        }
+      }
     }
 
     if (
@@ -204,6 +357,7 @@ export class InputController {
     window.removeEventListener('keyup', this.boundOnKeyUp);
     window.removeEventListener('pointerdown', this.boundUnlockAudio);
     window.removeEventListener('keydown', this.boundUnlockAudio);
+    window.removeEventListener('pointermove', this.boundOnPointerMove);
     window.removeEventListener('pointerup', this.boundOnPointerUp);
     window.removeEventListener('pointercancel', this.boundOnPointerUp);
     this.domElement.removeEventListener('pointerdown', this.boundOnPointerDown);

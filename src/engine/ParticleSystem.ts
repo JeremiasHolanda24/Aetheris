@@ -186,10 +186,17 @@ export class ParticleSystem {
       }
       if (!slot) break;
 
-      this.exhaustAlternator = (this.exhaustAlternator + 1) % 2;
-      const side = this.exhaustAlternator === 0 ? -0.46 : 0.46;
+      this.exhaustAlternator = (this.exhaustAlternator + 1) % 3;
+      const side =
+        this.exhaustAlternator === 0
+          ? -1.44
+          : this.exhaustAlternator === 1
+            ? 1.44
+            : 0;
+      const nozzleZ = this.exhaustAlternator === 2 ? 3.45 : 2.8;
+      const nozzleY = this.exhaustAlternator === 2 ? 0.06 : 0.03;
       _nozzleOffset
-        .set(side, 0.04, 1.95)
+        .set(side, nozzleY, nozzleZ)
         .applyQuaternion(_worldQuatTemp)
         .add(shipPos);
 

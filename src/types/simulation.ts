@@ -1,4 +1,6 @@
-export type CameraMode = 'chase' | 'tactical' | 'cockpit' | 'orbit';
+export type CameraMode = 'chase' | 'cockpit' | 'orbit';
+export type PlayerMode = 'ship' | 'character';
+export type CharacterCameraMode = 'third' | 'first';
 export type QualityLevel = 0 | 1 | 2 | 3;
 export type LandingState = 'flying' | 'landing' | 'landed' | 'takeoff';
 
@@ -39,6 +41,7 @@ export interface SimulationConfig {
   backdrop: BackdropParams;
   flora: FloraParams;
   cameraMode: CameraMode;
+  characterCamera: CharacterCameraMode;
 }
 
 export interface OffScreenIndicatorState {
@@ -49,6 +52,15 @@ export interface OffScreenIndicatorState {
   angleDeg: number;
   distance: number;
   color: string;
+}
+
+export interface HorizonHudState {
+  visible: boolean;
+  pathD: string;
+  opacity: number;
+  color: string;
+  viewportW: number;
+  viewportH: number;
 }
 
 export interface TelemetrySnapshot {
@@ -66,8 +78,20 @@ export interface TelemetrySnapshot {
   reentryIntensity: number;
   isThrusting: boolean;
   isBoosting: boolean;
+  turboCharge: number;
+  turboExhausted: boolean;
+  playerMode: PlayerMode;
+  characterCamera: CharacterCameraMode;
+  jetpackEnabled: boolean;
+  dampenersEnabled: boolean;
   qualityLevel: QualityLevel;
+  fps: number;
   floraInstances: number;
+  floraGroups: number;
+  renderCalls: number;
+  terrainDraws: number;
+  floraDraws: number;
+  otherDraws: number;
   landingState: LandingState;
   canLand: boolean;
   landHint: string;
@@ -103,4 +127,5 @@ export const DEFAULT_CONFIG: SimulationConfig = {
     density: 1,
   },
   cameraMode: 'chase',
+  characterCamera: 'third',
 };

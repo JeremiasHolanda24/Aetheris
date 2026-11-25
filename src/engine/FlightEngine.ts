@@ -1,19 +1,30 @@
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import {
+  CharacterCameraMode,
+  HorizonHudState,
   LandingState,
   OffScreenIndicatorState,
+  PlayerMode,
   SimulationConfig,
   TelemetrySnapshot,
 } from '../types/simulation';
 import { BeaconController } from './BeaconController';
 import { getBiomeName } from './biomes';
 import { CameraRig } from './CameraRig';
+import { CharacterController } from './CharacterController';
 import { FlightPhysics } from './FlightPhysics';
 import { FloraManager } from './FloraManager';
-import { InputController, VirtualInputs } from './InputController';
+import {
+  FlightInputSample,
+  InputController,
+  VirtualInputs,
+} from './InputController';
 import { LandingHooks } from './LandingController';
-import { computeOffScreenIndicator } from './OffScreenIndicator';
+import {
+  computeHorizonHud,
+  computeOffScreenIndicator,
+} from './OffScreenIndicator';
 import { ParticleSystem } from './ParticleSystem';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
 import { createShipModel, ShipModelHandle } from './proceduralModels';
@@ -28,20 +39,39 @@ export type { VirtualInputs };
 // Pre-allocated math helpers outside render loop (Zero GC)
 const _shipForward = new THREE.Vector3();
 const _shipDir = new THREE.Vector3();
+const _localUp = new THREE.Vector3();
 const _snapCamPos = new THREE.Vector3();
 const _snapLookAt = new THREE.Vector3();
 const _snapUp = new THREE.Vector3();
-const _keyLightOffset = new THREE.Vector3(260, 320, 180);
 const _sunDir = new THREE.Vector3();
 const _clearingPos = new THREE.Vector3();
 
-const _spaceBgColor = new THREE.Color(0x05050d);
-const _atmoBgColor = new THREE.Color(0x0b1d38);
+const _spaceBgColor = new THREE.Color(0x03040a);
+const _dayAtmoBgColor = new THREE.Color(0x0e2547);
+const _nightAtmoBgColor = new THREE.Color(0x040712);
+const _sunsetAtmoBgColor = new THREE.Color(0x3a1e32);
+const _daySunColor = new THREE.Color(0xfff1d6);
+const _sunsetSunColor = new THREE.Color(0xff9f5a);
+const _skyTmpColor = new THREE.Color();
 const _blendedBgColor = new THREE.Color();
+
+const DAY_CYCLE_SECONDS = 180;
+const SUN_ORBIT_TILT = 0.36;
+
+const IDLE_FLIGHT_INPUTS: FlightInputSample = {
+  turn: 0,
+  pitch: 0,
+  thrust: 0,
+  isThrusting: false,
+  isBoosting: false,
+  wantsFire: false,
+};
 
 export interface FlightEngineCallbacks {
   onTelemetry: (snapshot: TelemetrySnapshot) => void;
+  onCharacterCameraChange?: (mode: CharacterCameraMode) => void;
   onIndicatorFrame?: (indicator: OffScreenIndicatorState) => void;
+  onHorizonFrame?: (horizon: HorizonHudState) => void;
   onWaypointCaptured: (count: number) => void;
   onHitmarker?: (kind: 'beacon' | 'terrain') => void;
   onContextLostChange: (lost: boolean) => void;
@@ -74,7 +104,9 @@ export class FlightEngine {
   private fog: THREE.FogExp2;
   private envRT: THREE.WebGLRenderTarget;
 
+  private hemiLight: THREE.HemisphereLight;
   private keyLight: THREE.DirectionalLight;
+  private rimLight: THREE.DirectionalLight;
   private shipModel: ShipModelHandle;
   private planetManager: PlanetTerrainManager;
   private spaceBackground: SpaceBackground;
@@ -85,6 +117,7 @@ export class FlightEngine {
   private inputController: InputController;
   private cameraRig: CameraRig;
   private physics: FlightPhysics;
+  private character: CharacterController;
   private beaconController: BeaconController;
   private weaponsSystem: WeaponsSystem;
   private particleSystem: ParticleSystem;
@@ -94,11 +127,13 @@ export class FlightEngine {
   private floraViewRatio = 1.0;
 
   // Mission & input state
+  private playerMode: PlayerMode = 'ship';
   private waypointsCaptured = 0;
   private targetLocked = false;
   private wantsFire = false;
   private isThrusting = false;
   private isBoosting = false;
+  private sunPhaseOffset = 0;
 
   // Loop & lifecycle
   private timer = new THREE.Timer();
@@ -107,6 +142,8 @@ export class FlightEngine {
   private lastTelemetryEmit = -1;
   private lastViewportW = 1;
   private lastViewportH = 1;
+  private avgFpsDt = 1 / 60;
+  private hasFpsSample = false;
   private lastIndicator: OffScreenIndicatorState | null = null;
   private readonly landingHooks: LandingHooks;
   private prevLandingState: LandingState = 'flying';
@@ -165,8 +202,8 @@ export class FlightEngine {
 
     // 2. Scene & Dynamic Atmosphere Fog
     this.scene = new THREE.Scene();
-    this.scene.background = _atmoBgColor.clone();
-    this.fog = new THREE.FogExp2(0x0b1d38, 0.0017);
+    this.scene.background = _dayAtmoBgColor.clone();
+    this.fog = new THREE.FogExp2(0x0e2547, 0.0017);
     this.scene.fog = this.fog;
 
     // 3. Studio RoomEnvironment map
@@ -185,12 +222,12 @@ export class FlightEngine {
       this.config.planet.planetRadius,
     );
 
-    // 5. Three-Point Solar Lighting Rig
-    const hemiLight = new THREE.HemisphereLight(0xa5b4fc, 0x3b2d7a, 1.15);
-    this.scene.add(hemiLight);
+    // 5. Three-Point Solar Lighting Rig (day/night orbiting sun)
+    this.hemiLight = new THREE.HemisphereLight(0xa5b4fc, 0x3b2d7a, 1.05);
+    this.scene.add(this.hemiLight);
 
     this.keyLight = new THREE.DirectionalLight(0xfff1d6, 2.35);
-    this.keyLight.position.copy(_keyLightOffset);
+    this.keyLight.position.set(260, 320, 180);
     this.keyLight.castShadow = enableShadowMap;
     if (enableShadowMap) {
       this.keyLight.shadow.mapSize.set(512, 512);
@@ -207,9 +244,9 @@ export class FlightEngine {
     this.scene.add(this.keyLight);
     this.scene.add(this.keyLight.target);
 
-    const rimLight = new THREE.DirectionalLight(0x6366f1, 1.25);
-    rimLight.position.set(-240, -140, -220);
-    this.scene.add(rimLight);
+    this.rimLight = new THREE.DirectionalLight(0x6366f1, 0.25);
+    this.rimLight.position.set(-240, -140, -220);
+    this.scene.add(this.rimLight);
 
     // 6. Subsystems
     this.spaceBackground = new SpaceBackground(this.config.backdrop);
@@ -224,17 +261,23 @@ export class FlightEngine {
     });
 
     this.planetManager = new PlanetTerrainManager(this.config.planet);
+    this.planetManager.setGrassDetail(
+      this.qualityScaler.getCurrentPreset().terrainDetailRatio *
+        (this.isSoftwareGl || this.isMobileDevice ? 0.7 : 1.0),
+    );
     this.scene.add(this.planetManager.root);
 
-    this.shipModel = createShipModel(this.isSoftwareGl || this.isMobileDevice);
+    const lowSpec = this.isSoftwareGl || this.isMobileDevice;
+    this.shipModel = createShipModel(lowSpec);
     this.physics = new FlightPhysics(this.scene, this.shipModel);
+    this.character = new CharacterController(this.scene, lowSpec);
     this.beaconController = new BeaconController(this.scene);
 
     this.weaponsSystem = new WeaponsSystem(this.scene, this.soundEngine);
     this.particleSystem = new ParticleSystem(this.scene);
     this.floraManager = new FloraManager(this.scene, {
       castShadows: enableShadowMap,
-      isMobileOrSoftware: this.isSoftwareGl || this.isMobileDevice,
+      isMobileOrSoftware: lowSpec,
     });
 
     this.landingHooks = {
@@ -249,9 +292,13 @@ export class FlightEngine {
       onUnlockAudio: () => this.soundEngine.unlock(),
       onVisibilityChange: (hidden) => this.soundEngine.setPaused(hidden),
       onLandToggle: () => this.toggleLanding(),
+      onToggleJetpack: () => this.toggleJetpack(),
+      onToggleDampeners: () => this.toggleDampeners(),
+      onToggleCharacterCamera: () => this.toggleCharacterCamera(),
     });
 
     this.landOnSurface();
+    this.initSunPhaseForSpot(this.physics.shipRoot.position);
     this.beaconController.relocateTarget(
       'surface',
       this.physics.shipRoot.position,
@@ -303,6 +350,9 @@ export class FlightEngine {
     this.planetManager.updateParams(next.planet);
     if (planetRebuilt) {
       this.floraManager.invalidate();
+      if (this.beaconController.targetZone === 'moon') {
+        this.beaconController.syncMoonBeaconPosition(this.planetManager);
+      }
     }
     this.cameraRig.setPlanetRadius(next.planet.planetRadius);
     this.spaceBackground.updateParams(next.backdrop);
@@ -311,7 +361,12 @@ export class FlightEngine {
       if (next.cameraMode === 'orbit') {
         this.inputController.clearFirePointers();
       }
-      this.cameraRig.setMode(next.cameraMode, this.physics.shipRoot.position);
+      this.cameraRig.setMode(
+        next.cameraMode,
+        this.playerMode === 'character'
+          ? this.character.root.position
+          : this.physics.shipRoot.position,
+      );
     }
   }
 
@@ -348,14 +403,85 @@ export class FlightEngine {
     this.particleRatio = preset.particleRatio;
     this.floraDensityRatio = preset.floraDensityRatio;
     this.floraViewRatio = preset.floraViewRatio;
+    this.planetManager.setGrassDetail(
+      preset.terrainDetailRatio *
+        (this.isSoftwareGl || this.isMobileDevice ? 0.7 : 1.0),
+    );
     this.floraManager.setCastShadows(preset.shadowsEnabled);
     this.emitTelemetry();
+  }
+
+  private initSunPhaseForSpot(spot: THREE.Vector3): void {
+    const len = spot.length();
+    if (len < 0.001) {
+      this.sunPhaseOffset = 0.6;
+      return;
+    }
+    const ux = spot.x / len;
+    const uy = spot.y / len;
+    const uz = spot.z / len;
+    const peakTheta = Math.atan2(
+      uy * Math.sin(SUN_ORBIT_TILT) + uz * Math.cos(SUN_ORBIT_TILT),
+      ux,
+    );
+    // Start in bright morning/mid-morning moving toward noon -> sunset -> night
+    this.sunPhaseOffset = peakTheta - 0.5;
+  }
+
+  private computeSunDir(elapsed: number, out: THREE.Vector3): THREE.Vector3 {
+    const theta =
+      this.sunPhaseOffset + elapsed * ((Math.PI * 2) / DAY_CYCLE_SECONDS);
+    const sinT = Math.sin(theta);
+    return out
+      .set(
+        Math.cos(theta),
+        sinT * Math.sin(SUN_ORBIT_TILT),
+        sinT * Math.cos(SUN_ORBIT_TILT),
+      )
+      .normalize();
   }
 
   private syncLandingClearing(): void {
     const curState = this.physics.landing.state;
     if (curState === this.prevLandingState) return;
     this.prevLandingState = curState;
+
+    if (curState === 'landed') {
+      this.playerMode = 'character';
+      this.shipModel.setPilotSeated(false);
+      this.inputController.setPlayerMode('character');
+      this.character.spawnNearShip(
+        this.physics.shipRoot.position,
+        this.physics.shipQuat,
+        this.physics.landing.landedBody,
+        this.planetManager,
+      );
+      if (this.config.cameraMode === 'orbit') {
+        this.cameraRig.setMode('orbit', this.character.root.position);
+      } else {
+        this.cameraRig.updateCharacter(0.016, {
+          shipOrbitMode: false,
+          characterCamera: this.config.characterCamera,
+          charPos: this.character.root.position,
+          upDir: this.character.upDir,
+          rightDir: this.character.rightDir,
+          aimDir: this.character.aimDir,
+          speed: 0,
+          activeBody: this.character.activeBody,
+          planetManager: this.planetManager,
+        });
+      }
+    } else {
+      if (this.playerMode !== 'ship') {
+        this.playerMode = 'ship';
+        this.shipModel.setPilotSeated(true);
+        this.inputController.setPlayerMode('ship');
+        this.character.setVisible(false);
+        if (this.config.cameraMode === 'orbit') {
+          this.cameraRig.setMode('orbit', this.physics.shipRoot.position);
+        }
+      }
+    }
 
     if (
       (curState === 'landing' || curState === 'landed') &&
@@ -380,6 +506,28 @@ export class FlightEngine {
     }
   }
 
+  public toggleJetpack(): void {
+    if (this.playerMode !== 'character') return;
+    this.soundEngine.unlock();
+    this.character.toggleJetpack();
+    this.lastTelemetryEmit = -1;
+  }
+
+  public toggleDampeners(): void {
+    if (this.playerMode !== 'character') return;
+    this.character.toggleDampeners();
+    this.lastTelemetryEmit = -1;
+  }
+
+  public toggleCharacterCamera(): void {
+    if (this.playerMode !== 'character') return;
+    const next: CharacterCameraMode =
+      this.config.characterCamera === 'third' ? 'first' : 'third';
+    this.config.characterCamera = next;
+    this.callbacks.onCharacterCameraChange?.(next);
+    this.lastTelemetryEmit = -1;
+  }
+
   public toggleLanding(): void {
     this.soundEngine.unlock();
     this.physics.landing.toggle(
@@ -399,6 +547,7 @@ export class FlightEngine {
       _snapLookAt,
       _snapUp,
     );
+    this.prevLandingState = 'flying';
     this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, true);
     this.syncLandingClearing();
     this.lastTelemetryEmit = -1;
@@ -411,6 +560,7 @@ export class FlightEngine {
       _snapLookAt,
       _snapUp,
     );
+    this.prevLandingState = 'landed';
     this.cameraRig.snapTo(_snapCamPos, _snapLookAt, _snapUp, false);
     this.syncLandingClearing();
     this.lastTelemetryEmit = -1;
@@ -463,36 +613,63 @@ export class FlightEngine {
     this.timer.update(timestamp);
     const rawDt = this.timer.getDelta();
     this.qualityScaler.update(rawDt, document.hidden);
+    if (Number.isFinite(rawDt) && rawDt > 0 && rawDt < 0.5 && !document.hidden) {
+      if (!this.hasFpsSample) {
+        this.avgFpsDt = rawDt;
+        this.hasFpsSample = true;
+      } else {
+        const fpsAlpha = 1 - Math.exp(-rawDt / 1.0);
+        this.avgFpsDt += (rawDt - this.avgFpsDt) * fpsAlpha;
+      }
+    }
     const dt = Math.min(rawDt, 0.05);
     const elapsed = this.timer.getElapsed();
 
-    this.planetManager.update(elapsed, this.cameraRig.camera.position, dt);
-    if (this.beaconController.targetZone === 'moon') {
-      this.beaconController.syncMoonBeaconPosition(this.planetManager);
-    }
+    this.computeSunDir(elapsed, _sunDir);
+    this.planetManager.update(elapsed, _sunDir);
 
-    const inputs = this.inputController.sampleFlightInputs(
-      this.config.ship.invertPitch,
-    );
+    const isCharMode = this.playerMode === 'character';
+    const shipInputs = isCharMode
+      ? IDLE_FLIGHT_INPUTS
+      : this.inputController.sampleFlightInputs(this.config.ship.invertPitch);
     const landingControlled = this.physics.landing.isControlling;
-    this.wantsFire = landingControlled ? false : inputs.wantsFire;
-    this.isThrusting = landingControlled ? false : inputs.isThrusting;
-    this.isBoosting = landingControlled ? false : inputs.isBoosting;
 
     const physOut = this.physics.step(dt, elapsed, {
-      inputs,
+      inputs: shipInputs,
       ship: this.config.ship,
       planet: this.config.planet,
       planetManager: this.planetManager,
       beaconPos: this.beaconController.position,
-      targetLocked: landingControlled ? false : this.targetLocked,
+      targetLocked: isCharMode || landingControlled ? false : this.targetLocked,
       shadowMapEnabled: this.renderer.shadowMap.enabled,
       landingHooks: this.landingHooks,
       floraManager: this.floraManager,
       floraEnabled: this.config.flora.enabled,
-      cameraMode: this.config.cameraMode,
+      cameraMode: isCharMode ? 'chase' : this.config.cameraMode,
     });
     this.syncLandingClearing();
+
+    this.wantsFire = isCharMode || landingControlled ? false : shipInputs.wantsFire;
+    this.isThrusting = isCharMode || landingControlled ? false : shipInputs.isThrusting;
+    this.isBoosting = isCharMode || landingControlled ? false : physOut.isBoosting;
+
+    if (this.playerMode === 'character') {
+      const charInputs = this.inputController.sampleCharacterInputs();
+      this.character.step(dt, elapsed, {
+        inputs: charInputs,
+        cameraMode: this.config.characterCamera,
+        planet: this.config.planet,
+        planetManager: this.planetManager,
+        floraManager: this.floraManager,
+        floraEnabled: this.config.flora.enabled,
+        shipPos: this.physics.shipRoot.position,
+      });
+    }
+
+    const focusPos =
+      this.playerMode === 'character'
+        ? this.character.root.position
+        : this.physics.shipRoot.position;
 
     this.soundEngine.updateAtmosphereEntry(this.physics.reentryIntensity);
     this.particleSystem.update(dt, {
@@ -500,7 +677,8 @@ export class FlightEngine {
       shipQuat: this.physics.shipQuat,
       shipVisualQuat: this.shipModel.group.quaternion,
       shipVelocity: this.physics.velocity,
-      isThrusting: landingControlled ? false : inputs.thrust > 0.05,
+      isThrusting:
+        isCharMode || landingControlled ? false : shipInputs.thrust > 0.05,
       isBoosting: this.isBoosting,
       thrustPower: physOut.thrustPower,
       atmoRatio: physOut.atmoRatio,
@@ -509,19 +687,19 @@ export class FlightEngine {
       particleRatio: this.particleRatio,
     });
 
-    this.keyLight.position
-      .copy(this.physics.shipRoot.position)
-      .add(_keyLightOffset);
-    this.keyLight.target.position.copy(this.physics.shipRoot.position);
-    _sunDir
-      .copy(this.keyLight.position)
-      .sub(this.keyLight.target.position)
-      .normalize();
+    // Global rotating Sun DirectionalLight anchored around focusPos for crisp shadows & planetary/lunar day-night cycle
+    this.keyLight.position.copy(focusPos).addScaledVector(_sunDir, 320);
+    this.keyLight.target.position.copy(focusPos);
+
+    const focusAlt =
+      this.playerMode === 'character'
+        ? this.character.altitude
+        : this.physics.shipAltitude;
 
     this.floraManager.update(
       dt,
-      this.physics.shipRoot.position,
-      this.physics.shipAltitude,
+      focusPos,
+      focusAlt,
       this.planetManager,
       this.config.planet,
       this.config.flora,
@@ -531,12 +709,12 @@ export class FlightEngine {
         qualityLevel: this.qualityScaler.getLevel(),
       },
       _sunDir,
+      this.cameraRig.camera,
     );
 
     if (
-      this.physics.shipRoot.position.distanceTo(
-        this.beaconController.position,
-      ) < 8.5
+      focusPos.distanceTo(this.beaconController.position) <
+      (this.playerMode === 'character' ? 5.5 : 8.5)
     ) {
       this.waypointsCaptured += 1;
       this.callbacks.onWaypointCaptured(this.waypointsCaptured);
@@ -545,7 +723,7 @@ export class FlightEngine {
 
     this.weaponsSystem.update(dt, {
       wantsFire: this.wantsFire,
-      targetLocked: landingControlled ? false : this.targetLocked,
+      targetLocked: isCharMode || landingControlled ? false : this.targetLocked,
       cameraMode: this.config.cameraMode,
       camera: this.cameraRig.camera,
       shipPos: this.physics.shipRoot.position,
@@ -563,24 +741,80 @@ export class FlightEngine {
 
     this.beaconController.update(elapsed, dt, this.planetManager);
 
-    const atmoT = this.physics.atmospherePct / 100;
-    _blendedBgColor.lerpColors(_spaceBgColor, _atmoBgColor, atmoT);
+    // Day/Night atmosphere & lighting modulation at player/ship location
+    const moon = this.planetManager.getMoonState();
+    const nearMoon =
+      this.playerMode === 'character'
+        ? this.character.activeBody === 'moon'
+        : this.physics.landing.state === 'landed' &&
+          this.physics.landing.landedBody === 'moon';
+    if (nearMoon) {
+      _localUp.subVectors(focusPos, moon.center);
+    } else {
+      _localUp.copy(focusPos);
+    }
+    if (_localUp.lengthSq() > 0.0001) {
+      _localUp.normalize();
+    } else {
+      _localUp.set(0, 1, 0);
+    }
+    const sunDot = _localUp.dot(_sunDir);
+    const dayFactor = THREE.MathUtils.smoothstep(sunDot, -0.22, 0.3);
+    const sunsetFactor = Math.exp(-Math.pow((sunDot - 0.02) * 4.5, 2));
+
+    const atmoT = nearMoon ? 0 : this.physics.atmospherePct / 100;
+    this.keyLight.color
+      .copy(_daySunColor)
+      .lerp(_sunsetSunColor, sunsetFactor * atmoT * 0.72);
+    this.hemiLight.intensity = THREE.MathUtils.lerp(
+      0.2,
+      THREE.MathUtils.lerp(0.14, 1.05, dayFactor),
+      atmoT,
+    );
+    this.rimLight.intensity = THREE.MathUtils.lerp(0.14, 0.26, dayFactor);
+
+    _skyTmpColor
+      .copy(_nightAtmoBgColor)
+      .lerp(_dayAtmoBgColor, dayFactor)
+      .lerp(_sunsetAtmoBgColor, sunsetFactor * 0.65);
+    _blendedBgColor.lerpColors(_spaceBgColor, _skyTmpColor, atmoT);
     (this.scene.background as THREE.Color).copy(_blendedBgColor);
     this.fog.color.copy(_blendedBgColor);
-    this.fog.density = THREE.MathUtils.lerp(0.0002, 0.0017, atmoT);
+    this.fog.density = THREE.MathUtils.lerp(
+      0.00018,
+      THREE.MathUtils.lerp(0.0009, 0.0017, dayFactor),
+      atmoT,
+    );
 
-    this.cameraRig.update(dt, elapsed, {
-      mode: this.config.cameraMode,
-      shipPos: this.physics.shipRoot.position,
-      shipQuat: this.physics.shipQuat,
-      speed: physOut.speed,
-      maxSpeed: this.config.ship.maxSpeed,
-      reentryIntensity: this.physics.reentryIntensity,
-      landingState: this.physics.landing.state,
-    });
+    if (this.playerMode === 'character') {
+      this.cameraRig.updateCharacter(dt, {
+        shipOrbitMode: this.config.cameraMode === 'orbit',
+        characterCamera: this.config.characterCamera,
+        charPos: this.character.root.position,
+        upDir: this.character.upDir,
+        rightDir: this.character.rightDir,
+        aimDir: this.character.aimDir,
+        speed: this.character.speed,
+        activeBody: this.character.activeBody,
+        planetManager: this.planetManager,
+      });
+    } else {
+      this.cameraRig.update(dt, elapsed, {
+        mode: this.config.cameraMode,
+        shipPos: this.physics.shipRoot.position,
+        shipQuat: this.physics.shipQuat,
+        speed: physOut.speed,
+        maxSpeed: this.config.ship.maxSpeed,
+        reentryIntensity: this.physics.reentryIntensity,
+        landingState: this.physics.landing.state,
+      });
+    }
 
     this.spaceBackground.update(elapsed, this.cameraRig.camera.position);
-    this.planetManager.updateHorizonCulling(this.cameraRig.camera.position);
+    this.planetManager.updateHorizonCulling(
+      this.cameraRig.camera.position,
+      this.cameraRig.camera,
+    );
 
     this.renderer.render(this.scene, this.cameraRig.camera);
 
@@ -593,7 +827,32 @@ export class FlightEngine {
     );
     this.callbacks.onIndicatorFrame?.(this.lastIndicator);
 
-    if (elapsed - this.lastTelemetryEmit >= 0.1) {
+    if (this.callbacks.onHorizonFrame) {
+      const camPos = this.cameraRig.camera.position;
+      const camDist = camPos.length();
+      let groundR = this.config.planet.planetRadius;
+      if (camDist > 0.001 && camDist < this.config.planet.planetRadius + 25) {
+        _shipDir.copy(camPos).divideScalar(camDist);
+        groundR = this.planetManager.getRenderedSurfaceRadiusAt(
+          _shipDir.x,
+          _shipDir.y,
+          _shipDir.z,
+        );
+      }
+      this.callbacks.onHorizonFrame(
+        computeHorizonHud(
+          this.cameraRig.camera,
+          this.config.planet.planetRadius,
+          groundR,
+          this.config.planet.atmosphereHeight,
+          this.playerMode === 'character' ? 'chase' : this.config.cameraMode,
+          this.lastViewportW,
+          this.lastViewportH,
+        ),
+      );
+    }
+
+    if (elapsed - this.lastTelemetryEmit >= 0.12) {
       this.lastTelemetryEmit = elapsed;
       this.emitTelemetry();
     }
@@ -606,10 +865,16 @@ export class FlightEngine {
   };
 
   private emitTelemetry(): void {
-    const targetDist = this.physics.shipRoot.position.distanceTo(
-      this.beaconController.position,
-    );
-    _shipForward.set(0, 0, -1).applyQuaternion(this.physics.shipQuat);
+    const focusPos =
+      this.playerMode === 'character'
+        ? this.character.root.position
+        : this.physics.shipRoot.position;
+    const targetDist = focusPos.distanceTo(this.beaconController.position);
+    if (this.playerMode === 'character') {
+      _shipForward.copy(this.character.forwardDir);
+    } else {
+      _shipForward.set(0, 0, -1).applyQuaternion(this.physics.shipQuat);
+    }
     const heading =
       ((THREE.MathUtils.radToDeg(Math.atan2(_shipForward.x, -_shipForward.z)) %
         360) +
@@ -618,11 +883,9 @@ export class FlightEngine {
 
     let biome = '';
     if (!this.physics.inSpace) {
-      const lenSq = this.physics.shipRoot.position.lengthSq();
+      const lenSq = focusPos.lengthSq();
       if (lenSq > 0.0001) {
-        _shipDir
-          .copy(this.physics.shipRoot.position)
-          .divideScalar(Math.sqrt(lenSq));
+        _shipDir.copy(focusPos).divideScalar(Math.sqrt(lenSq));
         const rawH = getPlanetTerrainHeight(
           _shipDir.x,
           _shipDir.y,
@@ -655,12 +918,34 @@ export class FlightEngine {
       landHint = evalRes.hint;
     }
 
+    const floraStats = this.floraManager.getStats();
+    const renderCalls = this.renderer.info.render.calls;
+    const terrainDraws = this.planetManager.getVisiblePatchCount();
+    const floraDraws = floraStats.activeMeshes;
+    const otherDraws = Math.max(0, renderCalls - terrainDraws - floraDraws);
+    const fps = Math.round(1 / Math.max(this.avgFpsDt, 0.001));
+
+    const speed =
+      this.playerMode === 'character'
+        ? this.character.speed
+        : this.physics.velocity.length();
+    const altitude =
+      this.playerMode === 'character'
+        ? this.character.altitude
+        : this.physics.shipAltitude;
+
     this.callbacks.onTelemetry({
-      speed: this.physics.velocity.length(),
-      altitude: this.physics.shipAltitude,
+      speed,
+      altitude,
       headingDeg: heading,
-      inSpace: this.physics.inSpace,
-      atmospherePct: this.physics.atmospherePct,
+      inSpace:
+        this.playerMode === 'character' && this.character.activeBody === 'moon'
+          ? true
+          : this.physics.inSpace,
+      atmospherePct:
+        this.playerMode === 'character' && this.character.activeBody === 'moon'
+          ? 0
+          : this.physics.atmospherePct,
       biome,
       planetPatches: this.planetManager.patchCount,
       targetDistance: targetDist,
@@ -670,8 +955,20 @@ export class FlightEngine {
       reentryIntensity: this.physics.reentryIntensity,
       isThrusting: this.isThrusting,
       isBoosting: this.isBoosting,
+      turboCharge: this.physics.turboCharge,
+      turboExhausted: this.physics.turboExhausted,
+      playerMode: this.playerMode,
+      characterCamera: this.config.characterCamera,
+      jetpackEnabled: this.character.jetpackEnabled,
+      dampenersEnabled: this.character.dampenersEnabled,
       qualityLevel: this.qualityScaler.getLevel(),
-      floraInstances: this.floraManager.getActiveInstanceCount(),
+      fps,
+      floraInstances: floraStats.instancesDrawn,
+      floraGroups: floraStats.groupsActive,
+      renderCalls,
+      terrainDraws,
+      floraDraws,
+      otherDraws,
       landingState,
       canLand,
       landHint,
@@ -710,6 +1007,7 @@ export class FlightEngine {
     this.weaponsSystem.dispose();
     this.particleSystem.dispose();
     this.floraManager.dispose();
+    this.character.dispose();
     this.physics.dispose();
     this.beaconController.dispose();
     this.cameraRig.dispose();

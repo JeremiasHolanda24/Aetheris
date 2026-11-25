@@ -79,10 +79,6 @@ export class SoundEngine {
     }
   }
 
-  public isMuted(): boolean {
-    return this.muted;
-  }
-
   public setPaused(paused: boolean): void {
     this.paused = paused;
     if (!this.ctx || this.disposed) return;

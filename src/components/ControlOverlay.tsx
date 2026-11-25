@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import {
   ArrowDownToLine,
+  ArrowUpFromLine,
   Crosshair,
+  Eye,
+  Flame,
   LocateFixed,
   Maximize2,
   Minimize2,
@@ -10,10 +13,12 @@ import {
   Settings,
   Volume2,
   VolumeX,
+  Wind,
   X,
 } from 'lucide-react';
 import {
   CameraMode,
+  CharacterCameraMode,
   QualityLevel,
   SimulationConfig,
   TelemetrySnapshot,
@@ -31,6 +36,10 @@ interface TelemetryHeaderProps {
   onToggleFullscreen: () => void;
   onToggleTargetLock: () => void;
   onToggleMute: () => void;
+  onToggleCharacterCamera: () => void;
+  onToggleJetpack: () => void;
+  onToggleDampeners: () => void;
+  onToggleLanding: () => void;
 }
 
 export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
@@ -46,6 +55,10 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
     onToggleFullscreen,
     onToggleTargetLock,
     onToggleMute,
+    onToggleCharacterCamera,
+    onToggleJetpack,
+    onToggleDampeners,
+    onToggleLanding,
   }) => (
     <header
       className={`pointer-events-none fixed top-2.5 sm:top-4 left-0 right-0 z-30 flex flex-wrap items-center justify-between gap-2 transition-opacity duration-150 ${
@@ -56,35 +69,93 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
         paddingRight: 'max(0.75rem, env(safe-area-inset-right))',
       }}
     >
-      <div className="pointer-events-auto bg-[#090c16]/90 border border-white/10 rounded-lg px-3 py-1.5 sm:px-4 sm:py-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-        <h1 className="font-display text-xs sm:text-base font-semibold tracking-wide text-slate-100 whitespace-nowrap shrink-0">
-          Aetheris Flight 3D
-        </h1>
-        <span className="hidden sm:inline text-slate-600" aria-hidden="true">
-          |
+      <div className="pointer-events-auto bg-[#090c16]/90 border border-white/10 rounded-lg px-3 py-1.5 sm:px-4 sm:py-2 flex flex-wrap items-center gap-x-2.5 sm:gap-x-3 gap-y-1">
+        {(() => {
+          const maxRef = telemetry.playerMode === 'character' ? 30 : 120;
+          const barRatio = Math.min(1, Math.max(0, telemetry.speed / maxRef));
+          const totalSegs = 12;
+          const filledSegs = Math.round(barRatio * totalSegs);
+          return (
+            <div
+              className="flex items-center gap-2 shrink-0"
+              aria-label={`Velocidade ${Math.round(telemetry.speed)} metros por segundo`}
+            >
+              <div className="flex items-center gap-[2.5px]" aria-hidden="true">
+                {Array.from({ length: totalSegs }, (_, idx) => {
+                  const filled = idx < filledSegs;
+                  const segClass = filled
+                    ? idx >= 9
+                      ? 'bg-amber-500'
+                      : telemetry.isBoosting
+                        ? 'bg-amber-400'
+                        : 'bg-sky-400'
+                    : 'bg-slate-400/20';
+                  return (
+                    <span
+                      key={idx}
+                      className={`block w-[4px] sm:w-[5px] h-3 sm:h-3.5 ${segClass}`}
+                    />
+                  );
+                })}
+              </div>
+              <span className="text-[11px] sm:text-xs font-mono-tabular text-slate-300">
+                <strong className="text-slate-100 font-medium">
+                  {Math.round(telemetry.speed)}
+                </strong>{' '}
+                m/s
+              </span>
+            </div>
+          );
+        })()}
+        <span className="text-slate-600" aria-hidden="true">
+          ·
         </span>
+        {/* Turbo Charge Bar */}
+        {telemetry.playerMode === 'ship' && (
+          <>
+            <div
+              className="flex items-center gap-1.5 shrink-0"
+              title="Carga do Turbo (Espaço / Shift)"
+              aria-label={`Carga do turbo ${Math.round(telemetry.turboCharge * 100)} por cento`}
+            >
+              <Flame
+                className={`w-3.5 h-3.5 ${
+                  telemetry.turboExhausted
+                    ? 'text-rose-400'
+                    : telemetry.isBoosting
+                      ? 'text-amber-300'
+                      : 'text-amber-400/80'
+                }`}
+              />
+              <div className="w-12 sm:w-14 h-2 rounded-sm bg-slate-400/20 overflow-hidden">
+                <div
+                  className={`h-full transition-[width] duration-75 ${
+                    telemetry.turboExhausted
+                      ? 'bg-rose-500'
+                      : telemetry.isBoosting
+                        ? 'bg-amber-300'
+                        : 'bg-amber-400'
+                  }`}
+                  style={{
+                    width: `${Math.round(
+                      Math.min(1, Math.max(0, telemetry.turboCharge)) * 100,
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+          </>
+        )}
         <div className="flex flex-wrap items-center gap-x-2 sm:gap-x-2.5 gap-y-0.5 text-[11px] sm:text-xs text-slate-300 font-mono-tabular">
-          <span>
-            VEL{' '}
-            <strong className="text-slate-100 font-medium">
-              {telemetry.speed.toFixed(1)}
-            </strong>{' '}
-            m/s
-          </span>
-          <span className="text-slate-600" aria-hidden="true">
-            ·
-          </span>
           <span>
             ALT{' '}
             <strong className="text-slate-100 font-medium">
               {telemetry.altitude.toFixed(0)}
             </strong>{' '}
             m
-            {telemetry.biome ? (
-              <span className="ml-1.5 text-slate-400 font-normal">
-                · {telemetry.biome}
-              </span>
-            ) : null}
           </span>
           <span className="text-slate-600" aria-hidden="true">
             ·
@@ -101,20 +172,6 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
               </>
             )}
           </span>
-          <span className="hidden sm:inline text-slate-600" aria-hidden="true">
-            ·
-          </span>
-          <span className="hidden sm:inline">
-            ALVO{' '}
-            <strong className="text-amber-400 font-medium">
-              {Math.round(telemetry.targetDistance)}m
-            </strong>{' '}
-            ({telemetry.targetZone === 'orbit'
-              ? 'Órbita'
-              : telemetry.targetZone === 'moon'
-                ? 'Lua'
-                : 'Solo'})
-          </span>
           <span className="text-slate-600" aria-hidden="true">
             ·
           </span>
@@ -127,9 +184,65 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
         </div>
       </div>
 
-      {/* Top-Right: Travar Alvo (Desktop) + Tela Cheia + Engrenagem de Ajustes */}
-      <div className="pointer-events-auto flex items-center gap-2">
-        {!isTouchDevice && (
+      {/* Top-Right: Character Suit / Ship Quick Controls + Fullscreen + Audio + Settings */}
+      <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
+        {telemetry.playerMode === 'character' && !isTouchDevice && (
+          <>
+            <button
+              type="button"
+              onClick={onToggleCharacterCamera}
+              className="min-h-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border bg-[#090c16]/90 text-slate-200 border-white/15 hover:border-white/30 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+              title="Alternar câmera 3ª / 1ª pessoa (V)"
+            >
+              <Eye className="w-4 h-4 text-sky-400" />
+              <span>
+                {telemetry.characterCamera === 'third' ? '3ª Pessoa' : '1ª Pessoa'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onToggleJetpack}
+              className={`min-h-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
+                telemetry.jetpackEnabled
+                  ? 'bg-sky-500 text-slate-950 border-sky-300 font-semibold'
+                  : 'bg-[#090c16]/90 text-slate-300 border-white/15 hover:border-white/30'
+              }`}
+              title="Ligar/Desligar Jetpack (X)"
+              aria-pressed={telemetry.jetpackEnabled}
+            >
+              <Flame className="w-4 h-4" />
+              <span>Jetpack</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onToggleDampeners}
+              className={`min-h-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
+                telemetry.dampenersEnabled
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-400/50'
+                  : 'bg-[#090c16]/90 text-slate-400 border-white/15 hover:border-white/30'
+              }`}
+              title="Amortecedores Inerciais (Z)"
+              aria-pressed={telemetry.dampenersEnabled}
+            >
+              <Wind className="w-4 h-4" />
+              <span>Inercial</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onToggleLanding}
+              className="min-h-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border bg-amber-500/20 text-amber-300 border-amber-400/45 hover:bg-amber-500/30 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+              title="Entrar na nave e decolar (L)"
+            >
+              <ArrowUpFromLine className="w-4 h-4" />
+              <span>Decolar</span>
+            </button>
+          </>
+        )}
+
+        {telemetry.playerMode === 'ship' && !isTouchDevice && (
           <button
             type="button"
             onClick={onToggleTargetLock}
@@ -206,7 +319,13 @@ interface ControlDockProps {
   activeSliderId: string | null;
   autoQuality: boolean;
   qualityLevel: QualityLevel;
+  fps: number;
   floraInstances: number;
+  floraGroups: number;
+  renderCalls: number;
+  terrainDraws: number;
+  floraDraws: number;
+  otherDraws: number;
   onActiveSliderChange: (id: string | null) => void;
   onToggleAutoQuality: () => void;
   onCloseDock: () => void;
@@ -284,7 +403,13 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
     activeSliderId,
     autoQuality,
     qualityLevel,
+    fps,
     floraInstances,
+    floraGroups,
+    renderCalls,
+    terrainDraws,
+    floraDraws,
+    otherDraws,
     onActiveSliderChange,
     onToggleAutoQuality,
     onCloseDock,
@@ -324,7 +449,6 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
 
     const cameraModes: Array<{ id: CameraMode; label: string }> = [
       { id: 'chase', label: 'Perseguição' },
-      { id: 'tactical', label: 'Tática' },
       { id: 'cockpit', label: 'Cabine' },
       { id: 'orbit', label: 'Órbita Livre' },
     ];
@@ -762,32 +886,61 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
             )}
 
             {activeTab === 'camera' && (
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  {cameraModes.map((mode) => (
-                    <button
-                      key={mode.id}
-                      type="button"
-                      onClick={() =>
-                        onUpdateConfig((prev) => ({
-                          ...prev,
-                          cameraMode: mode.id,
-                        }))
-                      }
-                      className={`px-3.5 py-2 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                        config.cameraMode === mode.id
-                          ? 'bg-amber-500 text-slate-950 border-amber-400 font-semibold'
-                          : 'bg-slate-800/90 text-slate-200 border-white/10 hover:border-white/25'
-                      }`}
-                    >
-                      {mode.label}
-                    </button>
-                  ))}
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {cameraModes.map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        onClick={() =>
+                          onUpdateConfig((prev) => ({
+                            ...prev,
+                            cameraMode: mode.id,
+                          }))
+                        }
+                        className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          config.cameraMode === mode.id
+                            ? 'bg-amber-500 text-slate-950 border-amber-400 font-semibold'
+                            : 'bg-slate-800/90 text-slate-200 border-white/10 hover:border-white/25'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-slate-400">Astronauta:</span>
+                    {(
+                      [
+                        { id: 'third', label: '3ª Pessoa (NMS)' },
+                        { id: 'first', label: '1ª Pessoa' },
+                      ] as Array<{ id: CharacterCameraMode; label: string }>
+                    ).map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        onClick={() =>
+                          onUpdateConfig((prev) => ({
+                            ...prev,
+                            characterCamera: mode.id,
+                          }))
+                        }
+                        className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          config.characterCamera === mode.id
+                            ? 'bg-sky-500 text-slate-950 border-sky-300 font-semibold'
+                            : 'bg-slate-800/90 text-slate-200 border-white/10 hover:border-white/25'
+                        }`}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 <p className="text-xs text-slate-400">
                   {config.cameraMode === 'orbit'
                     ? 'Arraste para girar a câmera e use pinça/scroll para zoom.'
-                    : 'Segure na tela para atirar · T Travar Alvo · W/S/A/D/E/Q Voar · Espaço Turbo · L — Pousar / Decolar.'}
+                    : 'Nave: W/S/A/D/E/Q · Espaço Turbo · T Alvo · L Pousar/Decolar · Astronauta: Arraste p/ olhar · WASD · X Jetpack · Z Inercial · V 1ª/3ª Pessoa.'}
                 </p>
               </div>
             )}
@@ -825,7 +978,7 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
               <span className="text-slate-400">
                 Flora:{' '}
                 <strong className="text-slate-200 font-medium">
-                  {floraInstances}
+                  FPS {fps} · {floraGroups} grupos · {floraInstances} inst · {renderCalls} draws (terreno {terrainDraws} · flora {floraDraws} · outros {otherDraws})
                 </strong>
               </span>
               <span>

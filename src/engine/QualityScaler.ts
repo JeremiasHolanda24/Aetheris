@@ -8,6 +8,7 @@ export interface QualityPreset {
   particleRatio: number;
   floraDensityRatio: number;
   floraViewRatio: number;
+  terrainDetailRatio: number;
 }
 
 const STAR_RATIOS: Record<QualityLevel, number> = {
@@ -19,16 +20,23 @@ const STAR_RATIOS: Record<QualityLevel, number> = {
 
 const FLORA_DENSITY_RATIOS: Record<QualityLevel, number> = {
   0: 1.0,
-  1: 0.8,
-  2: 0.5,
-  3: 0.25,
+  1: 0.85,
+  2: 0.6,
+  3: 0.4,
 };
 
 const FLORA_VIEW_RATIOS: Record<QualityLevel, number> = {
   0: 1.0,
-  1: 0.9,
-  2: 0.7,
-  3: 0.5,
+  1: 0.95,
+  2: 0.85,
+  3: 0.7,
+};
+
+const TERRAIN_DETAIL_RATIOS: Record<QualityLevel, number> = {
+  0: 1.0,
+  1: 1.0,
+  2: 0.6,
+  3: 0.3,
 };
 
 const PIXEL_RATIO_CAPS: Record<QualityLevel, number> = {
@@ -119,7 +127,7 @@ export class QualityScaler {
     if (this.sliderDragging) return;
 
     const avgFps = 1 / Math.max(this.avgDt, 0.0001);
-    if (avgFps < 40) {
+    if (avgFps < 35) {
       this.lowFpsDuration += rawDt;
       this.highFpsDuration = 0;
     } else if (avgFps > 57) {
@@ -132,7 +140,7 @@ export class QualityScaler {
 
     if (this.cooldownRemaining > 0) return;
 
-    if (this.lowFpsDuration >= 3.0 && this.level < 3) {
+    if (this.lowFpsDuration >= 4.0 && this.level < 3) {
       this.setLevel((this.level + 1) as QualityLevel);
     } else if (this.highFpsDuration >= 10.0 && this.level > 0) {
       this.setLevel((this.level - 1) as QualityLevel);
@@ -161,6 +169,7 @@ export class QualityScaler {
       particleRatio: level === 3 ? 0.5 : 1.0,
       floraDensityRatio: FLORA_DENSITY_RATIOS[level],
       floraViewRatio: FLORA_VIEW_RATIOS[level],
+      terrainDetailRatio: TERRAIN_DETAIL_RATIOS[level],
     };
   }
 }

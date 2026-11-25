@@ -1,6 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { CameraMode, LandingState } from '../types/simulation';
+import {
+  CameraMode,
+  CharacterCameraMode,
+  LandingState,
+} from '../types/simulation';
+import { PlanetTerrainManager } from './PlanetTerrainManager';
 
 // Pre-allocated math helpers outside render loop (Zero GC)
 const _shipForward = new THREE.Vector3();
@@ -11,12 +16,13 @@ const _currentLookAt = new THREE.Vector3();
 const _camUp = new THREE.Vector3(0, 1, 0);
 const _camOffset = new THREE.Vector3();
 const _yawQuat = new THREE.Quaternion();
-
+const _charPivot = new THREE.Vector3();
+const _camRadial = new THREE.Vector3();
 const _shipDelta = new THREE.Vector3();
 
 /**
- * Manages PerspectiveCamera, OrbitControls, chase/tactical/cockpit/orbit views,
- * speed-driven FOV, relaxed landed chase framing, and atmospheric re-entry camera shake.
+ * Manages PerspectiveCamera, OrbitControls, ship chase/cockpit/orbit views,
+ * No Man's Sky 3rd-person & 1st-person character views, and speed-driven FOV.
  */
 export class CameraRig {
   public readonly camera: THREE.PerspectiveCamera;
@@ -46,7 +52,7 @@ export class CameraRig {
     this.controls.enableDamping = !isSoftwareGl;
     this.controls.dampingFactor = 0.08;
     this.controls.maxDistance = 420;
-    this.controls.minDistance = 5;
+    this.controls.minDistance = 2.2;
     this.controls.enabled = initialMode === 'orbit';
     this.controls.addEventListener('start', () => {
       this.userOrbiting = true;
@@ -64,7 +70,7 @@ export class CameraRig {
     }
   }
 
-  public setMode(mode: CameraMode, shipPos: THREE.Vector3): void {
+  public setMode(mode: CameraMode, focusPos: THREE.Vector3): void {
     const targetNear = mode === 'cockpit' ? 0.08 : 0.6;
     if (this.camera.near !== targetNear) {
       this.camera.near = targetNear;
@@ -74,8 +80,8 @@ export class CameraRig {
     this.controls.enabled = mode === 'orbit';
     this.hasPrevOrbitShipPos = false;
     if (mode === 'orbit') {
-      this.controls.target.copy(shipPos);
-      this.prevOrbitShipPos.copy(shipPos);
+      this.controls.target.copy(focusPos);
+      this.prevOrbitShipPos.copy(focusPos);
       this.hasPrevOrbitShipPos = true;
       this.controls.update();
     }
@@ -156,8 +162,8 @@ export class CameraRig {
     _shipUp.set(0, 1, 0).applyQuaternion(shipQuat);
 
     if (mode === 'chase') {
-      const chaseBack = 12.5 * (1 + 0.25 * this.landedCamBlend);
-      const chaseUp = 3.4 + 1.4 * this.landedCamBlend;
+      const chaseBack = 16.0 * (1 + 0.25 * this.landedCamBlend);
+      const chaseUp = 4.2 + 1.5 * this.landedCamBlend;
       const yawSway =
         THREE.MathUtils.degToRad(6) *
         Math.sin(elapsed * ((Math.PI * 2) / 14)) *
@@ -173,33 +179,27 @@ export class CameraRig {
         .add(_camOffset)
         .addScaledVector(_shipUp, chaseUp);
 
-      const lookForward = THREE.MathUtils.lerp(135, 4, this.landedCamBlend);
+      const lookForward = THREE.MathUtils.lerp(135, 5, this.landedCamBlend);
       _desiredLookAt
         .copy(shipPos)
         .addScaledVector(_shipForward, lookForward)
-        .addScaledVector(_shipUp, 0.6 * this.landedCamBlend);
-    } else if (mode === 'tactical') {
-      _desiredCamPos
-        .copy(shipPos)
-        .addScaledVector(_shipForward, -10)
-        .addScaledVector(_shipUp, 38);
-      _desiredLookAt.copy(shipPos).addScaledVector(_shipForward, 6);
+        .addScaledVector(_shipUp, 0.7 * this.landedCamBlend);
     } else {
-      // cockpit: fixed inside the bubble canopy at pilot eye height
+      // cockpit: seated inside bubble canopy (0, 0.50, -0.14) framing HUD glass and legible MFDs
       _desiredCamPos
         .copy(shipPos)
-        .addScaledVector(_shipForward, 0.16)
-        .addScaledVector(_shipUp, 0.43);
+        .addScaledVector(_shipForward, 0.14)
+        .addScaledVector(_shipUp, 0.50);
       _desiredLookAt
         .copy(shipPos)
         .addScaledVector(_shipForward, 140)
-        .addScaledVector(_shipUp, 0.43);
+        .addScaledVector(_shipUp, 0.48);
     }
 
     // Rigidly anchor camera to ship frame so high speed or sharp turns never lose the ship
     this.camera.position.copy(_desiredCamPos);
 
-    if (reentryIntensity > 0.04 && mode !== 'tactical') {
+    if (reentryIntensity > 0.04) {
       const shake = reentryIntensity * (mode === 'cockpit' ? 0.05 : 0.12);
       this.camera.position.x += Math.sin(elapsed * 53) * shake;
       this.camera.position.y += Math.cos(elapsed * 61) * shake;
@@ -217,13 +217,120 @@ export class CameraRig {
       1.3,
     );
     const targetFov =
-      mode === 'tactical'
-        ? 54
-        : mode === 'cockpit'
-          ? 66 + speedRatio * 8 + reentryIntensity * 3.5
-          : 60 + speedRatio * 10 + reentryIntensity * 4.5;
+      mode === 'cockpit'
+        ? 64 + speedRatio * 6 + reentryIntensity * 2.5
+        : 60 + speedRatio * 10 + reentryIntensity * 4.5;
     if (Math.abs(this.camera.fov - targetFov) > 0.05) {
       this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 5, dt);
+      this.camera.updateProjectionMatrix();
+    }
+  }
+
+  public updateCharacter(
+    dt: number,
+    params: {
+      shipOrbitMode: boolean;
+      characterCamera: CharacterCameraMode;
+      charPos: THREE.Vector3;
+      upDir: THREE.Vector3;
+      rightDir: THREE.Vector3;
+      aimDir: THREE.Vector3;
+      speed: number;
+      activeBody: 'planet' | 'moon';
+      planetManager: PlanetTerrainManager;
+    },
+  ): void {
+    const {
+      shipOrbitMode,
+      characterCamera,
+      charPos,
+      upDir,
+      rightDir,
+      aimDir,
+      speed,
+      activeBody,
+      planetManager,
+    } = params;
+
+    if (shipOrbitMode) {
+      _charPivot.copy(charPos).addScaledVector(upDir, 1.1);
+      if (this.hasPrevOrbitShipPos) {
+        _shipDelta.subVectors(_charPivot, this.prevOrbitShipPos);
+        this.camera.position.add(_shipDelta);
+        this.controls.target.add(_shipDelta);
+      } else if (!this.userOrbiting) {
+        this.controls.target.copy(_charPivot);
+      }
+      this.prevOrbitShipPos.copy(_charPivot);
+      this.hasPrevOrbitShipPos = true;
+      this.controls.update();
+      return;
+    }
+    this.hasPrevOrbitShipPos = false;
+
+    const desiredNear = characterCamera === 'first' ? 0.06 : 0.14;
+    if (this.camera.near !== desiredNear) {
+      this.camera.near = desiredNear;
+      this.camera.updateProjectionMatrix();
+    }
+
+    if (characterCamera === 'first') {
+      // 1st-person view inside astronaut helmet eye level
+      _desiredCamPos.copy(charPos).addScaledVector(upDir, 1.5);
+      _desiredLookAt.copy(_desiredCamPos).addScaledVector(aimDir, 45);
+    } else {
+      // No Man's Sky style over-the-right-shoulder 3rd-person camera
+      _charPivot.copy(charPos).addScaledVector(upDir, 1.44);
+      _desiredCamPos
+        .copy(_charPivot)
+        .addScaledVector(aimDir, -2.9)
+        .addScaledVector(rightDir, 0.52)
+        .addScaledVector(upDir, 0.22);
+
+      // Keep 3rd-person camera above terrain/moon surface
+      if (activeBody === 'moon') {
+        const moon = planetManager.getMoonState();
+        _camRadial.subVectors(_desiredCamPos, moon.center);
+        const camDist = _camRadial.length();
+        const minR = moon.radius + 0.35;
+        if (camDist < minR) {
+          if (camDist > 0.0001) {
+            _camRadial.divideScalar(camDist);
+          } else {
+            _camRadial.copy(upDir);
+          }
+          _desiredCamPos.copy(moon.center).addScaledVector(_camRadial, minR);
+        }
+      } else {
+        const camDist = _desiredCamPos.length();
+        if (camDist > 0.0001) {
+          _camRadial.copy(_desiredCamPos).divideScalar(camDist);
+          const surfR = planetManager.getRenderedSurfaceRadiusAt(
+            _camRadial.x,
+            _camRadial.y,
+            _camRadial.z,
+          );
+          const minR = surfR + 0.35;
+          if (camDist < minR) {
+            _desiredCamPos.copy(_camRadial).multiplyScalar(minR);
+          }
+        }
+      }
+
+      _desiredLookAt.copy(_charPivot).addScaledVector(aimDir, 18);
+    }
+
+    this.camera.position.copy(_desiredCamPos);
+    _camUp.copy(upDir);
+    this.camera.up.copy(_camUp);
+    _currentLookAt.copy(_desiredLookAt);
+    this.camera.lookAt(_currentLookAt);
+
+    const speedBoost = THREE.MathUtils.clamp(speed / 18, 0, 1);
+    const targetFov =
+      (characterCamera === 'first' ? 70 : 64) + speedBoost * 5;
+    if (Math.abs(this.camera.fov - targetFov) > 0.05) {
+      this.camera.fov = THREE.MathUtils.damp(this.camera.fov, targetFov, 6, dt);
       this.camera.updateProjectionMatrix();
     }
   }

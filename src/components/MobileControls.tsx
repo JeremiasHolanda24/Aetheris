@@ -1,43 +1,70 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ArrowDown,
   ArrowDownToLine,
+  ArrowUp,
   ArrowUpFromLine,
+  Eye,
   Flame,
   Gauge,
   LocateFixed,
   RotateCw,
+  Settings,
   Smartphone,
+  Wind,
   X,
 } from 'lucide-react';
 import { VirtualInputs } from '../engine/FlightEngine';
-import { LandingState } from '../types/simulation';
+import {
+  CharacterCameraMode,
+  LandingState,
+  PlayerMode,
+} from '../types/simulation';
 
 interface MobileControlsProps {
   visible: boolean;
+  playerMode: PlayerMode;
+  characterCamera: CharacterCameraMode;
+  jetpackEnabled: boolean;
+  dampenersEnabled: boolean;
   targetLocked: boolean;
   landingState: LandingState;
   canLand: boolean;
+  showSettingsFallback?: boolean;
   isPortraitMobile: boolean;
   portraitDismissed: boolean;
   onDismissPortrait: () => void;
   onRequestLandscapeFullscreen: () => void;
   onToggleTargetLock: () => void;
   onToggleLanding: () => void;
+  onToggleCharacterCamera: () => void;
+  onToggleJetpack: () => void;
+  onToggleDampeners: () => void;
+  onOpenDock?: () => void;
   onVirtualInputChange: (inputs: VirtualInputs) => void;
 }
 
 export const MobileControls: React.FC<MobileControlsProps> = React.memo(
   ({
     visible,
+    playerMode,
+    characterCamera,
+    jetpackEnabled,
+    dampenersEnabled,
     targetLocked,
     landingState,
     canLand,
+    showSettingsFallback = false,
     isPortraitMobile,
     portraitDismissed,
     onDismissPortrait,
     onRequestLandscapeFullscreen,
     onToggleTargetLock,
     onToggleLanding,
+    onToggleCharacterCamera,
+    onToggleJetpack,
+    onToggleDampeners,
+    onOpenDock,
     onVirtualInputChange,
   }) => {
     const stickStateRef = useRef({ turn: 0, pitch: 0 });
@@ -45,6 +72,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
       thrustPressed: false,
       boostPressed: false,
       brakePressed: false,
+      charUpPressed: false,
+      charDownPressed: false,
     });
 
     const activeStickPointerRef = useRef<number | null>(null);
@@ -55,12 +84,19 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
       thrust: false,
       boost: false,
       brake: false,
+      charUp: false,
+      charDown: false,
     });
 
     const emitCombinedInputs = useCallback(() => {
       const { turn, pitch } = stickStateRef.current;
-      const { thrustPressed, boostPressed, brakePressed } =
-        pedalStateRef.current;
+      const {
+        thrustPressed,
+        boostPressed,
+        brakePressed,
+        charUpPressed,
+        charDownPressed,
+      } = pedalStateRef.current;
 
       let pedalThrust = 0;
       if (thrustPressed || boostPressed) pedalThrust += 1;
@@ -72,6 +108,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         thrust: Math.max(-0.5, Math.min(1, pedalThrust)),
         boost: boostPressed,
         firing: false,
+        charUp: charUpPressed,
+        charDown: charDownPressed,
       });
     }, [onVirtualInputChange]);
 
@@ -82,16 +120,26 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
           thrustPressed: false,
           boostPressed: false,
           brakePressed: false,
+          charUpPressed: false,
+          charDownPressed: false,
         };
         activeStickPointerRef.current = null;
         setPuckOffset({ x: 0, y: 0, active: false });
-        setPedalsUi({ thrust: false, boost: false, brake: false });
+        setPedalsUi({
+          thrust: false,
+          boost: false,
+          brake: false,
+          charUp: false,
+          charDown: false,
+        });
         onVirtualInputChange({
           turn: 0,
           pitch: 0,
           thrust: 0,
           boost: false,
           firing: false,
+          charUp: false,
+          charDown: false,
         });
       }
     }, [visible, onVirtualInputChange]);
@@ -114,8 +162,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         dy *= scale;
       }
 
-      const normX = dx / maxRadius; // -1 left, +1 right
-      const normY = dy / maxRadius; // -1 up, +1 down
+      const normX = dx / maxRadius;
+      const normY = dy / maxRadius;
 
       const deadzone = 0.12;
       const rawTurn = -normX;
@@ -125,7 +173,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
           : (Math.sign(rawTurn) * (Math.abs(rawTurn) - deadzone)) /
             (1 - deadzone);
 
-      const rawPitch = -normY; // Push UP to climb into space, DOWN to dive
+      const rawPitch = -normY;
       const pitch =
         Math.abs(rawPitch) < deadzone
           ? 0
@@ -161,7 +209,12 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
     };
 
     const setPedal = (
-      key: 'thrustPressed' | 'boostPressed' | 'brakePressed',
+      key:
+        | 'thrustPressed'
+        | 'boostPressed'
+        | 'brakePressed'
+        | 'charUpPressed'
+        | 'charDownPressed',
       pressed: boolean,
     ) => {
       pedalStateRef.current[key] = pressed;
@@ -169,6 +222,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         thrust: pedalStateRef.current.thrustPressed,
         boost: pedalStateRef.current.boostPressed,
         brake: pedalStateRef.current.brakePressed,
+        charUp: pedalStateRef.current.charUpPressed,
+        charDown: pedalStateRef.current.charDownPressed,
       });
       emitCombinedInputs();
     };
@@ -187,7 +242,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
               </h2>
               <p className="mt-2 text-sm text-slate-300 leading-relaxed">
                 Gire o celular para o modo paisagem para pilotar com o manche
-                3D à esquerda (girar, subir e descer) e propulsão à direita.
+                3D à esquerda e controles à direita.
               </p>
               <div className="mt-5 flex flex-col gap-2.5">
                 <button
@@ -213,7 +268,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         {/* Dual-Thumb Landscape Touch Controls */}
         {visible && (
           <div className="pointer-events-none hidden [@media(min-height:220px)]:flex fixed inset-x-0 bottom-0 z-15 items-end justify-between px-5 pb-5 sm:px-8 sm:pb-6">
-            {/* LEFT THUMB ZONE: 3D Flight Analog Stick (Yaw + Pitch Climb/Dive) */}
+            {/* LEFT THUMB ZONE */}
             <div
               ref={stickZoneRef}
               onPointerDown={handleStickPointerDown}
@@ -230,15 +285,19 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
                   ? 'bg-[#090c16]/80 border-amber-400/50'
                   : 'bg-[#090c16]/65 border-white/15'
               }`}
-              aria-label="Manche 3D (Direção, Subir e Descer)"
+              aria-label={
+                playerMode === 'character'
+                  ? 'Analógico de movimento'
+                  : 'Manche 3D (Direção, Subir e Descer)'
+              }
             >
               <div className="absolute inset-x-4 h-px bg-white/10 pointer-events-none" />
               <div className="absolute inset-y-4 w-px bg-white/10 pointer-events-none" />
               <span className="absolute top-1.5 text-[9px] font-medium text-sky-300/90 pointer-events-none">
-                ▲ Subir
+                {playerMode === 'character' ? '▲ Frente' : '▲ Subir'}
               </span>
               <span className="absolute bottom-1.5 text-[9px] font-medium text-slate-400 pointer-events-none">
-                ▼ Descer
+                {playerMode === 'character' ? '▼ Trás' : '▼ Descer'}
               </span>
               <span className="absolute left-2.5 text-[11px] font-semibold text-slate-400 pointer-events-none">
                 ‹
@@ -261,160 +320,340 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
               </div>
             </div>
 
-            {/* RIGHT THUMB ZONE: Travar Alvo, Frear, Turbo & Acelerar */}
+            {/* RIGHT THUMB ZONE */}
             <div
-              className="pointer-events-auto flex items-end gap-3"
+              className="pointer-events-auto flex items-end gap-2.5 sm:gap-3"
               style={{
                 touchAction: 'none',
                 marginRight: 'env(safe-area-inset-right)',
                 marginBottom: 'env(safe-area-inset-bottom)',
               }}
             >
-              <div className="flex flex-col items-center gap-2.5">
-                {(landingState === 'landed' ||
-                  landingState === 'landing' ||
-                  (landingState === 'flying' && canLand)) && (
-                  <button
-                    type="button"
-                    onPointerDown={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onToggleLanding();
-                    }}
-                    style={{ touchAction: 'none' }}
-                    className={`min-w-[74px] h-11 px-2.5 rounded-xl border-2 flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer ${
-                      landingState === 'landing'
-                        ? 'bg-rose-500/90 text-white border-rose-200 font-bold'
-                        : landingState === 'landed'
-                          ? 'bg-sky-500/90 text-slate-950 border-sky-200 font-bold'
-                          : 'bg-emerald-500/90 text-slate-950 border-emerald-200 font-bold'
-                    }`}
-                    aria-label={
-                      landingState === 'landing'
-                        ? 'Cancelar pouso'
-                        : landingState === 'landed'
-                          ? 'Decolar'
-                          : 'Pousar'
-                    }
-                  >
-                    {landingState === 'landing' ? (
-                      <X className="w-3.5 h-3.5" />
-                    ) : landingState === 'landed' ? (
+              {playerMode === 'character' ? (
+                <>
+                  <div className="flex flex-col items-center gap-2">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onToggleLanding();
+                      }}
+                      style={{ touchAction: 'none' }}
+                      className="min-w-[74px] h-10 px-2.5 rounded-xl border-2 flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer bg-amber-500/90 text-slate-950 border-amber-200 font-bold"
+                      aria-label="Entrar na nave e decolar"
+                    >
                       <ArrowUpFromLine className="w-3.5 h-3.5" />
-                    ) : (
-                      <ArrowDownToLine className="w-3.5 h-3.5" />
+                      <span className="text-[10px] font-bold tracking-wide leading-none">
+                        DECOLAR
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onToggleCharacterCamera();
+                      }}
+                      style={{ touchAction: 'none' }}
+                      className="min-w-[74px] h-10 px-2.5 rounded-xl border flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer bg-[#090c16]/85 text-slate-100 border-white/20"
+                      aria-label="Alternar câmera 1ª ou 3ª pessoa"
+                    >
+                      <Eye className="w-3.5 h-3.5 text-sky-400" />
+                      <span className="text-[10px] font-semibold leading-none">
+                        {characterCamera === 'third' ? '3ª PES' : '1ª PES'}
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onToggleDampeners();
+                      }}
+                      style={{ touchAction: 'none' }}
+                      className={`min-w-[74px] h-10 px-2.5 rounded-xl border flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer ${
+                        dampenersEnabled
+                          ? 'bg-emerald-500/25 text-emerald-200 border-emerald-400/50'
+                          : 'bg-[#090c16]/85 text-slate-400 border-white/15'
+                      }`}
+                      aria-label="Inercial"
+                    >
+                      <Wind className="w-3.5 h-3.5" />
+                      <span className="text-[10px] font-semibold leading-none">
+                        INERCIAL
+                      </span>
+                    </button>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-2">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onToggleJetpack();
+                        }}
+                        style={{ touchAction: 'none' }}
+                        className={`w-16 h-12 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-all active:scale-95 cursor-pointer ${
+                          jetpackEnabled
+                            ? 'bg-sky-400 text-slate-950 border-sky-200 font-bold'
+                            : 'bg-[#090c16]/85 text-slate-200 border-white/20'
+                        }`}
+                        aria-label="Jetpack"
+                      >
+                        <Flame className="w-4 h-4" />
+                        <span className="text-[10px] font-semibold leading-none">
+                          Jetpack
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setPedal('boostPressed', true);
+                        }}
+                        onPointerUp={(e) => {
+                          e.preventDefault();
+                          setPedal('boostPressed', false);
+                        }}
+                        onPointerCancel={() => setPedal('boostPressed', false)}
+                        style={{ touchAction: 'none' }}
+                        className={`w-14 h-12 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
+                          pedalsUi.boost
+                            ? 'bg-amber-500 text-slate-950 border-amber-300'
+                            : 'bg-[#090c16]/80 text-amber-300 border-amber-400/35'
+                        }`}
+                        aria-label="Correr / Impulso"
+                      >
+                        <Gauge className="w-4 h-4" />
+                        <span className="text-[10px] font-semibold leading-none">
+                          Correr
+                        </span>
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setPedal('charDownPressed', true);
+                        }}
+                        onPointerUp={(e) => {
+                          e.preventDefault();
+                          setPedal('charDownPressed', false);
+                        }}
+                        onPointerCancel={() => setPedal('charDownPressed', false)}
+                        style={{ touchAction: 'none' }}
+                        className={`w-16 h-14 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
+                          pedalsUi.charDown
+                            ? 'bg-slate-200 text-slate-950 border-white'
+                            : 'bg-[#090c16]/80 text-slate-200 border-white/20'
+                        }`}
+                        aria-label="Descer / Agachar"
+                      >
+                        <ArrowDown className="w-4 h-4" />
+                        <span className="text-[10px] font-semibold leading-none">
+                          {jetpackEnabled ? 'Descer' : 'Agachar'}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setPedal('charUpPressed', true);
+                        }}
+                        onPointerUp={(e) => {
+                          e.preventDefault();
+                          setPedal('charUpPressed', false);
+                        }}
+                        onPointerCancel={() => setPedal('charUpPressed', false)}
+                        style={{ touchAction: 'none' }}
+                        className={`w-18 h-16 rounded-full border-2 flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
+                          pedalsUi.charUp
+                            ? 'bg-sky-400 text-slate-950 border-sky-200'
+                            : 'bg-[#090c16]/85 text-sky-300 border-sky-400/45'
+                        }`}
+                        aria-label="Pular / Subir"
+                      >
+                        <ArrowUp className="w-5 h-5" />
+                        <span className="text-[11px] font-semibold leading-none">
+                          {jetpackEnabled ? 'Subir' : 'Pular'}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex flex-col items-center gap-2.5">
+                    {(landingState === 'landed' ||
+                      landingState === 'landing' ||
+                      (landingState === 'flying' && canLand)) && (
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onToggleLanding();
+                        }}
+                        style={{ touchAction: 'none' }}
+                        className={`min-w-[74px] h-11 px-2.5 rounded-xl border-2 flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer ${
+                          landingState === 'landing'
+                            ? 'bg-rose-500/90 text-white border-rose-200 font-bold'
+                            : landingState === 'landed'
+                              ? 'bg-sky-500/90 text-slate-950 border-sky-200 font-bold'
+                              : 'bg-emerald-500/90 text-slate-950 border-emerald-200 font-bold'
+                        }`}
+                        aria-label={
+                          landingState === 'landing'
+                            ? 'Cancelar pouso'
+                            : landingState === 'landed'
+                              ? 'Decolar'
+                              : 'Pousar'
+                        }
+                      >
+                        {landingState === 'landing' ? (
+                          <X className="w-3.5 h-3.5" />
+                        ) : landingState === 'landed' ? (
+                          <ArrowUpFromLine className="w-3.5 h-3.5" />
+                        ) : (
+                          <ArrowDownToLine className="w-3.5 h-3.5" />
+                        )}
+                        <span className="text-[10px] font-bold tracking-wide leading-none">
+                          {landingState === 'landing'
+                            ? 'CANCELAR'
+                            : landingState === 'landed'
+                              ? 'DECOLAR'
+                              : 'POUSAR'}
+                        </span>
+                      </button>
                     )}
-                    <span className="text-[10px] font-bold tracking-wide leading-none">
-                      {landingState === 'landing'
-                        ? 'CANCELAR'
-                        : landingState === 'landed'
-                          ? 'DECOLAR'
-                          : 'POUSAR'}
-                    </span>
-                  </button>
-                )}
 
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onToggleTargetLock();
-                  }}
-                  style={{ touchAction: 'none' }}
-                  className={`w-16 h-16 sm:w-18 sm:h-18 rounded-full border-2 flex flex-col items-center justify-center gap-0.5 transition-all active:scale-95 cursor-pointer ${
-                    targetLocked
-                      ? 'bg-amber-500 text-slate-950 border-amber-200 font-bold shadow-[0_0_16px_rgba(245,158,11,0.45)]'
-                      : 'bg-[#090c16]/85 text-amber-300 border-amber-400/50'
-                  }`}
-                  aria-label="Travar Alvo"
-                  aria-pressed={targetLocked}
-                >
-                  <LocateFixed className="w-5 h-5" />
-                  <span className="text-[10px] font-semibold leading-none text-center px-1">
-                    {targetLocked ? 'Travado' : 'Travar'}
-                  </span>
-                </button>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onToggleTargetLock();
+                      }}
+                      style={{ touchAction: 'none' }}
+                      className={`w-16 h-16 sm:w-18 sm:h-18 rounded-full border-2 flex flex-col items-center justify-center gap-0.5 transition-all active:scale-95 cursor-pointer ${
+                        targetLocked
+                          ? 'bg-amber-500 text-slate-950 border-amber-200 font-bold shadow-[0_0_16px_rgba(245,158,11,0.45)]'
+                          : 'bg-[#090c16]/85 text-amber-300 border-amber-400/50'
+                      }`}
+                      aria-label="Travar Alvo"
+                      aria-pressed={targetLocked}
+                    >
+                      <LocateFixed className="w-5 h-5" />
+                      <span className="text-[10px] font-semibold leading-none text-center px-1">
+                        {targetLocked ? 'Travado' : 'Travar'}
+                      </span>
+                    </button>
 
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                    setPedal('brakePressed', true);
-                  }}
-                  onPointerUp={(e) => {
-                    e.preventDefault();
-                    setPedal('brakePressed', false);
-                  }}
-                  onPointerCancel={() => setPedal('brakePressed', false)}
-                  style={{ touchAction: 'none' }}
-                  className={`w-14 h-12 sm:w-16 sm:h-14 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
-                    pedalsUi.brake
-                      ? 'bg-rose-500 text-white border-rose-300'
-                      : 'bg-[#090c16]/75 text-slate-200 border-white/15'
-                  }`}
-                  aria-label="Frear"
-                >
-                  <span className="text-[11px] font-semibold leading-none">
-                    Frear
-                  </span>
-                </button>
-              </div>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setPedal('brakePressed', true);
+                      }}
+                      onPointerUp={(e) => {
+                        e.preventDefault();
+                        setPedal('brakePressed', false);
+                      }}
+                      onPointerCancel={() => setPedal('brakePressed', false)}
+                      style={{ touchAction: 'none' }}
+                      className={`w-14 h-12 sm:w-16 sm:h-14 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
+                        pedalsUi.brake
+                          ? 'bg-rose-500 text-white border-rose-300'
+                          : 'bg-[#090c16]/75 text-slate-200 border-white/15'
+                      }`}
+                      aria-label="Frear"
+                    >
+                      <span className="text-[11px] font-semibold leading-none">
+                        Frear
+                      </span>
+                    </button>
+                  </div>
 
-              <div className="flex flex-col items-end gap-2.5">
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                    setPedal('boostPressed', true);
-                  }}
-                  onPointerUp={(e) => {
-                    e.preventDefault();
-                    setPedal('boostPressed', false);
-                  }}
-                  onPointerCancel={() => setPedal('boostPressed', false)}
-                  style={{ touchAction: 'none' }}
-                  className={`w-16 h-14 sm:w-18 sm:h-15 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
-                    pedalsUi.boost
-                      ? 'bg-amber-500 text-slate-950 border-amber-300'
-                      : 'bg-[#090c16]/80 text-amber-300 border-amber-400/35'
-                  }`}
-                  aria-label="Turbo"
-                >
-                  <Flame className="w-4 h-4" />
-                  <span className="text-[11px] font-semibold leading-none">
-                    Turbo
-                  </span>
-                </button>
+                  <div className="flex flex-col items-end gap-2.5">
+                    {showSettingsFallback && onOpenDock && (
+                      <button
+                        type="button"
+                        onClick={onOpenDock}
+                        className="w-10 h-10 rounded-xl bg-[#090c16]/80 border border-white/15 text-slate-200 hover:bg-slate-800/90 flex items-center justify-center transition-colors cursor-pointer"
+                        aria-label="Abrir ajustes"
+                        title="Ajustes (H)"
+                      >
+                        <Settings className="w-4 h-4" />
+                      </button>
+                    )}
 
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.currentTarget.setPointerCapture(e.pointerId);
-                    setPedal('thrustPressed', true);
-                  }}
-                  onPointerUp={(e) => {
-                    e.preventDefault();
-                    setPedal('thrustPressed', false);
-                  }}
-                  onPointerCancel={() => setPedal('thrustPressed', false)}
-                  style={{ touchAction: 'none' }}
-                  className={`w-20 h-20 sm:w-22 sm:h-22 rounded-full border-2 flex flex-col items-center justify-center gap-1 transition-transform active:scale-95 cursor-pointer ${
-                    pedalsUi.thrust
-                      ? 'bg-sky-400 text-slate-950 border-sky-200'
-                      : 'bg-[#090c16]/85 text-sky-300 border-sky-400/45'
-                  }`}
-                  aria-label="Acelerar"
-                >
-                  <Gauge className="w-5 h-5" />
-                  <span className="text-xs font-semibold leading-none">
-                    Acelerar
-                  </span>
-                </button>
-              </div>
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setPedal('boostPressed', true);
+                      }}
+                      onPointerUp={(e) => {
+                        e.preventDefault();
+                        setPedal('boostPressed', false);
+                      }}
+                      onPointerCancel={() => setPedal('boostPressed', false)}
+                      style={{ touchAction: 'none' }}
+                      className={`w-16 h-14 sm:w-18 sm:h-15 rounded-2xl border flex flex-col items-center justify-center gap-0.5 transition-transform active:scale-95 cursor-pointer ${
+                        pedalsUi.boost
+                          ? 'bg-amber-500 text-slate-950 border-amber-300'
+                          : 'bg-[#090c16]/80 text-amber-300 border-amber-400/35'
+                      }`}
+                      aria-label="Turbo"
+                    >
+                      <Flame className="w-4 h-4" />
+                      <span className="text-[11px] font-semibold leading-none">
+                        Turbo
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setPedal('thrustPressed', true);
+                      }}
+                      onPointerUp={(e) => {
+                        e.preventDefault();
+                        setPedal('thrustPressed', false);
+                      }}
+                      onPointerCancel={() => setPedal('thrustPressed', false)}
+                      style={{ touchAction: 'none' }}
+                      className={`w-20 h-20 sm:w-22 sm:h-22 rounded-full border-2 flex flex-col items-center justify-center gap-1 transition-transform active:scale-95 cursor-pointer ${
+                        pedalsUi.thrust
+                          ? 'bg-sky-400 text-slate-950 border-sky-200'
+                          : 'bg-[#090c16]/85 text-sky-300 border-sky-400/45'
+                      }`}
+                      aria-label="Acelerar"
+                    >
+                      <Gauge className="w-5 h-5" />
+                      <span className="text-xs font-semibold leading-none">
+                        Acelerar
+                      </span>
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         )}

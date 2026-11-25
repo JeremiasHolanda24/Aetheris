@@ -354,9 +354,9 @@ export class WeaponsSystem {
 
     _boltStart
       .copy(params.shipPos)
-      .addScaledVector(_shipRight, wingSide * 1.9)
-      .addScaledVector(_shipUp, 0.05)
-      .addScaledVector(_shipForward, 1.4);
+      .addScaledVector(_shipRight, wingSide * 2.65)
+      .addScaledVector(_shipUp, -0.15)
+      .addScaledVector(_shipForward, -0.22);
 
     _boltVel.subVectors(_aimPoint, _boltStart).normalize();
     const speed = 290 + params.shipVelocityLen;

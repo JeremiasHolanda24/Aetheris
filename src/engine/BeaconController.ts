@@ -158,11 +158,8 @@ export class BeaconController {
   public update(
     elapsed: number,
     dt: number,
-    planetManager: PlanetTerrainManager,
+    _planetManager?: PlanetTerrainManager,
   ): void {
-    if (this.targetZone === 'moon') {
-      this.syncMoonBeaconPosition(planetManager);
-    }
     this.model.update(elapsed, dt);
   }
 

@@ -5,6 +5,7 @@ import { OffScreenHud, OffScreenHudHandle } from './components/OffScreenHud';
 import { FlightEngine, VirtualInputs } from './engine/FlightEngine';
 import {
   CameraMode,
+  CharacterCameraMode,
   DEFAULT_CONFIG,
   SimulationConfig,
   TelemetrySnapshot,
@@ -35,8 +36,20 @@ const INITIAL_TELEMETRY: TelemetrySnapshot = {
   reentryIntensity: 0,
   isThrusting: false,
   isBoosting: false,
+  turboCharge: 1,
+  turboExhausted: false,
+  playerMode: 'ship',
+  characterCamera: 'third',
+  jetpackEnabled: false,
+  dampenersEnabled: true,
   qualityLevel: 0,
+  fps: 60,
   floraInstances: 0,
+  floraGroups: 0,
+  renderCalls: 0,
+  terrainDraws: 0,
+  floraDraws: 0,
+  otherDraws: 0,
   landingState: 'flying',
   canLand: false,
   landHint: '',
@@ -69,12 +82,11 @@ function isFiniteNum(value: unknown): value is number {
 }
 
 function isCameraMode(value: unknown): value is CameraMode {
-  return (
-    value === 'chase' ||
-    value === 'tactical' ||
-    value === 'cockpit' ||
-    value === 'orbit'
-  );
+  return value === 'chase' || value === 'cockpit' || value === 'orbit';
+}
+
+function isCharacterCameraMode(value: unknown): value is CharacterCameraMode {
+  return value === 'third' || value === 'first';
 }
 
 function readStoredSettingsRaw(): Record<string, unknown> | null {
@@ -158,6 +170,10 @@ function createInitialConfig(isTouch: boolean): SimulationConfig {
 
     if (isCameraMode(rawConfig.cameraMode)) {
       base.cameraMode = rawConfig.cameraMode;
+    }
+
+    if (isCharacterCameraMode(rawConfig.characterCamera)) {
+      base.characterCamera = rawConfig.characterCamera;
     }
   }
 
@@ -259,6 +275,13 @@ export default function App() {
         }, 2400);
       },
       onContextLostChange: (lost) => setContextLost(lost),
+      onCharacterCameraChange: (mode) => {
+        setConfig((prev) =>
+          prev.characterCamera === mode
+            ? prev
+            : { ...prev, characterCamera: mode },
+        );
+      },
     });
 
     engine.setMuted(initialSettings.muted);
@@ -458,32 +481,24 @@ export default function App() {
     engineRef.current?.toggleLanding();
   }, []);
 
-  const isDraggingSlider = activeSliderId !== null;
+  const handleToggleCharacterCamera = useCallback(() => {
+    setConfig((prev) => ({
+      ...prev,
+      characterCamera: prev.characterCamera === 'third' ? 'first' : 'third',
+    }));
+  }, []);
 
-  let landingNoticeText = '';
-  let landingNoticeTone = 'text-slate-300 border-white/10';
-  if (telemetry.landingState === 'flying') {
-    if (telemetry.canLand) {
-      landingNoticeText = isTouchDevice ? 'Toque em POUSAR / DECOLAR' : '[L] Pousar';
-      landingNoticeTone = 'text-emerald-300 border-emerald-400/40';
-    } else if (telemetry.altitude < 80 && telemetry.landHint) {
-      landingNoticeText = telemetry.landHint;
-      landingNoticeTone = 'text-slate-300 border-white/10';
-    }
-  } else if (telemetry.landingState === 'landing') {
-    landingNoticeText = isTouchDevice
-      ? 'Pousando… Toque em POUSAR / DECOLAR'
-      : 'Pousando… [L] Cancelar';
-    landingNoticeTone = 'text-amber-300 border-amber-400/40';
-  } else if (telemetry.landingState === 'landed') {
-    landingNoticeText = isTouchDevice
-      ? 'Pousado · Toque em POUSAR / DECOLAR'
-      : 'Pousado · [L] Decolar';
-    landingNoticeTone = 'text-sky-300 border-sky-400/35';
-  } else if (telemetry.landingState === 'takeoff') {
-    landingNoticeText = 'Decolando…';
-    landingNoticeTone = 'text-sky-300 border-sky-400/35';
-  }
+  const handleToggleJetpack = useCallback(() => {
+    engineRef.current?.toggleJetpack();
+  }, []);
+
+  const handleToggleDampeners = useCallback(() => {
+    engineRef.current?.toggleDampeners();
+  }, []);
+
+  const isDraggingSlider = activeSliderId !== null;
+  const hideTopHud =
+    config.cameraMode === 'cockpit' && telemetry.playerMode === 'ship';
 
   return (
     <main className="relative w-screen h-[100dvh] overflow-hidden bg-[#05050d]">
@@ -522,42 +537,47 @@ export default function App() {
       >
         <MobileControls
           visible={isTouchDevice}
+          playerMode={telemetry.playerMode}
+          characterCamera={config.characterCamera}
+          jetpackEnabled={telemetry.jetpackEnabled}
+          dampenersEnabled={telemetry.dampenersEnabled}
           targetLocked={targetLocked}
           landingState={telemetry.landingState}
           canLand={telemetry.canLand}
           isPortraitMobile={isPortraitMobile && isTouchDevice}
           portraitDismissed={portraitDismissed}
+          showSettingsFallback={hideTopHud && !dockOpen}
+          onOpenDock={handleToggleDock}
           onDismissPortrait={handleDismissPortrait}
           onRequestLandscapeFullscreen={handleRequestLandscapeFullscreen}
           onToggleTargetLock={handleToggleTargetLock}
           onToggleLanding={handleToggleLanding}
+          onToggleCharacterCamera={handleToggleCharacterCamera}
+          onToggleJetpack={handleToggleJetpack}
+          onToggleDampeners={handleToggleDampeners}
           onVirtualInputChange={handleVirtualInput}
         />
       </div>
 
-      {!dockOpen && landingNoticeText && (
-        <div
-          className={`pointer-events-none fixed bottom-4 sm:bottom-6 left-1/2 -translate-x-1/2 z-20 px-3 py-1 bg-[#090c16]/85 border rounded-lg text-xs font-medium font-mono-tabular whitespace-nowrap transition-opacity duration-150 ${
-            isDraggingSlider ? 'opacity-15' : 'opacity-100'
-          } ${landingNoticeTone}`}
-        >
-          {landingNoticeText}
-        </div>
+      {!hideTopHud && (
+        <TelemetryHeader
+          telemetry={telemetry}
+          dockOpen={dockOpen}
+          isFullscreen={isFullscreen}
+          isTouchDevice={isTouchDevice}
+          targetLocked={targetLocked}
+          isMuted={isMuted}
+          dimmed={isDraggingSlider}
+          onToggleDock={handleToggleDock}
+          onToggleFullscreen={handleToggleFullscreen}
+          onToggleTargetLock={handleToggleTargetLock}
+          onToggleMute={handleToggleMute}
+          onToggleCharacterCamera={handleToggleCharacterCamera}
+          onToggleJetpack={handleToggleJetpack}
+          onToggleDampeners={handleToggleDampeners}
+          onToggleLanding={handleToggleLanding}
+        />
       )}
-
-      <TelemetryHeader
-        telemetry={telemetry}
-        dockOpen={dockOpen}
-        isFullscreen={isFullscreen}
-        isTouchDevice={isTouchDevice}
-        targetLocked={targetLocked}
-        isMuted={isMuted}
-        dimmed={isDraggingSlider}
-        onToggleDock={handleToggleDock}
-        onToggleFullscreen={handleToggleFullscreen}
-        onToggleTargetLock={handleToggleTargetLock}
-        onToggleMute={handleToggleMute}
-      />
 
       <ControlDock
         config={config}
@@ -565,7 +585,13 @@ export default function App() {
         activeSliderId={activeSliderId}
         autoQuality={autoQuality}
         qualityLevel={telemetry.qualityLevel}
+        fps={telemetry.fps}
         floraInstances={telemetry.floraInstances}
+        floraGroups={telemetry.floraGroups}
+        renderCalls={telemetry.renderCalls}
+        terrainDraws={telemetry.terrainDraws}
+        floraDraws={telemetry.floraDraws}
+        otherDraws={telemetry.otherDraws}
         onActiveSliderChange={setActiveSliderId}
         onToggleAutoQuality={handleToggleAutoQuality}
         onCloseDock={handleCloseDock}

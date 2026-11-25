@@ -64,6 +64,7 @@ export interface PhysicsStepResult {
   speed: number;
   atmoRatio: number;
   thrustPower: number;
+  isBoosting: boolean;
 }
 
 /**
@@ -80,6 +81,9 @@ export class FlightPhysics {
   public atmospherePct = 100;
   public inSpace = false;
   public reentryIntensity = 0;
+  public turboCharge = 1.0;
+  public turboExhausted = false;
+  private turboRechargeDelay = 0;
 
   private readonly scene: THREE.Scene;
   private readonly shipModel: ShipModelHandle;
@@ -96,6 +100,7 @@ export class FlightPhysics {
     speed: 0,
     atmoRatio: 1,
     thrustPower: 0,
+    isBoosting: false,
   };
 
   constructor(scene: THREE.Scene, shipModel: ShipModelHandle) {
@@ -105,7 +110,7 @@ export class FlightPhysics {
     this.scene.add(this.shipRoot);
 
     this.hoverShadowTex = createSoftShadowTexture();
-    this.hoverShadowGeo = new THREE.PlaneGeometry(5.5, 5.5);
+    this.hoverShadowGeo = new THREE.PlaneGeometry(8.5, 8.5);
     this.hoverShadowMat = new THREE.MeshBasicMaterial({
       map: this.hoverShadowTex,
       transparent: true,
@@ -126,7 +131,7 @@ export class FlightPhysics {
     outUp: THREE.Vector3,
   ): void {
     planetManager.findLandDirection(0, _radialUp);
-    const surfR = planetManager.getSurfaceRadiusAt(
+    const surfR = planetManager.getRenderedSupportRadiusAt(
       _radialUp.x,
       _radialUp.y,
       _radialUp.z,
@@ -158,20 +163,35 @@ export class FlightPhysics {
     this.bankRad = 0;
     this.pitchVisualRad = 0;
     this.reentryIntensity = 0;
+    this.turboCharge = 1.0;
+    this.turboExhausted = false;
+    this.turboRechargeDelay = 0;
 
     this.landing.forceLanded(_radialUp, planetManager);
     this.shipModel.setGearExtension(this.landing.gearT);
-    this.shipModel.updateCockpit(0.1, 0, GEAR_REST_HEIGHT, false, false, 0, 0);
+    this.shipModel.updateCockpit(
+      0.1,
+      0,
+      GEAR_REST_HEIGHT,
+      false,
+      false,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    );
 
     outUp.copy(_surfNormal);
     outCamPos
       .copy(this.shipRoot.position)
-      .addScaledVector(_shipForward, -15.625)
-      .addScaledVector(_surfNormal, 4.8);
+      .addScaledVector(_shipForward, -20.0)
+      .addScaledVector(_surfNormal, 5.7);
     outLookAt
       .copy(this.shipRoot.position)
-      .addScaledVector(_shipForward, 4)
-      .addScaledVector(_surfNormal, 0.6);
+      .addScaledVector(_shipForward, 5)
+      .addScaledVector(_surfNormal, 0.7);
   }
 
   public launchToOrbit(
@@ -197,6 +217,9 @@ export class FlightPhysics {
     this.bankRad = 0;
     this.pitchVisualRad = 0;
     this.reentryIntensity = 0;
+    this.turboCharge = 1.0;
+    this.turboExhausted = false;
+    this.turboRechargeDelay = 0;
 
     this.landing.forceFlying();
     this.shipModel.setGearExtension(0);
@@ -208,14 +231,18 @@ export class FlightPhysics {
       false,
       0,
       0,
+      0,
+      0,
+      0,
+      0,
     );
 
     _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
     outUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
     outCamPos
       .copy(this.shipRoot.position)
-      .addScaledVector(_shipForward, -12.5)
-      .addScaledVector(outUp, 3.4);
+      .addScaledVector(_shipForward, -16.0)
+      .addScaledVector(outUp, 4.2);
     outLookAt.copy(this.shipRoot.position).addScaledVector(_shipForward, 135);
   }
 
@@ -255,7 +282,30 @@ export class FlightPhysics {
     const turnInput = inputs.turn;
     const pitchInput = inputs.pitch;
     const thrustInput = inputs.thrust;
-    const boostMult = inputs.isBoosting && thrustInput > 0 ? 1.85 : 1.0;
+
+    const wantsBoost =
+      inputs.isBoosting && thrustInput > 0.05 && !this.landing.isControlling;
+    let effectiveBoosting = false;
+    if (wantsBoost && !this.turboExhausted && this.turboCharge > 0.001) {
+      effectiveBoosting = true;
+      this.turboCharge = Math.max(0, this.turboCharge - 0.26 * dt);
+      this.turboRechargeDelay = 0.55;
+      if (this.turboCharge <= 0.001) {
+        this.turboCharge = 0;
+        this.turboExhausted = true;
+      }
+    } else {
+      if (this.turboRechargeDelay > 0) {
+        this.turboRechargeDelay = Math.max(0, this.turboRechargeDelay - dt);
+      } else {
+        this.turboCharge = Math.min(1, this.turboCharge + 0.18 * dt);
+      }
+      if (this.turboExhausted && this.turboCharge >= 0.22) {
+        this.turboExhausted = false;
+      }
+    }
+
+    const boostMult = effectiveBoosting ? 1.85 : 1.0;
 
     // Radial normal & atmosphere ratio
     _radialUp.copy(this.shipRoot.position).normalize();
@@ -343,7 +393,7 @@ export class FlightPhysics {
       }
 
       const effectiveMax =
-        maxSpeed * vacuumMult * (inputs.isBoosting ? 1.45 : 1.0);
+        maxSpeed * vacuumMult * (effectiveBoosting ? 1.45 : 1.0);
       if (this.velocity.length() > effectiveMax) {
         this.velocity.setLength(effectiveMax);
       }
@@ -359,12 +409,12 @@ export class FlightPhysics {
       // Spherical Terrain Collision Floor
       _radialUp.copy(this.shipRoot.position).normalize();
       const newDist = this.shipRoot.position.length();
-      const newSurfR = planetManager.getSurfaceRadiusAt(
+      const newSurfR = planetManager.getRenderedSurfaceRadiusAt(
         _radialUp.x,
         _radialUp.y,
         _radialUp.z,
       );
-      const minFlightR = newSurfR + 3.2;
+      const minFlightR = newSurfR + 3.8;
       if (newDist < minFlightR) {
         this.shipRoot.position.copy(_radialUp).multiplyScalar(minFlightR);
         const inward = this.velocity.dot(_radialUp);
@@ -378,7 +428,7 @@ export class FlightPhysics {
         planetManager.getMoonState();
       _moonToShip.subVectors(this.shipRoot.position, moonCenter);
       const moonDist = _moonToShip.length();
-      const minMoonR = moonRadius + 3.2;
+      const minMoonR = moonRadius + 3.8;
       if (moonDist < minMoonR) {
         if (moonDist > 0.0001) {
           _moonToShip.divideScalar(moonDist);
@@ -440,7 +490,7 @@ export class FlightPhysics {
     }
 
     _radialUp.copy(this.shipRoot.position).normalize();
-    const curSurfR = planetManager.getSurfaceRadiusAt(
+    const curSurfR = planetManager.getRenderedSurfaceRadiusAt(
       _radialUp.x,
       _radialUp.y,
       _radialUp.z,
@@ -536,7 +586,7 @@ export class FlightPhysics {
       thrustPower =
         thrustInput > 0.05
           ? THREE.MathUtils.clamp(
-              (0.55 + thrustInput * 0.45) * (inputs.isBoosting ? 1.45 : 1),
+              (0.55 + thrustInput * 0.45) * (effectiveBoosting ? 1.45 : 1),
               0,
               1.5,
             )
@@ -559,7 +609,7 @@ export class FlightPhysics {
       this.shipModel.flameMaterial.opacity = thrustInput > 0.05 ? 0.94 : 0.38;
       if (this.shipModel.thrusterLight) {
         this.shipModel.thrusterLight.color.setHex(
-          inputs.isBoosting ? 0xf59e0b : 0x38bdf8,
+          effectiveBoosting ? 0xf59e0b : 0x38bdf8,
         );
         this.shipModel.thrusterLight.intensity =
           thrustInput > 0.05 ? 3.5 * boostMult : 0.95;
@@ -593,22 +643,47 @@ export class FlightPhysics {
     this.shipModel.updateEffects(
       elapsed,
       thrustPower,
-      landingControlled ? false : inputs.isBoosting,
+      effectiveBoosting,
       this.reentryIntensity,
     );
+
+    _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
+    _shipRight.set(1, 0, 0).applyQuaternion(this.shipQuat);
+    const cockpitPitchRad = Math.asin(
+      THREE.MathUtils.clamp(_shipForward.dot(_radialUp), -1, 1),
+    );
+    const cockpitRollRad = Math.asin(
+      THREE.MathUtils.clamp(-_shipRight.dot(_radialUp), -1, 1),
+    );
+    const cockpitHeadingDeg =
+      ((THREE.MathUtils.radToDeg(Math.atan2(_shipForward.x, -_shipForward.z)) %
+        360) +
+        360) %
+      360;
+    _toTarget.subVectors(beaconPos, this.shipRoot.position);
+    const targetBearingDeg =
+      ((THREE.MathUtils.radToDeg(Math.atan2(_toTarget.x, -_toTarget.z)) % 360) +
+        360) %
+      360;
+
     this.shipModel.updateCockpit(
       dt,
       speed,
       this.shipAltitude,
       this.inSpace,
-      landingControlled ? false : inputs.isBoosting,
+      effectiveBoosting,
       landingControlled ? 0 : turnInput,
       landingControlled ? 0 : pitchInput,
+      cockpitPitchRad,
+      cockpitRollRad,
+      cockpitHeadingDeg,
+      targetBearingDeg,
     );
 
     this.stepOut.speed = speed;
     this.stepOut.atmoRatio = atmoRatio;
     this.stepOut.thrustPower = thrustPower;
+    this.stepOut.isBoosting = effectiveBoosting;
     return this.stepOut;
   }
 

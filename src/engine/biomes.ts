@@ -128,10 +128,12 @@ export function getBiomeColor(
   rawHeightNorm: number,
   seaLevel: number,
   out: THREE.Color,
+  outSample?: BiomeSample,
 ): THREE.Color {
-  sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, _biomeSample);
-  const temperature = _biomeSample.T;
-  const moisture = _biomeSample.M;
+  const sample = outSample ?? _biomeSample;
+  sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, sample);
+  const temperature = sample.T;
+  const moisture = sample.M;
 
   if (rawHeightNorm <= seaLevel) {
     const depthNorm = THREE.MathUtils.clamp(
@@ -206,4 +208,23 @@ export function getBiomeName(
 ): string {
   sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, _biomeSample);
   return BIOME_NAMES[_biomeSample.biome];
+}
+
+/**
+ * Continuous [0, 1] procedural grass coverage mask from temperature T, moisture M,
+ * normalized height, and seaLevel.
+ */
+export function getGrassCoverage(
+  T: number,
+  M: number,
+  rawHeightNorm: number,
+  seaLevel: number,
+): number {
+  const landMask = smoothstep(seaLevel + 0.04, seaLevel + 0.12, rawHeightNorm);
+  return (
+    landMask *
+    smoothstep(0.3, 0.55, M) *
+    smoothstep(0.12, 0.3, T) *
+    (1 - smoothstep(0.45, 0.7, rawHeightNorm))
+  );
 }
