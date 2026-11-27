@@ -36,6 +36,7 @@ const COLOR_POLAR_SEA_ICE = new THREE.Color(0xdbeafe);
 const _coldRow = new THREE.Color();
 const _hotRow = new THREE.Color();
 const _landColor = new THREE.Color();
+const _oceanColor = new THREE.Color();
 const _biomeSample: BiomeSample = { biome: 'ocean', T: 0.5, M: 0.5 };
 
 const BIOME_NAMES: Record<BiomeId, string> = {
@@ -119,6 +120,8 @@ export function sampleBiome(
 
 /**
  * Pure, zero-allocation biome color lookup for a unit sphere direction (nx, ny, nz).
+ * Uses generous smoothstep transitions across coastline, climate biomes, rock, and snow/ice
+ * with zero hard step cuts.
  * `rawHeightNorm` is unclipped `h / maxHeight` in [-1, 1].
  */
 export function getBiomeColor(
@@ -129,66 +132,68 @@ export function getBiomeColor(
   seaLevel: number,
   out: THREE.Color,
   outSample?: BiomeSample,
+  includeSnowAndIce = true,
 ): THREE.Color {
   const sample = outSample ?? _biomeSample;
   sampleBiome(nx, ny, nz, rawHeightNorm, seaLevel, sample);
   const temperature = sample.T;
   const moisture = sample.M;
 
-  if (rawHeightNorm <= seaLevel) {
-    const depthNorm = THREE.MathUtils.clamp(
-      (seaLevel - rawHeightNorm) / 0.5,
-      0,
-      1,
-    );
-    out.lerpColors(COLOR_OCEAN_SHALLOW, COLOR_OCEAN_DEEP, depthNorm);
+  // Continuous ocean gradient + smooth polar sea ice blend
+  const depthNorm = smoothstep(seaLevel + 0.03, seaLevel - 0.52, rawHeightNorm);
+  _oceanColor.lerpColors(COLOR_OCEAN_SHALLOW, COLOR_OCEAN_DEEP, depthNorm);
+  const polarIceT = smoothstep(0.26, 0.03, temperature);
+  if (includeSnowAndIce && polarIceT > 0) {
+    _oceanColor.lerp(COLOR_POLAR_SEA_ICE, polarIceT);
+  }
 
-    if (temperature < 0.15) {
-      const seaIceT = smoothstep(0.15, 0.04, temperature);
-      out.lerp(COLOR_POLAR_SEA_ICE, seaIceT);
-    }
-  } else {
-    // Bilinear climate blend in (temperature, moisture)
-    _coldRow.lerpColors(COLOR_TUNDRA, COLOR_TAIGA, moisture);
-    _hotRow.lerpColors(COLOR_DESERT, COLOR_JUNGLE, moisture);
-    _landColor.lerpColors(_coldRow, _hotRow, temperature);
+  // Continuous bilinear climate blend in (temperature, moisture)
+  _coldRow.lerpColors(COLOR_TUNDRA, COLOR_TAIGA, moisture);
+  _hotRow.lerpColors(COLOR_DESERT, COLOR_JUNGLE, moisture);
+  _landColor.lerpColors(_coldRow, _hotRow, temperature);
 
-    // Mid-climate pull toward temperate grassland (T and M between 0.35 and 0.65)
-    const tCenter =
-      smoothstep(0.32, 0.45, temperature) *
-      (1 - smoothstep(0.55, 0.68, temperature));
-    const mCenter =
-      smoothstep(0.32, 0.45, moisture) *
-      (1 - smoothstep(0.55, 0.68, moisture));
-    const grassWeight = tCenter * mCenter;
-    if (grassWeight > 0) {
-      _landColor.lerp(COLOR_GRASSLAND, grassWeight * 0.9);
-    }
+  // Wide temperate grassland pull
+  const tCenter =
+    smoothstep(0.24, 0.44, temperature) *
+    (1 - smoothstep(0.56, 0.76, temperature));
+  const mCenter =
+    smoothstep(0.24, 0.44, moisture) *
+    (1 - smoothstep(0.56, 0.76, moisture));
+  const grassWeight = tCenter * mCenter;
+  if (grassWeight > 0) {
+    _landColor.lerp(COLOR_GRASSLAND, grassWeight * 0.9);
+  }
 
-    // Coastal beach band between seaLevel and seaLevel + 0.05
-    const beachFactor =
-      1 - smoothstep(seaLevel + 0.01, seaLevel + 0.05, rawHeightNorm);
-    out.copy(_landColor).lerp(COLOR_BEACH, beachFactor);
+  // Generous coastal beach blend (no abrupt cutoff at seaLevel)
+  const beachFactor =
+    1 - smoothstep(seaLevel - 0.025, seaLevel + 0.14, rawHeightNorm);
+  if (beachFactor > 0) {
+    _landColor.lerp(COLOR_BEACH, beachFactor);
+  }
 
-    // High-altitude rocky mountains
-    const rockT = smoothstep(0.45, 0.7, rawHeightNorm);
-    if (rockT > 0) {
-      out.lerp(COLOR_ROCK, rockT);
-    }
+  // High-altitude rocky mountains
+  const rockT = smoothstep(0.36, 0.72, rawHeightNorm);
+  if (rockT > 0) {
+    _landColor.lerp(COLOR_ROCK, rockT);
+  }
 
-    // Elevation snow line (lower snow line in colder climates)
-    const snowLine = THREE.MathUtils.lerp(0.55, 0.95, temperature);
-    const snowT = smoothstep(snowLine - 0.06, snowLine + 0.06, rawHeightNorm);
+  if (includeSnowAndIce) {
+    // Generous elevation snow line (lower in colder climates)
+    const snowLine = THREE.MathUtils.lerp(0.48, 0.90, temperature);
+    const snowT = smoothstep(snowLine - 0.16, snowLine + 0.18, rawHeightNorm);
     if (snowT > 0) {
-      out.lerp(COLOR_SNOW, snowT);
+      _landColor.lerp(COLOR_SNOW, snowT);
     }
 
-    // Polar ice cap
-    if (temperature < 0.15) {
-      const polarIceT = smoothstep(0.15, 0.04, temperature);
-      out.lerp(COLOR_POLAR_ICE, polarIceT);
+    // Smooth polar ice cap
+    if (polarIceT > 0) {
+      _landColor.lerp(COLOR_POLAR_ICE, polarIceT);
     }
   }
+
+  // Smooth coastline blend between ocean and land
+  const coastT = smoothstep(seaLevel - 0.035, seaLevel + 0.035, rawHeightNorm);
+  out.lerpColors(_oceanColor, _landColor, coastT);
 
   // Fine-scale internal micro-variation so surfaces never look flat
   const micro = 1 + simplex3(nx * 40, ny * 40, nz * 40) * 0.06;

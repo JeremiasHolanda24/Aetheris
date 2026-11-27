@@ -30,6 +30,15 @@ export interface TreeCollider {
   height: number;
 }
 
+export interface FloraHarvestQuery {
+  found: boolean;
+  groupId: number;
+  memberIdx: number;
+  species: 'shrub' | 'mushroom';
+  label: string;
+  distance: number;
+}
+
 interface SpeciesSpec {
   id: SpeciesId;
   category: FloraCategory;
@@ -195,6 +204,7 @@ interface GeneratedGroup {
   matrices: Float32Array;
   colors: Float32Array;
   variants: Uint8Array;
+  harvested: Uint8Array;
 }
 
 interface VisibleGroupEntry {
@@ -292,6 +302,8 @@ const _meshPt = new THREE.Vector3();
 const _camPos = new THREE.Vector3();
 const _camDir = new THREE.Vector3();
 const _camForward = new THREE.Vector3();
+const _velDir = new THREE.Vector3();
+const _trajDir = new THREE.Vector3();
 const _toGroup = new THREE.Vector3();
 const _instPos = new THREE.Vector3();
 const _instUp = new THREE.Vector3();
@@ -761,6 +773,46 @@ function buildSpeciesGeometry(species: SpeciesId, variantIdx: number): THREE.Buf
   }
 }
 
+function buildSimpleTreeLodGeometry(
+  species: 'conifer' | 'broadleaf' | 'palm',
+): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  if (species === 'conifer') {
+    const trunk = new THREE.CylinderGeometry(0.26, 0.42, 3.6, 4);
+    trunk.translate(0, 1.4, 0);
+    parts.push(prepPartHex(trunk, 0x5b3a24, 0));
+
+    const crown = new THREE.ConeGeometry(2.55, 8.6, 5);
+    crown.translate(0, 6.8, 0);
+    parts.push(prepPart(crown, 0.94, 1.0, 0.94, 1));
+    return mergeParts(parts);
+  }
+
+  if (species === 'broadleaf') {
+    const trunk = new THREE.CylinderGeometry(0.28, 0.48, 4.6, 4);
+    trunk.translate(0, 2.0, 0);
+    parts.push(prepPartHex(trunk, 0x6a4429, 0));
+
+    const crown = new THREE.IcosahedronGeometry(2.75, 0);
+    crown.scale(1.12, 0.78, 1.12);
+    crown.translate(0, 6.2, 0);
+    parts.push(prepPart(crown, 0.94, 0.98, 0.92, 1));
+    return mergeParts(parts);
+  }
+
+  const trunk = new THREE.CylinderGeometry(0.24, 0.42, 8.4, 4);
+  trunk.rotateZ(0.1);
+  trunk.translate(0.35, 3.9, 0);
+  parts.push(prepPartHex(trunk, 0x7a5c3d, 0));
+
+  const crown = new THREE.ConeGeometry(2.8, 1.35, 5);
+  crown.translate(0.75, 8.2, 0);
+  parts.push(prepPart(crown, 0.94, 0.98, 0.9, 1));
+  return mergeParts(parts);
+}
+
+// All flora materials are 100% opaque (alphaTest = 0, no discard, no alpha blending)
+// so distant LODs never generate transparent pixel overdraw.
 function createFloraMaterial(options: {
   cacheKey: string;
   windAmplitude: number; // 0 for rocks, 0.04 for trees
@@ -771,6 +823,8 @@ function createFloraMaterial(options: {
   uSunDir: { value: THREE.Vector3 };
   uFadeStart: { value: number };
   uFadeEnd: { value: number };
+  uHorizonFogColor: { value: THREE.Color };
+  uHorizonFogParams: { value: THREE.Vector3 };
 }): THREE.MeshStandardMaterial {
   const mat = new THREE.MeshStandardMaterial({
     flatShading: true,
@@ -780,9 +834,10 @@ function createFloraMaterial(options: {
     side: options.doubleSide ? THREE.DoubleSide : THREE.FrontSide,
     emissive: options.glowing ? new THREE.Color(0xffffff) : new THREE.Color(0x000000),
     emissiveIntensity: options.glowing ? 1.0 : 0,
+    fog: false,
   });
 
-  mat.customProgramCacheKey = () => options.cacheKey;
+  mat.customProgramCacheKey = () => `${options.cacheKey}-hfog1`;
 
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTime = options.uTime;
@@ -790,6 +845,8 @@ function createFloraMaterial(options: {
     shader.uniforms.uSunDir = options.uSunDir;
     shader.uniforms.uFadeStart = options.uFadeStart;
     shader.uniforms.uFadeEnd = options.uFadeEnd;
+    shader.uniforms.uHorizonFogColor = options.uHorizonFogColor;
+    shader.uniforms.uHorizonFogParams = options.uHorizonFogParams;
 
     const extraVertDecl = [
       'attribute float aTint;',
@@ -798,6 +855,7 @@ function createFloraMaterial(options: {
       'uniform float uWind;',
       'uniform float uFadeStart;',
       'uniform float uFadeEnd;',
+      'varying mediump float vHorizonCamDist;',
       options.glowing ? 'uniform vec3 uSunDir;' : '',
       options.glowing ? 'varying vec3 vFloraGlow;' : '',
     ]
@@ -838,9 +896,12 @@ function createFloraMaterial(options: {
         `#include <begin_vertex>
         #ifdef USE_INSTANCING
           float fadeDist = distance(instanceMatrix[3].xyz, cameraPosition);
+          vHorizonCamDist = distance(cameraPosition, (instanceMatrix * vec4(transformed, 1.0)).xyz);
           float fadeScale = 1.0 - smoothstep(uFadeStart, uFadeEnd, fadeDist);
           ${windSnippet}
           transformed *= fadeScale;
+        #else
+          vHorizonCamDist = distance(cameraPosition, (modelMatrix * vec4(transformed, 1.0)).xyz);
         #endif`,
       )
       .replace(
@@ -864,18 +925,30 @@ function createFloraMaterial(options: {
       console.warn('Flora: tint shader não aplicado');
     }
 
+    const fragCommonExtra = [
+      'varying mediump float vHorizonCamDist;',
+      'uniform mediump vec3 uHorizonFogColor;',
+      'uniform mediump vec3 uHorizonFogParams;',
+      options.glowing ? 'varying vec3 vFloraGlow;' : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>\n${fragCommonExtra}`)
+      .replace(
+        '#include <fog_fragment>',
+        `#include <fog_fragment>
+        mediump float hFogFactor = smoothstep(uHorizonFogParams.x, uHorizonFogParams.y, vHorizonCamDist) * uHorizonFogParams.z;
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, uHorizonFogColor, hFogFactor);`,
+      );
+
     if (options.glowing) {
-      shader.fragmentShader = shader.fragmentShader
-        .replace(
-          '#include <common>',
-          `#include <common>
-          varying vec3 vFloraGlow;`,
-        )
-        .replace(
-          '#include <emissivemap_fragment>',
-          `#include <emissivemap_fragment>
-          totalEmissiveRadiance *= vFloraGlow;`,
-        );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+        totalEmissiveRadiance *= vFloraGlow;`,
+      );
     }
   };
 
@@ -912,23 +985,28 @@ export class FloraManager {
     SPECIES_LIST.length * VARIANTS_PER_SPECIES,
   );
 
-  // Separate non-shadow-casting LOD1 meshes for tree species [0..2 * 3 + variantIdx]
+  // Simplified merged opaque LOD1/LOD2 meshes per tree species [0..2]
   private readonly treeLod1Meshes: THREE.InstancedMesh[] = [];
   private readonly treeLod1Capacities: number[] = [];
-  private readonly treeLod1Counts = new Int32Array(3 * VARIANTS_PER_SPECIES);
+  private readonly treeLod1Counts = new Int32Array(3);
 
   private readonly allMeshes: THREE.InstancedMesh[] = [];
   private readonly geometries: THREE.BufferGeometry[] = [];
   private readonly meshHeights: number[] = [];
   private readonly speciesMaxHeights = new Float32Array(SPECIES_LIST.length);
 
-  // Cube-sphere cell grid & group registry (at most 1 group per cell)
+  // Cube-sphere cell grid & group registry (at most 1 group per cell, built incrementally under 2ms budget)
   private cachedPlanetSig = '';
   private cachedPlanetRadius = -1;
+  private cellGridN = 0;
   private cellCount = 0;
   private cellCenters = new Float32Array(0);
   private cellAngRadii = new Float32Array(0);
   private cellGroups: (FloraGroupRecord | null)[] = [];
+  private registryCellCursor = 0;
+  private registryReady = false;
+  private registryBuildMaxR = 24;
+  private registryDensitySqrt = 1;
   private maxGroupRadius = 24;
   private registryInvalidated = true;
 
@@ -939,11 +1017,22 @@ export class FloraManager {
   private readonly genQueue: FloraGroupRecord[] = [];
   private readonly queuedSet = new Set<number>();
 
-  // Landing clearing state
+  // Landing clearing state & plant harvesting
   private clearingActive = false;
   private readonly clearingPos = new THREE.Vector3();
   private clearingRadiusSq = 0;
   private clearingDirty = false;
+  private harvestVersion = 0;
+  private harvestDirty = false;
+
+  // Pending staggered GPU buffer uploads (avoids uploading 20+ InstancedMeshes in 1 frame)
+  private readonly primaryDirty = new Uint8Array(
+    SPECIES_LIST.length * VARIANTS_PER_SPECIES,
+  );
+  private readonly treeLod1Dirty = new Uint8Array(3);
+  private hasPendingUploads = false;
+  private readonly lastPrewarmDir = new THREE.Vector3(0, 1, 0);
+  private prewarmCompletedForSpot = false;
 
   // Visibility, stats & rebuild throttling
   private activeInstanceCount = 0;
@@ -958,13 +1047,78 @@ export class FloraManager {
   private readonly lastEvalCamForward = new THREE.Vector3(0, 0, -1);
   private lastUserDensity = -1;
   private lastFadeViewRatio = -1;
+  private lastHighAltMode = false;
+  private lastLowDetailMode = false;
+  private lastFadeSpeedFloor = 0;
+  private appliedTreeShadows: boolean;
+  private forceDisabled = false;
+  // Counts real flora work performed since last sample:
+  // +1 per uncached cell generated by generateGroupData(),
+  // +1 per InstancedMesh whose instanceMatrix/instanceColor buffers are uploaded with needsUpdate = true.
+  private builtCellCounter = 0;
+
+  public consumeBuiltCellCount(): number {
+    const count = this.builtCellCounter;
+    this.builtCellCounter = 0;
+    return count;
+  }
+
+  private readonly warmupSavedVisible: boolean[] = [];
+  private readonly warmupSavedCount: number[] = [];
+  private readonly warmupSavedCastShadow: boolean[] = [];
+  private readonly warmupDummyMat = new THREE.Matrix4();
+
+  public prepareForShaderWarmup(shadowsEnabled: boolean): void {
+    this.warmupSavedVisible.length = 0;
+    this.warmupSavedCount.length = 0;
+    this.warmupSavedCastShadow.length = 0;
+
+    for (let i = 0; i < this.allMeshes.length; i++) {
+      const mesh = this.allMeshes[i];
+      this.warmupSavedVisible.push(mesh.visible);
+      this.warmupSavedCount.push(mesh.count);
+      this.warmupSavedCastShadow.push(mesh.castShadow);
+
+      if (mesh.count === 0) {
+        mesh.setMatrixAt(0, this.warmupDummyMat);
+        mesh.setColorAt(0, _instColor.setHex(0xffffff));
+        mesh.instanceMatrix.needsUpdate = true;
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        mesh.count = 1;
+      }
+      mesh.visible = true;
+    }
+
+    for (let s = 0; s < 3; s++) {
+      for (let v = 0; v < VARIANTS_PER_SPECIES; v++) {
+        this.primaryMeshes[s * VARIANTS_PER_SPECIES + v].castShadow = shadowsEnabled;
+      }
+    }
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    for (let i = 0; i < this.allMeshes.length; i++) {
+      const mesh = this.allMeshes[i];
+      if (i < this.warmupSavedVisible.length) {
+        mesh.visible = this.warmupSavedVisible[i];
+        mesh.count = this.warmupSavedCount[i];
+        mesh.castShadow = this.warmupSavedCastShadow[i];
+      }
+    }
+  }
 
   constructor(
     scene: THREE.Scene,
-    options: { castShadows: boolean; isMobileOrSoftware: boolean },
+    options: {
+      castShadows: boolean;
+      isMobileOrSoftware: boolean;
+      horizonFogColor: { value: THREE.Color };
+      horizonFogParams: { value: THREE.Vector3 };
+    },
   ) {
     this.scene = scene;
     this.castShadows = options.castShadows;
+    this.appliedTreeShadows = options.castShadows;
     this.isMobileOrSoftware = options.isMobileOrSoftware;
 
     this.treeMat = createFloraMaterial({
@@ -975,6 +1129,8 @@ export class FloraManager {
       uSunDir: this.uSunDir,
       uFadeStart: this.uTreeFadeStart,
       uFadeEnd: this.uTreeFadeEnd,
+      uHorizonFogColor: options.horizonFogColor,
+      uHorizonFogParams: options.horizonFogParams,
     });
     this.smallPlantMat = createFloraMaterial({
       cacheKey: 'flora-small',
@@ -984,6 +1140,8 @@ export class FloraManager {
       uSunDir: this.uSunDir,
       uFadeStart: this.uSmallFadeStart,
       uFadeEnd: this.uSmallFadeEnd,
+      uHorizonFogColor: options.horizonFogColor,
+      uHorizonFogParams: options.horizonFogParams,
     });
     this.rockMat = createFloraMaterial({
       cacheKey: 'flora-rock',
@@ -993,6 +1151,8 @@ export class FloraManager {
       uSunDir: this.uSunDir,
       uFadeStart: this.uSmallFadeStart,
       uFadeEnd: this.uSmallFadeEnd,
+      uHorizonFogColor: options.horizonFogColor,
+      uHorizonFogParams: options.horizonFogParams,
     });
     this.mushroomMat = createFloraMaterial({
       cacheKey: 'flora-mushroom',
@@ -1003,6 +1163,8 @@ export class FloraManager {
       uSunDir: this.uSunDir,
       uFadeStart: this.uSmallFadeStart,
       uFadeEnd: this.uSmallFadeEnd,
+      uHorizonFogColor: options.horizonFogColor,
+      uHorizonFogParams: options.horizonFogParams,
     });
 
     for (let s = 0; s < SPECIES_LIST.length; s++) {
@@ -1037,6 +1199,7 @@ export class FloraManager {
         mesh.receiveShadow = false;
         mesh.count = 0;
         mesh.visible = false;
+        mesh.userData.perfTag = 'flora';
         mesh.setColorAt(0, _instColor.setHex(0xffffff));
 
         this.scene.add(mesh);
@@ -1045,21 +1208,27 @@ export class FloraManager {
         this.primaryCapacities.push(capacity);
         this.allMeshes.push(mesh);
         this.meshHeights.push(height);
+      }
 
-        if (spec.category === 'tree') {
-          const lod1Mesh = new THREE.InstancedMesh(geo, mat, capacity);
-          lod1Mesh.frustumCulled = false;
-          lod1Mesh.castShadow = false;
-          lod1Mesh.receiveShadow = false;
-          lod1Mesh.count = 0;
-          lod1Mesh.visible = false;
-          lod1Mesh.setColorAt(0, _instColor.setHex(0xffffff));
+      if (spec.category === 'tree') {
+        const lodGeo = buildSimpleTreeLodGeometry(
+          spec.id as 'conifer' | 'broadleaf' | 'palm',
+        );
+        const lodCapacity = this.isMobileOrSoftware ? 3500 : 8000;
+        const lod1Mesh = new THREE.InstancedMesh(lodGeo, mat, lodCapacity);
+        lod1Mesh.frustumCulled = false;
+        lod1Mesh.castShadow = false;
+        lod1Mesh.receiveShadow = false;
+        lod1Mesh.count = 0;
+        lod1Mesh.visible = false;
+        lod1Mesh.userData.perfTag = 'flora';
+        lod1Mesh.setColorAt(0, _instColor.setHex(0xffffff));
 
-          this.scene.add(lod1Mesh);
-          this.treeLod1Meshes.push(lod1Mesh);
-          this.treeLod1Capacities.push(capacity);
-          this.allMeshes.push(lod1Mesh);
-        }
+        this.scene.add(lod1Mesh);
+        this.geometries.push(lodGeo);
+        this.treeLod1Meshes.push(lod1Mesh);
+        this.treeLod1Capacities.push(lodCapacity);
+        this.allMeshes.push(lod1Mesh);
       }
       this.speciesMaxHeights[s] = spMaxH * 1.25;
     }
@@ -1070,6 +1239,15 @@ export class FloraManager {
   }
 
   public getStats(): FloraStats {
+    if (this.forceDisabled) {
+      return {
+        groupsActive: 0,
+        groupsLod0: 0,
+        groupsLod1: 0,
+        instancesDrawn: 0,
+        activeMeshes: 0,
+      };
+    }
     return {
       groupsActive: this.statsGroupsActive,
       groupsLod0: this.statsGroupsLod0,
@@ -1095,11 +1273,30 @@ export class FloraManager {
   }
 
   public setCastShadows(enabled: boolean): void {
-    if (this.castShadows === enabled) return;
     this.castShadows = enabled;
+    this.syncTreeCastShadows(enabled && !this.lastHighAltMode);
+  }
+
+  private syncTreeCastShadows(enabled: boolean): void {
+    if (this.appliedTreeShadows === enabled) return;
+    this.appliedTreeShadows = enabled;
     for (let s = 0; s < 3; s++) {
       for (let v = 0; v < VARIANTS_PER_SPECIES; v++) {
         this.primaryMeshes[s * VARIANTS_PER_SPECIES + v].castShadow = enabled;
+      }
+    }
+  }
+
+  public setForceDisabled(disabled: boolean): void {
+    if (this.forceDisabled === disabled) return;
+    this.forceDisabled = disabled;
+    if (disabled) {
+      for (let i = 0; i < this.allMeshes.length; i++) {
+        this.allMeshes[i].visible = false;
+      }
+    } else if (this.wasVisible) {
+      for (let i = 0; i < this.allMeshes.length; i++) {
+        this.allMeshes[i].visible = this.allMeshes[i].count > 0;
       }
     }
   }
@@ -1111,8 +1308,11 @@ export class FloraManager {
     this.visibleGroups.length = 0;
     this.activeCellList.length = 0;
     this.registryInvalidated = true;
+    this.registryReady = false;
+    this.registryCellCursor = 0;
     this.lastFillSignature = 0;
     this.timeSinceFill = 99;
+    this.prewarmCompletedForSpot = false;
     this.hideAllMeshes();
   }
 
@@ -1121,6 +1321,9 @@ export class FloraManager {
       this.allMeshes[i].count = 0;
       this.allMeshes[i].visible = false;
     }
+    this.primaryDirty.fill(0);
+    this.treeLod1Dirty.fill(0);
+    this.hasPendingUploads = false;
     this.activeInstanceCount = 0;
     this.activeMeshCount = 0;
     this.statsGroupsActive = 0;
@@ -1129,254 +1332,275 @@ export class FloraManager {
     this.wasVisible = false;
   }
 
-  private ensureGroupRegistry(
+  private stepGroupRegistry(
     planetManager: PlanetTerrainManager,
     planet: PlanetParams,
     userDensityFactor: number,
-  ): void {
+    budgetStartMs: number,
+  ): boolean {
     const sig = `${planet.planetRadius}|${planet.noiseScale}|${planet.maxHeight}|${planet.seaLevel}`;
-    if (!this.registryInvalidated && sig === this.cachedPlanetSig) {
-      return;
+    if (this.registryInvalidated || sig !== this.cachedPlanetSig) {
+      this.cachedPlanetSig = sig;
+      this.cachedPlanetRadius = planet.planetRadius;
+      this.registryInvalidated = false;
+
+      const n = Math.max(8, Math.round((planet.planetRadius * (Math.PI * 0.5)) / 32));
+      this.cellGridN = n;
+      this.cellCount = 6 * n * n;
+      this.cellCenters = new Float32Array(this.cellCount * 3);
+      this.cellAngRadii = new Float32Array(this.cellCount);
+      this.cellGroups = new Array<FloraGroupRecord | null>(this.cellCount).fill(null);
+      this.registryCellCursor = 0;
+      this.registryReady = false;
+      this.registryBuildMaxR = 24;
+      this.registryDensitySqrt = Math.sqrt(Math.max(0.05, userDensityFactor));
+      this.lastUserDensity = userDensityFactor;
+      this.groupCache.clear();
+      this.genQueue.length = 0;
+      this.queuedSet.clear();
+      this.visibleGroups.length = 0;
+      this.lastFillSignature = 0;
     }
-    this.cachedPlanetSig = sig;
-    this.cachedPlanetRadius = planet.planetRadius;
-    this.registryInvalidated = false;
 
-    const n = Math.max(8, Math.round((planet.planetRadius * (Math.PI * 0.5)) / 32));
-    this.cellCount = 6 * n * n;
-    this.cellCenters = new Float32Array(this.cellCount * 3);
-    this.cellAngRadii = new Float32Array(this.cellCount);
-    this.cellGroups = new Array<FloraGroupRecord | null>(this.cellCount).fill(null);
+    if (this.registryReady) {
+      return false;
+    }
 
+    const n = this.cellGridN;
+    const perFace = n * n;
     const step = 2 / n;
     const safeMaxH = Math.max(planet.maxHeight, 0.001);
-    const densitySqrt = Math.sqrt(Math.max(0.05, userDensityFactor));
-    let maxR = 24;
-    let cellIdx = 0;
+    const densitySqrt = this.registryDensitySqrt;
+    let processed = 0;
 
-    for (let f = 0; f < CUBE_FACES.length; f++) {
+    while (this.registryCellCursor < this.cellCount) {
+      const cellIdx = this.registryCellCursor;
+      const f = Math.floor(cellIdx / perFace);
+      const rem = cellIdx - f * perFace;
+      const j = Math.floor(rem / n);
+      const i = rem - j * n;
       const face = CUBE_FACES[f];
-      for (let j = 0; j < n; j++) {
-        const v0 = -1 + j * step;
-        const v1 = v0 + step;
-        const vMid = v0 + step * 0.5;
-        for (let i = 0; i < n; i++) {
-          const u0 = -1 + i * step;
-          const u1 = u0 + step;
-          const uMid = u0 + step * 0.5;
 
-          const c = spherifyCubePoint(
-            face.normal[0] + uMid * face.uAxis[0] + vMid * face.vAxis[0],
-            face.normal[1] + uMid * face.uAxis[1] + vMid * face.vAxis[1],
-            face.normal[2] + uMid * face.uAxis[2] + vMid * face.vAxis[2],
+      const v0 = -1 + j * step;
+      const v1 = v0 + step;
+      const vMid = v0 + step * 0.5;
+      const u0 = -1 + i * step;
+      const u1 = u0 + step;
+      const uMid = u0 + step * 0.5;
+
+      const c = spherifyCubePoint(
+        face.normal[0] + uMid * face.uAxis[0] + vMid * face.vAxis[0],
+        face.normal[1] + uMid * face.uAxis[1] + vMid * face.vAxis[1],
+        face.normal[2] + uMid * face.uAxis[2] + vMid * face.vAxis[2],
+      );
+      const cLen = Math.hypot(c.nx, c.ny, c.nz) || 1;
+      const cx = c.nx / cLen;
+      const cy = c.ny / cLen;
+      const cz = c.nz / cLen;
+
+      this.cellCenters[cellIdx * 3] = cx;
+      this.cellCenters[cellIdx * 3 + 1] = cy;
+      this.cellCenters[cellIdx * 3 + 2] = cz;
+
+      let maxAng = 0;
+      for (let cv = 0; cv < 2; cv++) {
+        const vc = cv === 0 ? v0 : v1;
+        for (let cu = 0; cu < 2; cu++) {
+          const uc = cu === 0 ? u0 : u1;
+          const p = spherifyCubePoint(
+            face.normal[0] + uc * face.uAxis[0] + vc * face.vAxis[0],
+            face.normal[1] + uc * face.uAxis[1] + vc * face.vAxis[1],
+            face.normal[2] + uc * face.uAxis[2] + vc * face.vAxis[2],
           );
-          const cLen = Math.hypot(c.nx, c.ny, c.nz) || 1;
-          const cx = c.nx / cLen;
-          const cy = c.ny / cLen;
-          const cz = c.nz / cLen;
+          const dot = THREE.MathUtils.clamp(
+            cx * p.nx + cy * p.ny + cz * p.nz,
+            -1,
+            1,
+          );
+          const ang = Math.acos(dot);
+          if (ang > maxAng) maxAng = ang;
+        }
+      }
+      this.cellAngRadii[cellIdx] = maxAng;
 
-          this.cellCenters[cellIdx * 3] = cx;
-          this.cellCenters[cellIdx * 3 + 1] = cy;
-          this.cellCenters[cellIdx * 3 + 2] = cz;
+      const seed = hashCell(f, i, j, SEED_FIXA);
+      const rng = mulberry32(seed ^ 0x13579bdf);
+      const u = u0 + rng() * step;
+      const v = v0 + rng() * step;
 
-          let maxAng = 0;
-          for (let cv = 0; cv < 2; cv++) {
-            const vc = cv === 0 ? v0 : v1;
-            for (let cu = 0; cu < 2; cu++) {
-              const uc = cu === 0 ? u0 : u1;
-              const p = spherifyCubePoint(
-                face.normal[0] + uc * face.uAxis[0] + vc * face.vAxis[0],
-                face.normal[1] + uc * face.uAxis[1] + vc * face.vAxis[1],
-                face.normal[2] + uc * face.uAxis[2] + vc * face.vAxis[2],
-              );
-              const dot = THREE.MathUtils.clamp(
-                cx * p.nx + cy * p.ny + cz * p.nz,
-                -1,
-                1,
-              );
-              const ang = Math.acos(dot);
-              if (ang > maxAng) maxAng = ang;
+      const gp = spherifyCubePoint(
+        face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
+        face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
+        face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
+      );
+      _candDir.set(gp.nx, gp.ny, gp.nz).normalize();
+
+      const rawH = getPlanetTerrainHeight(
+        _candDir.x,
+        _candDir.y,
+        _candDir.z,
+        planet.planetRadius,
+        planet.noiseScale,
+        planet.maxHeight,
+      );
+      const rawNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
+      sampleBiome(
+        _candDir.x,
+        _candDir.y,
+        _candDir.z,
+        rawNorm,
+        planet.seaLevel,
+        _biomeSample,
+      );
+
+      const biome = _biomeSample.biome;
+      const profile = BIOME_FLORA_TABLE[biome];
+
+      if (
+        biome !== 'ocean' &&
+        biome !== 'ice' &&
+        profile.density > 0 &&
+        profile.entries.length > 0
+      ) {
+        const patchNoise = simplex3(
+          _candDir.x * 5 + 17,
+          _candDir.y * 5,
+          _candDir.z * 5,
+        );
+        const patchMask = THREE.MathUtils.lerp(
+          0.15,
+          1,
+          smoothstep(-0.2, 0.4, patchNoise),
+        );
+        if (rng() <= (profile.density / MAX_BIOME_DENSITY) * patchMask) {
+          planetManager.getSurfaceNormalAt(
+            _candDir.x,
+            _candDir.y,
+            _candDir.z,
+            _candNormal,
+          );
+          const seedCosSlope = _candNormal.dot(_candDir);
+          if (seedCosSlope >= COS_32_DEG) {
+            let eligibleCount = 0;
+            let totalWeight = 0;
+
+            for (let e = 0; e < profile.entries.length; e++) {
+              const entry = profile.entries[e];
+              if (entry.minT !== undefined && _biomeSample.T <= entry.minT) {
+                continue;
+              }
+              if (
+                entry.maxRawNorm !== undefined &&
+                rawNorm >= entry.maxRawNorm
+              ) {
+                continue;
+              }
+
+              const spIdx = SPECIES_INDEX[entry.species];
+              const spec = SPECIES_LIST[spIdx];
+              const grp = SPECIES_GROUP_SPEC[spec.id];
+              if (seedCosSlope < grp.slopeLimitCos) continue;
+              if (
+                rawNorm <= planet.seaLevel + spec.minAboveSea ||
+                rawNorm >= spec.maxRawNorm
+              ) {
+                continue;
+              }
+
+              _eligibleIndices[eligibleCount] = spIdx;
+              _eligibleWeights[eligibleCount] = entry.weight;
+              _eligibleMaxNorm[eligibleCount] =
+                entry.maxRawNorm !== undefined
+                  ? Math.min(spec.maxRawNorm, entry.maxRawNorm)
+                  : spec.maxRawNorm;
+              totalWeight += entry.weight;
+              eligibleCount++;
             }
-          }
-          this.cellAngRadii[cellIdx] = maxAng;
 
-          // At most 1 candidate group per cell on a jittered grid
-          const seed = hashCell(f, i, j, SEED_FIXA);
-          const rng = mulberry32(seed ^ 0x13579bdf);
-          const u = u0 + rng() * step;
-          const v = v0 + rng() * step;
-
-          const gp = spherifyCubePoint(
-            face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0],
-            face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1],
-            face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2],
-          );
-          _candDir.set(gp.nx, gp.ny, gp.nz).normalize();
-
-          const rawH = getPlanetTerrainHeight(
-            _candDir.x,
-            _candDir.y,
-            _candDir.z,
-            planet.planetRadius,
-            planet.noiseScale,
-            planet.maxHeight,
-          );
-          const rawNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
-          sampleBiome(
-            _candDir.x,
-            _candDir.y,
-            _candDir.z,
-            rawNorm,
-            planet.seaLevel,
-            _biomeSample,
-          );
-
-          const biome = _biomeSample.biome;
-          const profile = BIOME_FLORA_TABLE[biome];
-
-          if (
-            biome !== 'ocean' &&
-            biome !== 'ice' &&
-            profile.density > 0 &&
-            profile.entries.length > 0
-          ) {
-            const patchNoise = simplex3(
-              _candDir.x * 5 + 17,
-              _candDir.y * 5,
-              _candDir.z * 5,
-            );
-            const patchMask = THREE.MathUtils.lerp(
-              0.15,
-              1,
-              smoothstep(-0.2, 0.4, patchNoise),
-            );
-            if (rng() <= (profile.density / MAX_BIOME_DENSITY) * patchMask) {
-              planetManager.getSurfaceNormalAt(
-                _candDir.x,
-                _candDir.y,
-                _candDir.z,
-                _candNormal,
-              );
-              const seedCosSlope = _candNormal.dot(_candDir);
-              if (seedCosSlope >= COS_32_DEG) {
-                let eligibleCount = 0;
-                let totalWeight = 0;
-
-                for (let e = 0; e < profile.entries.length; e++) {
-                  const entry = profile.entries[e];
-                  if (entry.minT !== undefined && _biomeSample.T <= entry.minT) {
-                    continue;
-                  }
-                  if (
-                    entry.maxRawNorm !== undefined &&
-                    rawNorm >= entry.maxRawNorm
-                  ) {
-                    continue;
-                  }
-
-                  const spIdx = SPECIES_INDEX[entry.species];
-                  const spec = SPECIES_LIST[spIdx];
-                  const grp = SPECIES_GROUP_SPEC[spec.id];
-                  if (seedCosSlope < grp.slopeLimitCos) continue;
-                  if (
-                    rawNorm <= planet.seaLevel + spec.minAboveSea ||
-                    rawNorm >= spec.maxRawNorm
-                  ) {
-                    continue;
-                  }
-
-                  _eligibleIndices[eligibleCount] = spIdx;
-                  _eligibleWeights[eligibleCount] = entry.weight;
-                  _eligibleMaxNorm[eligibleCount] =
-                    entry.maxRawNorm !== undefined
-                      ? Math.min(spec.maxRawNorm, entry.maxRawNorm)
-                      : spec.maxRawNorm;
-                  totalWeight += entry.weight;
-                  eligibleCount++;
-                }
-
-                if (eligibleCount > 0 && totalWeight > 0) {
-                  let pick = rng() * totalWeight;
-                  let chosenSpIdx = _eligibleIndices[0];
-                  let maxAllowedNorm = _eligibleMaxNorm[0];
-                  for (let e = 0; e < eligibleCount; e++) {
-                    pick -= _eligibleWeights[e];
-                    if (pick <= 0) {
-                      chosenSpIdx = _eligibleIndices[e];
-                      maxAllowedNorm = _eligibleMaxNorm[e];
-                      break;
-                    }
-                  }
-
-                  const chosenId = SPECIES_LIST[chosenSpIdx].id;
-                  const grpSpec = SPECIES_GROUP_SPEC[chosenId];
-                  const baseCount =
-                    grpSpec.minCount +
-                    Math.floor(rng() * (grpSpec.maxCount - grpSpec.minCount + 1));
-                  const baseRadius = Math.sqrt(
-                    (baseCount * grpSpec.areaPerMember) / Math.PI,
-                  );
-                  const radius = baseRadius * densitySqrt;
-                  if (radius > maxR) maxR = radius;
-
-                  if (chosenId === 'mushroom') {
-                    _baseTintColor.setHex(
-                      biome === 'grassland'
-                        ? rng() < 0.5
-                          ? 0xf472b6
-                          : 0x38bdf8
-                        : rng() < 0.5
-                          ? 0x22d3ee
-                          : 0xe879f9,
-                    );
-                  } else {
-                    _baseTintColor.setHex(profile.foliageHex);
-                  }
-
-                  planetManager.getMeshPointAtCubeUV(f, u, v, _meshPt);
-                  const mLen = _meshPt.length() || 1;
-
-                  this.cellGroups[cellIdx] = {
-                    id: cellIdx,
-                    cellIdx,
-                    faceIdx: f,
-                    u,
-                    v,
-                    cx: _meshPt.x,
-                    cy: _meshPt.y,
-                    cz: _meshPt.z,
-                    nx: _meshPt.x / mLen,
-                    ny: _meshPt.y / mLen,
-                    nz: _meshPt.z / mLen,
-                    speciesIdx: chosenSpIdx,
-                    tintR: _baseTintColor.r,
-                    tintG: _baseTintColor.g,
-                    tintB: _baseTintColor.b,
-                    baseCount,
-                    baseRadius,
-                    radius,
-                    seed,
-                    maxAllowedNorm,
-                    lodState: -1,
-                    priorityScore: 0,
-                  };
+            if (eligibleCount > 0 && totalWeight > 0) {
+              let pick = rng() * totalWeight;
+              let chosenSpIdx = _eligibleIndices[0];
+              let maxAllowedNorm = _eligibleMaxNorm[0];
+              for (let e = 0; e < eligibleCount; e++) {
+                pick -= _eligibleWeights[e];
+                if (pick <= 0) {
+                  chosenSpIdx = _eligibleIndices[e];
+                  maxAllowedNorm = _eligibleMaxNorm[e];
+                  break;
                 }
               }
+
+              const chosenId = SPECIES_LIST[chosenSpIdx].id;
+              const grpSpec = SPECIES_GROUP_SPEC[chosenId];
+              const baseCount =
+                grpSpec.minCount +
+                Math.floor(rng() * (grpSpec.maxCount - grpSpec.minCount + 1));
+              const baseRadius = Math.sqrt(
+                (baseCount * grpSpec.areaPerMember) / Math.PI,
+              );
+              const radius = baseRadius * densitySqrt;
+              if (radius > this.registryBuildMaxR) {
+                this.registryBuildMaxR = radius;
+              }
+
+              if (chosenId === 'mushroom') {
+                _baseTintColor.setHex(
+                  biome === 'grassland'
+                    ? rng() < 0.5
+                      ? 0xf472b6
+                      : 0x38bdf8
+                    : rng() < 0.5
+                      ? 0x22d3ee
+                      : 0xe879f9,
+                );
+              } else {
+                _baseTintColor.setHex(profile.foliageHex);
+              }
+
+              planetManager.getMeshPointAtCubeUV(f, u, v, _meshPt);
+              const mLen = _meshPt.length() || 1;
+
+              this.cellGroups[cellIdx] = {
+                id: cellIdx,
+                cellIdx,
+                faceIdx: f,
+                u,
+                v,
+                cx: _meshPt.x,
+                cy: _meshPt.y,
+                cz: _meshPt.z,
+                nx: _meshPt.x / mLen,
+                ny: _meshPt.y / mLen,
+                nz: _meshPt.z / mLen,
+                speciesIdx: chosenSpIdx,
+                tintR: _baseTintColor.r,
+                tintG: _baseTintColor.g,
+                tintB: _baseTintColor.b,
+                baseCount,
+                baseRadius,
+                radius,
+                seed,
+                maxAllowedNorm,
+                lodState: -1,
+                priorityScore: 0,
+              };
             }
           }
-
-          cellIdx++;
         }
+      }
+
+      this.registryCellCursor++;
+      processed++;
+      if (processed >= 1 && performance.now() - budgetStartMs >= TIME_BUDGET_MS) {
+        break;
       }
     }
 
-    this.maxGroupRadius = maxR;
-    this.lastUserDensity = userDensityFactor;
-    this.groupCache.clear();
-    this.genQueue.length = 0;
-    this.queuedSet.clear();
-    this.visibleGroups.length = 0;
-    this.lastFillSignature = 0;
+    if (this.registryCellCursor >= this.cellCount) {
+      this.registryReady = true;
+      this.maxGroupRadius = this.registryBuildMaxR;
+    }
+    return processed > 0;
   }
 
   private setCachedGroup(groupId: number, data: GeneratedGroup): void {
@@ -1592,6 +1816,7 @@ export class FloraManager {
     const matrices = new Float32Array(placed * 16);
     const colors = new Float32Array(placed * 3);
     const variants = new Uint8Array(placed);
+    const harvested = new Uint8Array(placed);
 
     for (let i = 0; i < placed; i++) {
       const srcIdx = _genOrder[i];
@@ -1600,7 +1825,84 @@ export class FloraManager {
       variants[i] = _genVar[srcIdx];
     }
 
-    return { count: placed, matrices, colors, variants };
+    return { count: placed, matrices, colors, variants, harvested };
+  }
+
+  public queryNearestHarvestableFlora(
+    pos: THREE.Vector3,
+    maxDist: number,
+    out: FloraHarvestQuery,
+  ): void {
+    out.found = false;
+    out.groupId = -1;
+    out.memberIdx = -1;
+    out.distance = Infinity;
+    if (this.cellCount === 0 || this.cachedPlanetRadius <= 0 || this.forceDisabled) {
+      return;
+    }
+
+    let bestDistSq = maxDist * maxDist;
+    const shrubIdx = SPECIES_INDEX.shrub;
+    const mushroomIdx = SPECIES_INDEX.mushroom;
+
+    for (let g = 0; g < this.visibleGroups.length; g++) {
+      const group = this.visibleGroups[g].group;
+      if (group.speciesIdx !== shrubIdx && group.speciesIdx !== mushroomIdx) {
+        continue;
+      }
+      const maxReach = maxDist + group.radius + 2;
+      const gdx = group.cx - pos.x;
+      const gdy = group.cy - pos.y;
+      const gdz = group.cz - pos.z;
+      if (gdx * gdx + gdy * gdy + gdz * gdz > maxReach * maxReach) continue;
+
+      const gen = this.groupCache.get(group.id);
+      if (!gen) continue;
+
+      const mat = gen.matrices;
+      const harv = gen.harvested;
+      for (let m = 0; m < gen.count; m++) {
+        if (harv[m] !== 0) continue;
+        const mOff = m * 16;
+        const px = mat[mOff + 12];
+        const py = mat[mOff + 13];
+        const pz = mat[mOff + 14];
+
+        if (this.clearingActive) {
+          const cdx = px - this.clearingPos.x;
+          const cdy = py - this.clearingPos.y;
+          const cdz = pz - this.clearingPos.z;
+          if (cdx * cdx + cdy * cdy + cdz * cdz < this.clearingRadiusSq) {
+            continue;
+          }
+        }
+
+        const dx = px - pos.x;
+        const dy = py - pos.y;
+        const dz = pz - pos.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 <= bestDistSq) {
+          bestDistSq = d2;
+          out.found = true;
+          out.groupId = group.id;
+          out.memberIdx = m;
+          out.species = group.speciesIdx === mushroomIdx ? 'mushroom' : 'shrub';
+          out.label =
+            group.speciesIdx === mushroomIdx ? 'Cogumelo' : 'Arbusto';
+          out.distance = Math.sqrt(d2);
+        }
+      }
+    }
+  }
+
+  public harvestMember(groupId: number, memberIdx: number): boolean {
+    const gen = this.groupCache.get(groupId);
+    if (!gen || memberIdx < 0 || memberIdx >= gen.count) return false;
+    if (gen.harvested[memberIdx] !== 0) return false;
+    gen.harvested[memberIdx] = 1;
+    this.harvestVersion = (this.harvestVersion + 1) | 0;
+    this.harvestDirty = true;
+    return true;
   }
 
   public queryTrees(pos: THREE.Vector3, out: TreeCollider[]): number {
@@ -1679,7 +1981,7 @@ export class FloraManager {
   public update(
     dt: number,
     shipPos: THREE.Vector3,
-    _altitude: number,
+    surfaceAltitude: number,
     planetManager: PlanetTerrainManager,
     planet: PlanetParams,
     flora: FloraParams,
@@ -1690,23 +1992,66 @@ export class FloraManager {
     },
     sunDir?: THREE.Vector3,
     camera?: THREE.Camera,
+    isLandingOrLanded = true,
+    shipVelocity?: THREE.Vector3,
   ): void {
+    if (this.forceDisabled) {
+      return;
+    }
+
+    const tFrameStart = performance.now();
     const userDensityFactor =
       flora.density * (this.isMobileOrSoftware ? 0.6 : 1.0);
-    this.ensureGroupRegistry(planetManager, planet, userDensityFactor);
+    const registryStepped = this.stepGroupRegistry(
+      planetManager,
+      planet,
+      userDensityFactor,
+      tFrameStart,
+    );
+
+    const speed =
+      !isLandingOrLanded && shipVelocity ? shipVelocity.length() : 0;
+    const speedFactor = isLandingOrLanded
+      ? 0
+      : THREE.MathUtils.clamp((speed - 28) / 47, 0, 1);
+
+    const highAltMode = !isLandingOrLanded && surfaceAltitude > 25;
+    const lowDetailMode = highAltMode || speedFactor > 0.35;
+    this.syncTreeCastShadows(
+      this.castShadows && !highAltMode && speedFactor < 0.25,
+    );
 
     this.uTime.value += dt;
-    this.uWind.value = quality.qualityLevel >= 2 ? 0 : 1;
+    this.uWind.value =
+      lowDetailMode || quality.qualityLevel >= 2 ? 0 : 1;
     if (sunDir) {
       this.uSunDir.value.copy(sunDir);
     }
 
-    if (quality.floraViewRatio !== this.lastFadeViewRatio) {
-      this.lastFadeViewRatio = quality.floraViewRatio;
-      const treeMax = Math.max(140, 230 * quality.floraViewRatio);
+    const baseViewRatio = highAltMode
+      ? quality.floraViewRatio * 0.65
+      : quality.floraViewRatio;
+    const effectiveViewRatio =
+      speedFactor > 0
+        ? baseViewRatio * THREE.MathUtils.lerp(1.0, 0.55, speedFactor)
+        : baseViewRatio;
+    const effectiveDensityRatio =
+      speedFactor > 0
+        ? quality.floraDensityRatio * THREE.MathUtils.lerp(1.0, 0.45, speedFactor)
+        : quality.floraDensityRatio;
+
+    const fadeFloorScale =
+      speedFactor > 0 ? THREE.MathUtils.lerp(1.0, 0.55, speedFactor) : 1.0;
+    if (
+      Math.abs(effectiveViewRatio - this.lastFadeViewRatio) > 0.015 ||
+      Math.abs(fadeFloorScale - this.lastFadeSpeedFloor) > 0.03
+    ) {
+      this.lastFadeViewRatio = effectiveViewRatio;
+      this.lastFadeSpeedFloor = fadeFloorScale;
+      const treeMax = Math.max(120 * fadeFloorScale, 230 * effectiveViewRatio);
       this.uTreeFadeEnd.value = treeMax;
       this.uTreeFadeStart.value = treeMax * 0.82;
-      const smallMax = Math.max(90, 150 * quality.floraViewRatio);
+      const smallMax = Math.max(75 * fadeFloorScale, 150 * effectiveViewRatio);
       this.uSmallFadeEnd.value = smallMax;
       this.uSmallFadeStart.value = smallMax * 0.82;
     }
@@ -1720,7 +2065,7 @@ export class FloraManager {
     const planetAltitude =
       shipDist - planet.planetRadius - planet.maxHeight * 0.5;
 
-    if (!flora.enabled || flora.density <= 0 || planetAltitude >= 150) {
+    if (this.forceDisabled || !flora.enabled || flora.density <= 0) {
       if (this.wasVisible) {
         this.hideAllMeshes();
       }
@@ -1730,6 +2075,7 @@ export class FloraManager {
     if (Math.abs(userDensityFactor - this.lastUserDensity) > 0.02) {
       this.lastUserDensity = userDensityFactor;
       const densitySqrt = Math.sqrt(Math.max(0.05, userDensityFactor));
+      this.registryDensitySqrt = densitySqrt;
       for (let i = 0; i < this.cellGroups.length; i++) {
         const g = this.cellGroups[i];
         if (g) {
@@ -1745,9 +2091,25 @@ export class FloraManager {
       this.queuedSet.clear();
       this.lastFillSignature = 0;
       this.timeSinceFill = 99;
+      this.prewarmCompletedForSpot = false;
     }
 
-    // Update camera culling helpers (30% expanded FOV frustum + forward direction)
+    if (planetAltitude >= 150) {
+      if (this.wasVisible) {
+        this.hideAllMeshes();
+      }
+      // Early space pre-generation (<= 1.5 ms budget): populate flora cache for the ground directly below the ship
+      this.prewarmSurfaceTarget(
+        _shipDir,
+        planetManager,
+        planet,
+        userDensityFactor,
+        tFrameStart,
+      );
+      return;
+    }
+
+    // Update camera culling helpers (15% padded FOV frustum + forward direction)
     let hasFrustum = false;
     if (camera) {
       camera.updateMatrixWorld();
@@ -1756,7 +2118,7 @@ export class FloraManager {
       camera.getWorldDirection(_camForward);
 
       if (camera instanceof THREE.PerspectiveCamera) {
-        const targetFov = Math.min(165, camera.fov * 1.3);
+        const targetFov = Math.min(165, camera.fov * 1.15);
         if (
           _cullCamera.fov !== targetFov ||
           _cullCamera.aspect !== camera.aspect ||
@@ -1781,6 +2143,23 @@ export class FloraManager {
       _camForward.copy(_shipDir);
     }
 
+    if (speed > 0.5 && shipVelocity) {
+      _velDir.copy(shipVelocity).divideScalar(speed);
+      _trajDir.copy(_velDir);
+    } else {
+      _velDir.copy(_camForward);
+      _trajDir.copy(_camForward);
+    }
+
+    this.timeSinceFill += dt;
+    const movedDistSq = this.lastEvalShipPos.distanceToSquared(shipPos);
+    const camRotated = _camForward.dot(this.lastEvalCamForward) < COS_8_DEG;
+    const highAltChanged =
+      highAltMode !== this.lastHighAltMode ||
+      lowDetailMode !== this.lastLowDetailMode;
+    this.lastHighAltMode = highAltMode;
+    this.lastLowDetailMode = lowDetailMode;
+
     const camLen = _camPos.length();
     if (camLen > 0.0001) {
       _camDir.copy(_camPos).divideScalar(camLen);
@@ -1788,13 +2167,12 @@ export class FloraManager {
       _camDir.set(0, 1, 0);
     }
 
-    this.timeSinceFill += dt;
-    const movedDistSq = this.lastEvalShipPos.distanceToSquared(shipPos);
-    const camRotated = _camForward.dot(this.lastEvalCamForward) < COS_8_DEG;
-
     const shouldEvaluate =
       !this.wasVisible ||
       this.clearingDirty ||
+      this.harvestDirty ||
+      highAltChanged ||
+      registryStepped ||
       this.timeSinceFill >= 0.15 ||
       movedDistSq > 144 ||
       camRotated;
@@ -1805,16 +2183,21 @@ export class FloraManager {
       this.evaluateVisibleGroups(
         shipPos,
         planet,
-        quality.floraViewRatio,
+        effectiveViewRatio,
         hasFrustum,
+        lowDetailMode,
+        speed,
+        fadeFloorScale,
       );
       this.lastEvalShipPos.copy(shipPos);
       this.lastEvalCamForward.copy(_camForward);
     }
 
-    // Process lazy group generation queue under 2ms time budget
-    if (this.genQueue.length > 0) {
-      const tStart = performance.now();
+    // Process lazy group generation queue within remaining 2ms frame budget
+    if (
+      this.genQueue.length > 0 &&
+      performance.now() - tFrameStart < TIME_BUDGET_MS
+    ) {
       while (this.genQueue.length > 0) {
         const group = this.genQueue.pop();
         if (!group) break;
@@ -1827,32 +2210,122 @@ export class FloraManager {
             userDensityFactor,
           );
           this.setCachedGroup(group.id, gen);
+          // Incremented whenever a previously uncached flora cell is generated via generateGroupData.
+          this.builtCellCounter++;
           generatedThisFrame++;
         }
-        if (performance.now() - tStart >= TIME_BUDGET_MS) {
+        if (performance.now() - tFrameStart >= TIME_BUDGET_MS) {
           break;
         }
       }
+    } else if (
+      highAltMode &&
+      this.genQueue.length === 0 &&
+      performance.now() - tFrameStart < 1.5
+    ) {
+      // While descending at > 25m, pre-cache ground-level species (rocks, mushrooms, LOD0 trees) within budget
+      this.prewarmSurfaceTarget(
+        _shipDir,
+        planetManager,
+        planet,
+        userDensityFactor,
+        tFrameStart,
+      );
     }
 
-    // Rebuild InstancedMesh buffers when visible/LOD/cache signature changes (throttled to <= 0.15s) or clearing updated
+    // Rebuild InstancedMesh CPU buffers when visible/LOD/cache signature changes,
+    // then stagger GPU needsUpdate uploads across frames to prevent frame hitches.
+    let flushedThisFrame = false;
     if (
       this.clearingDirty ||
+      this.harvestDirty ||
+      highAltChanged ||
       !this.wasVisible ||
       ((shouldEvaluate || generatedThisFrame > 0) && this.timeSinceFill >= 0.15)
     ) {
-      const sig = this.computeSignature(quality.floraDensityRatio);
-      if (sig !== this.lastFillSignature || this.clearingDirty || !this.wasVisible) {
-        this.fillInstancedMeshes(quality.floraDensityRatio);
+      const sig = this.computeSignature(effectiveDensityRatio, lowDetailMode);
+      if (
+        sig !== this.lastFillSignature ||
+        this.clearingDirty ||
+        this.harvestDirty ||
+        highAltChanged ||
+        !this.wasVisible
+      ) {
+        this.fillInstancedMeshes(effectiveDensityRatio, tFrameStart);
         this.lastFillSignature = sig;
         this.clearingDirty = false;
+        this.harvestDirty = false;
         this.timeSinceFill = 0;
+        flushedThisFrame = true;
       } else {
         this.timeSinceFill = 0;
       }
     }
 
+    if (!flushedThisFrame && this.hasPendingUploads) {
+      this.flushPendingUploads(tFrameStart, 3);
+    }
+
     this.wasVisible = true;
+  }
+
+  private prewarmSurfaceTarget(
+    targetDir: THREE.Vector3,
+    planetManager: PlanetTerrainManager,
+    planet: PlanetParams,
+    userDensityFactor: number,
+    budgetStartMs: number,
+  ): void {
+    if (this.cellCount === 0 || performance.now() - budgetStartMs >= 1.5) return;
+    if (
+      this.prewarmCompletedForSpot &&
+      targetDir.dot(this.lastPrewarmDir) > 0.996
+    ) {
+      return;
+    }
+
+    const baseAngle = 175 / Math.max(planet.planetRadius, 1);
+    const centers = this.cellCenters;
+    const angRadii = this.cellAngRadii;
+    let builtAny = false;
+    let uncachedRemaining = false;
+
+    for (let cellIdx = 0; cellIdx < this.cellCount; cellIdx++) {
+      const group = this.cellGroups[cellIdx];
+      if (!group) continue;
+      if (this.groupCache.has(group.id)) continue;
+
+      const maxAng = baseAngle + angRadii[cellIdx];
+      if (maxAng < Math.PI) {
+        const dot =
+          centers[cellIdx * 3] * targetDir.x +
+          centers[cellIdx * 3 + 1] * targetDir.y +
+          centers[cellIdx * 3 + 2] * targetDir.z;
+        if (dot <= Math.cos(maxAng)) continue;
+      }
+
+      if (performance.now() - budgetStartMs >= 1.5) {
+        uncachedRemaining = true;
+        break;
+      }
+
+      const gen = this.generateGroupData(
+        group,
+        planetManager,
+        planet,
+        userDensityFactor,
+      );
+      this.setCachedGroup(group.id, gen);
+      this.builtCellCounter++;
+      builtAny = true;
+    }
+
+    if (!uncachedRemaining) {
+      this.lastPrewarmDir.copy(targetDir);
+      this.prewarmCompletedForSpot = true;
+    } else if (builtAny) {
+      this.prewarmCompletedForSpot = false;
+    }
   }
 
   private evaluateVisibleGroups(
@@ -1860,11 +2333,14 @@ export class FloraManager {
     planet: PlanetParams,
     viewRatio: number,
     hasFrustum: boolean,
+    lowDetailMode: boolean,
+    shipSpeed: number,
+    fadeFloorScale: number,
   ): void {
     this.visibleGroups.length = 0;
     this.activeCellList.length = 0;
 
-    const maxTreeDist = Math.max(140, 230 * viewRatio);
+    const maxTreeDist = Math.max(120 * fadeFloorScale, 230 * viewRatio);
     const maxSearchDist = maxTreeDist + Math.max(24, this.maxGroupRadius);
     const baseAngle = maxSearchDist / Math.max(planet.planetRadius, 1);
 
@@ -1879,6 +2355,7 @@ export class FloraManager {
 
     const centers = this.cellCenters;
     const angRadii = this.cellAngRadii;
+    const skipShortHorizonCells = shipSpeed > 25;
     let newlyQueued = false;
 
     for (let cellIdx = 0; cellIdx < this.cellCount; cellIdx++) {
@@ -1897,6 +2374,10 @@ export class FloraManager {
 
       const spIdx = group.speciesIdx;
       const spec = SPECIES_LIST[spIdx];
+      if (lowDetailMode && (spec.id === 'rock' || spec.id === 'mushroom')) {
+        continue;
+      }
+
       const grpSpec = SPECIES_GROUP_SPEC[spec.id];
       const sphereR = group.radius + this.speciesMaxHeights[spIdx];
 
@@ -1906,13 +2387,21 @@ export class FloraManager {
       const shipDist = Math.sqrt(sdx * sdx + sdy * sdy + sdz * sdz);
       const edgeDist = Math.max(0, shipDist - group.radius);
 
-      // LOD thresholds with ±8% hysteresis and quality-safe minimums
+      // LOD thresholds with ±8% hysteresis; lowDetailMode forces cheapest LOD1 on trees
       const isTree = spec.category === 'tree';
-      const t0 = Math.max(isTree ? 70 : 45, grpSpec.lod0Dist * viewRatio);
-      const t1 = Math.max(isTree ? 140 : 90, grpSpec.lod1Dist * viewRatio);
+      const t0 = Math.max(
+        (isTree ? 70 : 45) * fadeFloorScale,
+        grpSpec.lod0Dist * viewRatio,
+      );
+      const t1 = Math.max(
+        (isTree ? 120 : 75) * fadeFloorScale,
+        grpSpec.lod1Dist * viewRatio,
+      );
       let nextLod: 0 | 1 | 2;
 
-      if (group.lodState === -1) {
+      if (lowDetailMode && isTree) {
+        nextLod = edgeDist <= t1 ? 1 : 2;
+      } else if (group.lodState === -1) {
         if (edgeDist <= t0) nextLod = 0;
         else if (edgeDist <= t1) nextLod = 1;
         else nextLod = 2;
@@ -1949,12 +2438,8 @@ export class FloraManager {
         if (hDot < Math.cos(maxVisAngle)) continue;
       }
 
-      // Expanded frustum culling (always keep within 60u of camera)
-      const cdx = group.cx - _camPos.x;
-      const cdy = group.cy - _camPos.y;
-      const cdz = group.cz - _camPos.z;
-      const camDistSq = cdx * cdx + cdy * cdy + cdz * cdz;
-      if (hasFrustum && camDistSq >= 3600) {
+      // Strict camera frustum culling (no flora outside camera frustum is sent to GPU)
+      if (hasFrustum) {
         _groupSphere.center.set(group.cx, group.cy, group.cz);
         _groupSphere.radius = sphereR;
         if (!_frustum.intersectsSphere(_groupSphere)) continue;
@@ -1967,10 +2452,17 @@ export class FloraManager {
       });
 
       if (!this.groupCache.has(group.id) && !this.queuedSet.has(group.id)) {
-        const camDist = Math.sqrt(camDistSq) || 1;
-        _toGroup.set(cdx / camDist, cdy / camDist, cdz / camDist);
-        const fwdDot = THREE.MathUtils.clamp(_toGroup.dot(_camForward), -1, 1);
-        group.priorityScore = shipDist * (1.35 - 0.55 * fwdDot);
+        // At high speed, skip generating uncached cells the ship is behind or will cross in < 1s
+        if (skipShortHorizonCells) {
+          const alongVel = sdx * _velDir.x + sdy * _velDir.y + sdz * _velDir.z;
+          if (alongVel < shipSpeed * 1.0) {
+            continue;
+          }
+        }
+        const invShipDist = 1 / Math.max(shipDist, 1);
+        _toGroup.set(sdx * invShipDist, sdy * invShipDist, sdz * invShipDist);
+        const trajDot = THREE.MathUtils.clamp(_toGroup.dot(_trajDir), -1, 1);
+        group.priorityScore = shipDist * (1.5 - 0.7 * trajDot);
         this.genQueue.push(group);
         this.queuedSet.add(group.id);
         newlyQueued = true;
@@ -1982,16 +2474,21 @@ export class FloraManager {
       this.visibleGroups.sort((a, b) => a.sortDist - b.sortDist);
     }
 
-    // Sort queue descending by priorityScore so pop() gets closest & ahead-of-camera first
+    // Sort queue descending by priorityScore so pop() gets closest & ahead-of-trajectory first
     if (newlyQueued && this.genQueue.length > 1) {
       this.genQueue.sort((a, b) => b.priorityScore - a.priorityScore);
     }
   }
 
-  private computeSignature(densityRatio: number): number {
+  private computeSignature(
+    densityRatio: number,
+    highAltMode: boolean,
+  ): number {
     let sig = 0x811c9dc5;
     sig = Math.imul(sig ^ Math.round(densityRatio * 100), 0x01000193);
     sig = Math.imul(sig ^ (this.clearingActive ? 1 : 0), 0x01000193);
+    sig = Math.imul(sig ^ (highAltMode ? 1 : 0), 0x01000193);
+    sig = Math.imul(sig ^ this.harvestVersion, 0x01000193);
 
     for (let i = 0; i < this.visibleGroups.length; i++) {
       const entry = this.visibleGroups[i];
@@ -2004,7 +2501,10 @@ export class FloraManager {
     return sig >>> 0;
   }
 
-  private fillInstancedMeshes(qualityDensityRatio: number): void {
+  private fillInstancedMeshes(
+    qualityDensityRatio: number,
+    budgetStartMs: number,
+  ): void {
     this.primaryCounts.fill(0);
     this.treeLod1Counts.fill(0);
 
@@ -2042,9 +2542,11 @@ export class FloraManager {
       const srcMats = gen.matrices;
       const srcCols = gen.colors;
       const srcVars = gen.variants;
+      const srcHarvested = gen.harvested;
 
       for (let m = 0; m < drawCount; m++) {
-        const slot = baseSlot + srcVars[m];
+        if (srcHarvested[m] !== 0) continue;
+        const slot = isTreeLod1 ? spIdx : baseSlot + srcVars[m];
         const mesh = isTreeLod1
           ? this.treeLod1Meshes[slot]
           : this.primaryMeshes[slot];
@@ -2100,43 +2602,119 @@ export class FloraManager {
       }
     }
 
-    let totalActive = 0;
-    let activeMeshes = 0;
+    this.hasPendingUploads = false;
     for (let i = 0; i < this.primaryMeshes.length; i++) {
       const mesh = this.primaryMeshes[i];
       const count = this.primaryCounts[i];
-      mesh.count = count;
-      mesh.visible = count > 0;
-      totalActive += count;
-      if (count > 0) {
-        activeMeshes++;
-        uploadAttribute(mesh.instanceMatrix, count);
-        if (mesh.instanceColor) {
-          uploadAttribute(mesh.instanceColor, count);
-        }
+      if (count === 0) {
+        mesh.count = 0;
+        mesh.visible = false;
+        this.primaryDirty[i] = 0;
+      } else {
+        this.primaryDirty[i] = 1;
+        this.hasPendingUploads = true;
       }
     }
 
     for (let i = 0; i < this.treeLod1Meshes.length; i++) {
       const mesh = this.treeLod1Meshes[i];
       const count = this.treeLod1Counts[i];
+      if (count === 0) {
+        mesh.count = 0;
+        mesh.visible = false;
+        this.treeLod1Dirty[i] = 0;
+      } else {
+        this.treeLod1Dirty[i] = 1;
+        this.hasPendingUploads = true;
+      }
+    }
+
+    this.statsGroupsLod0 = groupsLod0;
+    this.statsGroupsLod1 = groupsLod1;
+    this.statsGroupsActive = groupsLod0 + groupsLod1;
+
+    this.flushPendingUploads(budgetStartMs, 4);
+  }
+
+  private flushPendingUploads(
+    budgetStartMs: number,
+    maxUploadsPerFrame: number,
+  ): void {
+    let uploads = 0;
+    let remainingDirty = false;
+
+    // Prioritize tree LOD1 & primary trees first, then ground plants/rocks
+    for (let i = 0; i < this.treeLod1Meshes.length; i++) {
+      if (this.treeLod1Dirty[i] === 0) continue;
+      if (
+        uploads >= maxUploadsPerFrame ||
+        (uploads >= 2 && performance.now() - budgetStartMs >= TIME_BUDGET_MS)
+      ) {
+        remainingDirty = true;
+        break;
+      }
+      const mesh = this.treeLod1Meshes[i];
+      const count = this.treeLod1Counts[i];
       mesh.count = count;
       mesh.visible = count > 0;
-      totalActive += count;
       if (count > 0) {
-        activeMeshes++;
         uploadAttribute(mesh.instanceMatrix, count);
         if (mesh.instanceColor) {
           uploadAttribute(mesh.instanceColor, count);
         }
+        // Counts actual InstancedMesh GPU buffer upload (needsUpdate = true)
+        this.builtCellCounter++;
+        uploads++;
       }
+      this.treeLod1Dirty[i] = 0;
     }
 
+    for (let i = 0; i < this.primaryMeshes.length; i++) {
+      if (this.primaryDirty[i] === 0) continue;
+      if (
+        uploads >= maxUploadsPerFrame ||
+        (uploads >= 2 && performance.now() - budgetStartMs >= TIME_BUDGET_MS)
+      ) {
+        remainingDirty = true;
+        break;
+      }
+      const mesh = this.primaryMeshes[i];
+      const count = this.primaryCounts[i];
+      mesh.count = count;
+      mesh.visible = count > 0;
+      if (count > 0) {
+        uploadAttribute(mesh.instanceMatrix, count);
+        if (mesh.instanceColor) {
+          uploadAttribute(mesh.instanceColor, count);
+        }
+        // Counts actual InstancedMesh GPU buffer upload (needsUpdate = true)
+        this.builtCellCounter++;
+        uploads++;
+      }
+      this.primaryDirty[i] = 0;
+    }
+
+    if (!remainingDirty) {
+      for (let i = 0; i < this.treeLod1Dirty.length; i++) {
+        if (this.treeLod1Dirty[i]) {
+          remainingDirty = true;
+          break;
+        }
+      }
+    }
+    this.hasPendingUploads = remainingDirty;
+
+    let totalActive = 0;
+    let activeMeshes = 0;
+    for (let i = 0; i < this.allMeshes.length; i++) {
+      const m = this.allMeshes[i];
+      if (m.visible && m.count > 0) {
+        totalActive += m.count;
+        activeMeshes++;
+      }
+    }
     this.activeInstanceCount = totalActive;
     this.activeMeshCount = activeMeshes;
-    this.statsGroupsLod0 = groupsLod0;
-    this.statsGroupsLod1 = groupsLod1;
-    this.statsGroupsActive = groupsLod0 + groupsLod1;
   }
 
   public dispose(): void {

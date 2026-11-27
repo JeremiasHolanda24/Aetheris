@@ -5,6 +5,11 @@ import { FloraManager, TreeCollider } from './FloraManager';
 import { CharacterInputSample } from './InputController';
 import { LandingBody } from './LandingController';
 import { PlanetTerrainManager } from './PlanetTerrainManager';
+import { ShipColliderBox } from './proceduralModels';
+
+const CHAR_COLLIDER_RADIUS = 0.35;
+const CHAR_COLLIDER_HEIGHT = 1.66;
+const SHIP_STEP_HEIGHT = 0.4;
 
 // Pre-allocated scratch helpers (Zero GC)
 const _shipFwd = new THREE.Vector3();
@@ -19,10 +24,11 @@ const _horizVel = new THREE.Vector3();
 const _yawQuat = new THREE.Quaternion();
 const _rotDelta = new THREE.Quaternion();
 const _invPrevQuat = new THREE.Quaternion();
+const _invShipQuat = new THREE.Quaternion();
 const _basisMat = new THREE.Matrix4();
 const _backDir = new THREE.Vector3();
-const _shipDiff = new THREE.Vector3();
-const _shipRadial = new THREE.Vector3();
+const _localPos = new THREE.Vector3();
+const _localVel = new THREE.Vector3();
 const _treeDiff = new THREE.Vector3();
 const _treeAxis = new THREE.Vector3();
 const _treeRadial = new THREE.Vector3();
@@ -53,6 +59,7 @@ export class CharacterController {
   private readonly prevMoonQuat = new THREE.Quaternion();
   private hasMoonTrack = false;
   private isVisible = false;
+  private forceHidden = false;
 
   constructor(scene: THREE.Scene, isMobileOrSoftware: boolean) {
     this.scene = scene;
@@ -66,9 +73,31 @@ export class CharacterController {
     return this.isVisible;
   }
 
+  public setForceHidden(hidden: boolean): void {
+    this.forceHidden = hidden;
+    this.root.visible = this.isVisible && !this.forceHidden;
+  }
+
+  private readonly warmupSavedVisibles = new Map<THREE.Object3D, boolean>();
+
+  public prepareForShaderWarmup(): void {
+    this.warmupSavedVisibles.clear();
+    this.root.traverse((obj) => {
+      this.warmupSavedVisibles.set(obj, obj.visible);
+      obj.visible = true;
+    });
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    this.warmupSavedVisibles.forEach((vis, obj) => {
+      obj.visible = vis;
+    });
+    this.warmupSavedVisibles.clear();
+  }
+
   public setVisible(visible: boolean): void {
     this.isVisible = visible;
-    this.root.visible = visible;
+    this.root.visible = visible && !this.forceHidden;
     if (!visible) {
       this.hasMoonTrack = false;
       this.velocity.set(0, 0, 0);
@@ -179,6 +208,9 @@ export class CharacterController {
       floraManager?: FloraManager;
       floraEnabled?: boolean;
       shipPos: THREE.Vector3;
+      shipQuat: THREE.Quaternion;
+      shipColliders: readonly ShipColliderBox[];
+      shipGearActive: boolean;
     },
   ): void {
     if (!this.isVisible) return;
@@ -191,7 +223,12 @@ export class CharacterController {
       floraManager,
       floraEnabled,
       shipPos,
+      shipQuat,
+      shipColliders,
+      shipGearActive,
     } = params;
+
+    const wasGrounded = this.grounded;
 
     const moon = planetManager.getMoonState();
 
@@ -402,25 +439,138 @@ export class CharacterController {
       this.altitude = alt;
     }
 
-    // Landed Ship Collision (keep astronaut outside 1.6x ship fuselage capsule)
-    _shipDiff.subVectors(this.root.position, shipPos);
-    const shipAxial = _shipDiff.dot(this.upDir);
-    if (shipAxial > -1.5 && shipAxial < 1.8) {
-      _shipRadial.copy(_shipDiff).addScaledVector(this.upDir, -shipAxial);
-      const minShipDist = 2.4;
-      const radSq = _shipRadial.lengthSq();
-      if (radSq < minShipDist * minShipDist) {
-        const radLen = Math.sqrt(radSq);
-        if (radLen > 0.0001) {
-          _shipRadial.divideScalar(radLen);
+    // Ship local-space OBB collisions (cylinder radius 0.35, height 1.66 + 0.40 step-up)
+    if (
+      shipColliders.length > 0 &&
+      this.root.position.distanceToSquared(shipPos) < 81
+    ) {
+      _invShipQuat.copy(shipQuat).invert();
+      _localPos
+        .subVectors(this.root.position, shipPos)
+        .applyQuaternion(_invShipQuat);
+      _localVel.copy(_relVel).applyQuaternion(_invShipQuat);
+
+      let landedOnShip = false;
+      const radSqLimit = CHAR_COLLIDER_RADIUS * CHAR_COLLIDER_RADIUS;
+
+      for (let iter = 0; iter < 2; iter++) {
+        for (let i = 0; i < shipColliders.length; i++) {
+          const box = shipColliders[i];
+          if (box.requiresGear && !shipGearActive) continue;
+
+          const cx = THREE.MathUtils.clamp(_localPos.x, box.min.x, box.max.x);
+          const cz = THREE.MathUtils.clamp(_localPos.z, box.min.z, box.max.z);
+          const dx = _localPos.x - cx;
+          const dz = _localPos.z - cz;
+          const distXZSq = dx * dx + dz * dz;
+          if (distXZSq >= radSqLimit) continue;
+
+          const charMinY = _localPos.y;
+          const charMaxY = charMinY + CHAR_COLLIDER_HEIGHT;
+
+          // 1. Standing on top or stepping up (< 0.40) onto ship surface
+          const stepDiff = box.max.y - charMinY;
+          if (
+            charMinY >= box.max.y - 0.04 &&
+            charMinY <= box.max.y + 0.03 &&
+            _localVel.y <= 0.1
+          ) {
+            _localPos.y = box.max.y;
+            if (_localVel.y < 0) _localVel.y = 0;
+            landedOnShip = true;
+            continue;
+          }
+
+          let penXZ: number;
+          let pushX = 0;
+          let pushZ = 0;
+          if (distXZSq > 1e-10) {
+            const distXZ = Math.sqrt(distXZSq);
+            penXZ = CHAR_COLLIDER_RADIUS - distXZ;
+            pushX = dx / distXZ;
+            pushZ = dz / distXZ;
+          } else {
+            const toMinX = _localPos.x - box.min.x + CHAR_COLLIDER_RADIUS;
+            const toMaxX = box.max.x - _localPos.x + CHAR_COLLIDER_RADIUS;
+            const toMinZ = _localPos.z - box.min.z + CHAR_COLLIDER_RADIUS;
+            const toMaxZ = box.max.z - _localPos.z + CHAR_COLLIDER_RADIUS;
+            penXZ = toMinX;
+            pushX = -1;
+            pushZ = 0;
+            if (toMaxX < penXZ) {
+              penXZ = toMaxX;
+              pushX = 1;
+              pushZ = 0;
+            }
+            if (toMinZ < penXZ) {
+              penXZ = toMinZ;
+              pushX = 0;
+              pushZ = -1;
+            }
+            if (toMaxZ < penXZ) {
+              penXZ = toMaxZ;
+              pushX = 0;
+              pushZ = 1;
+            }
+          }
+
+          if (
+            stepDiff > 0 &&
+            stepDiff < SHIP_STEP_HEIGHT &&
+            charMinY >= box.min.y - 0.05 &&
+            (wasGrounded ||
+              (!this.jetpackEnabled && _localVel.y <= 1.2) ||
+              penXZ >= stepDiff)
+          ) {
+            _localPos.y = box.max.y;
+            if (_localVel.y < 0) _localVel.y = 0;
+            landedOnShip = true;
+            continue;
+          }
+
+          if (charMaxY <= box.min.y || charMinY >= box.max.y) continue;
+
+          // 2. Underside head bump vs lateral wall push (never teleport up if stepDiff >= 0.40)
+          const penDown = charMaxY - box.min.y;
+          if (
+            charMinY < box.min.y &&
+            penDown < penXZ &&
+            (_localVel.y > 0.05 || penDown < 0.35)
+          ) {
+            _localPos.y -= penDown;
+            if (_localVel.y > 0) _localVel.y = 0;
+          } else {
+            _localPos.x += pushX * penXZ;
+            _localPos.z += pushZ * penXZ;
+            const inward = _localVel.x * pushX + _localVel.z * pushZ;
+            if (inward < 0) {
+              _localVel.x -= pushX * inward;
+              _localVel.z -= pushZ * inward;
+            }
+          }
+        }
+      }
+
+      this.root.position.copy(_localPos).applyQuaternion(shipQuat).add(shipPos);
+      _relVel.copy(_localVel).applyQuaternion(shipQuat);
+
+      if (landedOnShip) {
+        this.grounded = true;
+        this.upDir.subVectors(this.root.position, _bodyCenter);
+        const shipSurfDist = this.upDir.length();
+        if (shipSurfDist > 0.0001) {
+          this.upDir.divideScalar(shipSurfDist);
         } else {
-          _shipRadial.copy(this.rightDir);
+          this.upDir.copy(_unitY);
         }
-        this.root.position.addScaledVector(_shipRadial, minShipDist - radLen);
-        const inward = _relVel.dot(_shipRadial);
-        if (inward < 0) {
-          _relVel.addScaledVector(_shipRadial, -inward);
-        }
+        const localGroundR = onMoon
+          ? moon.radius
+          : planetManager.getRenderedSurfaceRadiusAt(
+              this.upDir.x,
+              this.upDir.y,
+              this.upDir.z,
+            );
+        this.altitude = Math.max(0, shipSurfDist - localGroundR);
       }
     }
 

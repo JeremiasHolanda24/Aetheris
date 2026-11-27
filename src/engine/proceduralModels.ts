@@ -2,8 +2,16 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GEAR_REST_HEIGHT } from './LandingController';
 
+export interface ShipColliderBox {
+  id: string;
+  min: THREE.Vector3;
+  max: THREE.Vector3;
+  requiresGear?: boolean;
+}
+
 export interface ShipModelHandle {
   group: THREE.Group;
+  colliders: ShipColliderBox[];
   leftFlame: THREE.Mesh;
   rightFlame: THREE.Mesh;
   thrusterLight: THREE.PointLight | null;
@@ -43,11 +51,43 @@ export interface BeaconModelHandle {
   dispose: () => void;
 }
 
+const _mergeColor = new THREE.Color();
+
+function remapAtlasUVs(
+  geo: THREE.BufferGeometry,
+  region: 'hull' | 'wing' | 'white',
+): THREE.BufferGeometry {
+  if (!geo.getAttribute('uv')) {
+    const count = geo.getAttribute('position').count;
+    geo.setAttribute(
+      'uv',
+      new THREE.Float32BufferAttribute(new Float32Array(count * 2), 2),
+    );
+  }
+  const uv = geo.getAttribute('uv') as THREE.BufferAttribute;
+  for (let i = 0; i < uv.count; i++) {
+    const u = THREE.MathUtils.clamp(uv.getX(i), 0, 1);
+    const v = THREE.MathUtils.clamp(uv.getY(i), 0, 1);
+    if (region === 'hull') {
+      uv.setXY(i, 0.002 + u * 0.496, 0.002 + v * 0.996);
+    } else if (region === 'wing') {
+      uv.setXY(i, 0.504 + u * 0.242, 0.504 + v * 0.492);
+    } else {
+      uv.setXY(i, 0.875, 0.25);
+    }
+  }
+  uv.needsUpdate = true;
+  return geo;
+}
+
 function mergeStaticGeometries(
   parts: THREE.BufferGeometry[],
 ): THREE.BufferGeometry {
   const normalized = parts.map((g) => {
     const nonIdx = g.index ? g.toNonIndexed() : g;
+    if (!nonIdx.getAttribute('normal')) {
+      nonIdx.computeVertexNormals();
+    }
     if (!nonIdx.getAttribute('uv')) {
       const count = nonIdx.getAttribute('position').count;
       nonIdx.setAttribute(
@@ -64,6 +104,51 @@ function mergeStaticGeometries(
   }
   return merged;
 }
+
+interface ColoredGeoPart {
+  geo: THREE.BufferGeometry;
+  color: number;
+  atlasRegion?: 'hull' | 'wing' | 'white';
+}
+
+function mergeColoredGeometries(
+  parts: ColoredGeoPart[],
+): THREE.BufferGeometry {
+  const normalized = parts.map((part) => {
+    const g = part.geo.index ? part.geo.toNonIndexed() : part.geo;
+    if (!g.getAttribute('normal')) {
+      g.computeVertexNormals();
+    }
+    if (part.atlasRegion) {
+      remapAtlasUVs(g, part.atlasRegion);
+    } else if (!g.getAttribute('uv')) {
+      const count = g.getAttribute('position').count;
+      g.setAttribute(
+        'uv',
+        new THREE.Float32BufferAttribute(new Float32Array(count * 2), 2),
+      );
+    }
+    const count = g.getAttribute('position').count;
+    const colors = new Float32Array(count * 3);
+    _mergeColor.setHex(part.color);
+    for (let i = 0; i < count; i++) {
+      colors[i * 3] = _mergeColor.r;
+      colors[i * 3 + 1] = _mergeColor.g;
+      colors[i * 3 + 2] = _mergeColor.b;
+    }
+    g.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    return g;
+  });
+  const merged = mergeGeometries(normalized, false);
+  for (let i = 0; i < parts.length; i++) {
+    if (normalized[i] !== parts[i].geo) normalized[i].dispose();
+    parts[i].geo.dispose();
+  }
+  return merged;
+}
+
+let loggedShipMeshStats = false;
+let loggedBeaconMeshStats = false;
 
 function makeBox(
   w: number,
@@ -104,30 +189,32 @@ function makeCyl(
   return g;
 }
 
-function createStarfighterHullTexture(): THREE.CanvasTexture {
-  const size = 512;
+function createShipAtlasTexture(): THREE.CanvasTexture {
+  const width = 1024;
+  const height = 512;
   const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
+  canvas.width = width;
+  canvas.height = height;
   const ctx = canvas.getContext('2d');
 
   if (ctx) {
+    // 1. Left 512x512: Starfighter hull texture (u in [0, 0.5], v in [0, 1])
+    const hullSize = 512;
     ctx.fillStyle = '#f2ede2';
-    ctx.fillRect(0, 0, size, size);
+    ctx.fillRect(0, 0, hullSize, hullSize);
 
-    const sideGrad = ctx.createLinearGradient(0, 0, size, 0);
+    const sideGrad = ctx.createLinearGradient(0, 0, hullSize, 0);
     sideGrad.addColorStop(0.0, '#dfd8ca');
     sideGrad.addColorStop(0.25, '#ece6da');
     sideGrad.addColorStop(0.5, '#f6f2e9');
     sideGrad.addColorStop(0.75, '#ece6da');
     sideGrad.addColorStop(1.0, '#dfd8ca');
     ctx.fillStyle = sideGrad;
-    ctx.fillRect(0, 0, size, size);
+    ctx.fillRect(0, 0, hullSize, hullSize);
 
-    // Foredeck crimson triple racing stripe
-    const cx = size * 0.5;
-    const stripeTop = size * 0.135;
-    const stripeBot = size * 0.37;
+    const cx = hullSize * 0.5;
+    const stripeTop = hullSize * 0.135;
+    const stripeBot = hullSize * 0.37;
 
     ctx.fillStyle = '#c84833';
     ctx.beginPath();
@@ -154,153 +241,75 @@ function createStarfighterHullTexture(): THREE.CanvasTexture {
     ctx.closePath();
     ctx.fill();
 
-    // Filigree emblem on nose cone
     ctx.strokeStyle = 'rgba(176, 134, 62, 0.72)';
     ctx.lineWidth = 1.6;
     ctx.beginPath();
-    ctx.arc(cx, size * 0.105, 5.5, 0, Math.PI * 2);
+    ctx.arc(cx, hullSize * 0.105, 5.5, 0, Math.PI * 2);
     ctx.stroke();
     ctx.beginPath();
-    ctx.arc(cx, size * 0.105, 11, Math.PI * 0.18, Math.PI * 0.82);
+    ctx.arc(cx, hullSize * 0.105, 11, Math.PI * 0.18, Math.PI * 0.82);
     ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(cx, size * 0.062);
-    ctx.lineTo(cx, size * 0.094);
-    ctx.moveTo(cx - 5, size * 0.072);
-    ctx.lineTo(cx - 5, size * 0.096);
-    ctx.moveTo(cx + 5, size * 0.072);
-    ctx.lineTo(cx + 5, size * 0.096);
+    ctx.moveTo(cx, hullSize * 0.062);
+    ctx.lineTo(cx, hullSize * 0.094);
+    ctx.moveTo(cx - 5, hullSize * 0.072);
+    ctx.lineTo(cx - 5, hullSize * 0.096);
+    ctx.moveTo(cx + 5, hullSize * 0.072);
+    ctx.lineTo(cx + 5, hullSize * 0.096);
     ctx.stroke();
 
-    // Recessed hull panel seam lines
     ctx.strokeStyle = 'rgba(130, 114, 88, 0.34)';
     ctx.lineWidth = 1.4;
     const panelYs = [0.22, 0.34, 0.66, 0.80, 0.91];
     for (let i = 0; i < panelYs.length; i++) {
-      const py = size * panelYs[i];
+      const py = hullSize * panelYs[i];
       ctx.beginPath();
       ctx.moveTo(0, py);
-      ctx.lineTo(size, py);
+      ctx.lineTo(hullSize, py);
       ctx.stroke();
     }
 
     const seamXs = [0.22, 0.34, 0.42, 0.58, 0.66, 0.78];
     for (let i = 0; i < seamXs.length; i++) {
-      const px = size * seamXs[i];
+      const px = hullSize * seamXs[i];
       ctx.beginPath();
-      ctx.moveTo(px, size * 0.08);
-      ctx.lineTo(px, size * 0.96);
+      ctx.moveTo(px, hullSize * 0.08);
+      ctx.lineTo(px, hullSize * 0.96);
       ctx.stroke();
     }
-  }
 
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 2;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-function createWingPodTexture(): THREE.CanvasTexture {
-  const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-
-  if (ctx) {
+    // 2. Top-mid-right 256x256: Wing & Pod texture (u in [0.5, 0.75], v in [0.5, 1.0])
+    const podSize = 256;
+    ctx.save();
+    ctx.translate(512, 0);
     ctx.fillStyle = '#f0ebe0';
-    ctx.fillRect(0, 0, size, size);
+    ctx.fillRect(0, 0, podSize, podSize);
 
-    const grad = ctx.createLinearGradient(0, 0, 0, size);
+    const grad = ctx.createLinearGradient(0, 0, 0, podSize);
     grad.addColorStop(0, '#f5f1e8');
     grad.addColorStop(1, '#e3dccd');
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, size, size);
+    ctx.fillRect(0, 0, podSize, podSize);
 
     ctx.strokeStyle = 'rgba(128, 112, 86, 0.35)';
     ctx.lineWidth = 2;
-    ctx.strokeRect(18, 22, size - 36, size - 44);
+    ctx.strokeRect(18, 22, podSize - 36, podSize - 44);
     ctx.beginPath();
-    ctx.moveTo(18, size * 0.55);
-    ctx.lineTo(size - 18, size * 0.55);
-    ctx.moveTo(size * 0.5, 22);
-    ctx.lineTo(size * 0.5, size - 22);
+    ctx.moveTo(18, podSize * 0.55);
+    ctx.lineTo(podSize - 18, podSize * 0.55);
+    ctx.moveTo(podSize * 0.5, 22);
+    ctx.lineTo(podSize * 0.5, podSize - 22);
     ctx.stroke();
+    ctx.restore();
+
+    // 3. Bottom-right 256x256: Solid white swatch for vertex-colored painted parts
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(768, 256, 256, 256);
   }
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 2;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-function createUfcKeypadTexture(): THREE.CanvasTexture {
-  const w = 512;
-  const h = 288;
-  const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  if (ctx) {
-    ctx.fillStyle = '#060d14';
-    ctx.fillRect(0, 0, w, h);
-
-    ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(6, 6, w - 12, h - 12);
-
-    // Keypad matrix on left + status readout on right
-    const keyCols = 3;
-    const keyRows = 4;
-    const labels = [
-      '1', '2', '3',
-      '4', '5', '6',
-      '7', '8', '9',
-      'CLR', '0', 'ENT',
-    ];
-    for (let r = 0; r < keyRows; r++) {
-      for (let c = 0; c < keyCols; c++) {
-        const bx = 22 + c * 68;
-        const by = 24 + r * 62;
-        ctx.fillStyle = '#15202e';
-        ctx.fillRect(bx, by, 58, 50);
-        ctx.strokeStyle = '#64748b';
-        ctx.lineWidth = 2.5;
-        ctx.strokeRect(bx, by, 58, 50);
-        ctx.fillStyle = '#86efac';
-        ctx.font = c === 0 && r === 3 ? 'bold 20px monospace' : c === 2 && r === 3 ? 'bold 20px monospace' : 'bold 28px monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(labels[r * keyCols + c], bx + 29, by + 26);
-      }
-    }
-    ctx.textBaseline = 'alphabetic';
-
-    // UFC readout channels on right side
-    const readoutLines = ['NAV  OK', 'WPN RDY', 'ATM STD', 'COM CH1'];
-    for (let i = 0; i < readoutLines.length; i++) {
-      const rx = 242;
-      const ry = 24 + i * 62;
-      ctx.fillStyle = '#07180f';
-      ctx.fillRect(rx, ry, 246, 50);
-      ctx.strokeStyle = i === 1 ? '#f59e0b' : '#22c55e';
-      ctx.lineWidth = 2.5;
-      ctx.strokeRect(rx, ry, 246, 50);
-      ctx.fillStyle = i === 1 ? '#fde047' : '#4ade80';
-      ctx.font = 'bold 30px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(readoutLines[i], rx + 123, ry + 26);
-    }
-    ctx.textBaseline = 'alphabetic';
-  }
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.generateMipmaps = false;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
   tex.needsUpdate = true;
   return tex;
 }
@@ -614,62 +623,46 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     return t;
   };
 
-  const hullTex = trackTex(createStarfighterHullTexture());
-  const wingPodTex = trackTex(createWingPodTexture());
-  const ufcTex = trackTex(createUfcKeypadTexture());
+  const shipAtlasTex = trackTex(createShipAtlasTexture());
 
-  const hullMat = trackMat(
+  const shipPaintedMat = trackMat(
     new THREE.MeshStandardMaterial({
-      map: hullTex,
+      map: shipAtlasTex,
       color: 0xffffff,
-      metalness: 0.16,
-      roughness: 0.28,
+      vertexColors: true,
+      metalness: 0.15,
+      roughness: 0.30,
       envMapIntensity: 1.0,
     }),
   );
 
-  const wingIvoryMat = trackMat(
+  const brightMetalMat = trackMat(
     new THREE.MeshStandardMaterial({
-      map: wingPodTex,
       color: 0xffffff,
-      metalness: 0.16,
-      roughness: 0.3,
-      envMapIntensity: 1.0,
-    }),
-  );
-
-  const brushedGoldMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xd6a64c,
-      metalness: 0.9,
-      roughness: 0.24,
-      envMapIntensity: 1.45,
-    }),
-  );
-
-  const crimsonMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xc94732,
-      metalness: 0.14,
-      roughness: 0.38,
-      envMapIntensity: 0.85,
+      vertexColors: true,
+      metalness: 0.88,
+      roughness: 0.25,
+      envMapIntensity: 1.38,
     }),
   );
 
   const darkTrimMat = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0x1a2029,
+      color: 0xffffff,
+      vertexColors: true,
       metalness: 0.58,
       roughness: 0.54,
       envMapIntensity: 0.72,
     }),
   );
 
-  const seatTanMat = trackMat(
+  const pilotSuitMat = trackMat(
     new THREE.MeshStandardMaterial({
-      color: 0xb76835,
-      metalness: 0.06,
-      roughness: 0.72,
+      color: 0xffffff,
+      vertexColors: true,
+      roughness: 0.46,
+      metalness: 0.14,
+      envMapIntensity: 0.85,
     }),
   );
 
@@ -679,46 +672,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     }),
   );
 
-  const ufcMat = trackMat(
-    new THREE.MeshBasicMaterial({
-      map: ufcTex,
-      toneMapped: false,
-    }),
-  );
-
-  // Pilot EVA suit materials (matches CharacterModel 1:1)
-  const pilotWhiteMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xf1f5f9,
-      roughness: 0.42,
-      metalness: 0.08,
-      envMapIntensity: 0.9,
-    }),
-  );
-  const pilotGrayMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x525d6d,
-      roughness: 0.48,
-      metalness: 0.42,
-      envMapIntensity: 0.95,
-    }),
-  );
-  const pilotBlackMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x171b22,
-      roughness: 0.62,
-      metalness: 0.25,
-      envMapIntensity: 0.7,
-    }),
-  );
-  const pilotSkinMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xd9a27e,
-      roughness: 0.68,
-      metalness: 0.02,
-      envMapIntensity: 0.45,
-    }),
-  );
   const pilotVisorMat = trackMat(
     new THREE.MeshStandardMaterial({
       color: 0x9fd8ff,
@@ -754,7 +707,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   };
 
   const speedScreen = createInstrumentScreen(512, 384);
-  const radarScreen = createInstrumentScreen(512, 384);
   const altScreen = createInstrumentScreen(512, 384);
 
   // Transparent Green HUD Combiner Glass projection CanvasTexture
@@ -847,92 +799,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     }
 
     speedScreen.tex.needsUpdate = true;
-  };
-
-  const drawRadarConsole = (
-    pitchRad: number,
-    rollRad: number,
-    headingDeg: number,
-    targetBearingDeg: number,
-  ) => {
-    const ctx = radarScreen.ctx;
-    if (!ctx) return;
-    const w = radarScreen.canvas.width;
-    const h = radarScreen.canvas.height;
-    const cx = w * 0.5;
-    const cy = h * 0.58;
-    const r = 126;
-
-    ctx.fillStyle = '#030b11';
-    ctx.fillRect(0, 0, w, h);
-
-    ctx.strokeStyle = '#22c55e';
-    ctx.lineWidth = 6;
-    ctx.strokeRect(10, 10, w - 20, h - 20);
-
-    // Top digital heading bar
-    ctx.fillStyle = 'rgba(34, 197, 94, 0.18)';
-    ctx.fillRect(18, 18, w - 36, 56);
-    ctx.fillStyle = '#86efac';
-    ctx.font = 'bold 34px monospace';
-    ctx.textAlign = 'left';
-    ctx.fillText(`CAP ${String(Math.round(headingDeg)).padStart(3, '0')}`, 30, 56);
-    ctx.textAlign = 'right';
-    ctx.fillText('ATD/RDR', w - 30, 56);
-
-    // Horizon line tilted by roll/pitch inside circular mask
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r - 3, 0, Math.PI * 2);
-    ctx.clip();
-
-    ctx.translate(cx, cy);
-    ctx.rotate(-rollRad);
-    const pitchPx = THREE.MathUtils.clamp(pitchRad * 92, -84, 84);
-    ctx.fillStyle = 'rgba(14, 116, 144, 0.34)';
-    ctx.fillRect(-r, pitchPx - 180, r * 2, 180);
-    ctx.fillStyle = 'rgba(146, 64, 14, 0.34)';
-    ctx.fillRect(-r, pitchPx, r * 2, 180);
-
-    ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(-r, pitchPx);
-    ctx.lineTo(r, pitchPx);
-    ctx.stroke();
-    ctx.restore();
-
-    // Compass rose circles
-    ctx.strokeStyle = 'rgba(74, 222, 128, 0.68)';
-    ctx.lineWidth = 3.5;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r * 0.54, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Ship center aircraft symbol
-    ctx.strokeStyle = '#86efac';
-    ctx.lineWidth = 5;
-    ctx.beginPath();
-    ctx.moveTo(cx - 28, cy);
-    ctx.lineTo(cx - 10, cy);
-    ctx.lineTo(cx, cy + 10);
-    ctx.lineTo(cx + 10, cy);
-    ctx.lineTo(cx + 28, cy);
-    ctx.stroke();
-
-    // Target direction blip around radar edge
-    const relRad = THREE.MathUtils.degToRad(targetBearingDeg - headingDeg);
-    const bx = cx + Math.sin(relRad) * (r - 20);
-    const by = cy - Math.cos(relRad) * (r - 20);
-    ctx.fillStyle = '#fde047';
-    ctx.beginPath();
-    ctx.arc(bx, by, 10, 0, Math.PI * 2);
-    ctx.fill();
-
-    radarScreen.tex.needsUpdate = true;
   };
 
   const drawAltConsole = (altitude: number, inSpace: boolean) => {
@@ -1072,7 +938,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   };
 
   drawSpeedConsole(0, false);
-  drawRadarConsole(0, 0, 0, 0);
   drawAltConsole(0, false);
   drawHudCombiner(0, 0, 0, 0, 0);
 
@@ -1087,14 +952,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
       transparent: true,
       opacity: 0.38,
       depthWrite: false,
-    }),
-  );
-
-  const engineMetalMat = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0x5c5750,
-      metalness: 0.86,
-      roughness: 0.28,
     }),
   );
 
@@ -1128,7 +985,11 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
         varying vec2 vUv;
         void main() {
           vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          vec4 mvPos = vec4(position, 1.0);
+          #ifdef USE_INSTANCING
+            mvPos = instanceMatrix * mvPos;
+          #endif
+          gl_Position = projectionMatrix * modelViewMatrix * mvPos;
         }
       `,
       fragmentShader: `
@@ -1220,16 +1081,30 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     }),
   );
 
-  // 1. Primary Silhouette: 1.6x Smooth Lofted Ivory Fuselage with seamless U-channel cockpit cavity (1 draw call)
-  const fuselageGeo = trackGeo(
-    buildLoftedFuselageGeometry(0, 1, 36, 32, 0, true),
-  );
-  const fuselage = new THREE.Mesh(fuselageGeo, hullMat);
-  fuselage.castShadow = !isMobileOrSoftware;
-  group.add(fuselage);
+  // 1. Static ship geometry buckets merged across fuselage/cockpit/exterior (<=10 draw calls total!)
+  const COLOR_WHITE = 0xffffff;
+  const COLOR_GOLD = 0xd6a64c;
+  const COLOR_ENGINE_METAL = 0x5c5750;
+  const COLOR_DARK_TRIM = 0x1a2029;
+  const COLOR_CRIMSON = 0xc94732;
+  const COLOR_SEAT_TAN = 0xb76835;
+  const COLOR_PILOT_WHITE = 0xf1f5f9;
+  const COLOR_PILOT_GRAY = 0x525d6d;
+  const COLOR_PILOT_BLACK = 0x171b22;
+  const COLOR_PILOT_SKIN = 0xd9a27e;
+
+  const shipPaintedParts: ColoredGeoPart[] = [
+    {
+      geo: buildLoftedFuselageGeometry(0, 1, 36, 32, 0, true),
+      color: COLOR_WHITE,
+      atlasRegion: 'hull',
+    },
+  ];
+  const shipBrightMetalParts: ColoredGeoPart[] = [];
+  const shipDarkTrimParts: ColoredGeoPart[] = [];
 
   // 2. Cockpit-visible static geometry buckets (flush surface-inlaid gold trim matching Solaris design)
-  const hullGoldParts: THREE.BufferGeometry[] = [
+  const hullGoldGeos: THREE.BufferGeometry[] = [
     // Flush gold nose cone cap
     buildLoftedFuselageGeometry(0, 0.062, 6, 18, 0.008, false),
     // Nose M-arch seam framing the front of the crimson stripes (100% flush on hull surface)
@@ -1275,88 +1150,64 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   const sensorPortL = hullSurfacePointAt(0.352, -Math.PI * 0.11, 0.004);
   const sensorPortR = hullSurfacePointAt(0.352, Math.PI * 0.11, 0.004);
 
-  // ALL cockpit interior geometry strictly bounded inside |x| <= 0.37, y >= -0.145, z ∈ [-1.02, +0.20]
-  // so zero edges can ever touch or protrude through the white hull skin!
-  const hullDarkParts: THREE.BufferGeometry[] = [
-    // Flush exterior nose deck sensor ports
+  const hullDarkGeos: THREE.BufferGeometry[] = [
     makeCyl(0.044, 0.052, 0.025, 10, sensorPortL.x, sensorPortL.y, sensorPortL.z, 0.14, 0, 0.22),
     makeCyl(0.044, 0.052, 0.025, 10, sensorPortR.x, sensorPortR.y, sensorPortR.z, 0.14, 0, -0.22),
-
-    // Cockpit tub floor liner & aft bulkhead sealing behind seat
     makeBox(0.70, 0.03, 1.12, 0, -0.125, -0.44),
     makeBox(0.68, 0.44, 0.06, 0, 0.11, 0.14),
-
-    // Sloped Left & Right Side Switch Consoles strictly inside tub walls (|x| <= 0.365)
     makeBox(0.13, 0.24, 0.80, -0.30, 0.01, -0.44),
     makeBox(0.13, 0.24, 0.80, 0.30, 0.01, -0.44),
-    // Left throttle quadrant base + handle
     makeBox(0.08, 0.045, 0.14, -0.28, 0.15, -0.52),
     makeBox(0.045, 0.04, 0.075, -0.28, 0.185, -0.53, -0.25),
-
-    // Trapezoidal Sloped Front Instrument Pedestal & Shroud (z = -0.86 .. -0.68, unobstructed face ahead of panels)
-    makeBox(0.62, 0.40, 0.18, 0, 0.12, -0.77, -0.10),
-    // Upper tapered glare shroud sits FORWARD of MFDs & UFC so NOTHING blocks any screen!
-    makeBox(0.26, 0.030, 0.10, 0, 0.468, -0.745, 0.10),
+    makeBox(0.62, 0.24, 0.18, 0, 0.04, -0.77, -0.10),
     makeBox(0.18, 0.030, 0.10, -0.20, 0.405, -0.730, 0.10, 0, 0.50),
     makeBox(0.18, 0.030, 0.10, 0.20, 0.405, -0.730, 0.10, 0, -0.50),
-
-    // UFC mounting housing (centered directly above Center MFD)
-    makeBox(0.202, 0.104, 0.04, 0, 0.415, -0.685, -0.16),
-
-    // Twin Dark Vertical HUD Combiner Glass Brackets
     makeBox(0.016, 0.145, 0.026, -0.120, 0.535, -0.710),
     makeBox(0.016, 0.145, 0.026, 0.120, 0.535, -0.710),
-
-    // Center Flight Stick Boot & Sub-Floor Socket (between pilot legs at z = -0.49)
     makeCyl(0.038, 0.056, 0.05, 10, 0, -0.085, -0.49),
-
-    // Sculpted Armored Pilot Seat frame (merged into hullDarkParts to save a draw call)
-    makeBox(0.42, 0.06, 0.42, 0, -0.075, -0.16), // Seat pan
-    makeBox(0.39, 0.44, 0.065, 0, 0.16, 0.04, -0.20), // Reclined backrest frame
-    makeBox(0.06, 0.26, 0.20, -0.205, 0.08, -0.09, -0.14), // Left side bolster
-    makeBox(0.06, 0.26, 0.20, 0.205, 0.08, -0.09, -0.14), // Right side bolster
+    makeBox(0.42, 0.06, 0.42, 0, -0.075, -0.16),
+    makeBox(0.39, 0.44, 0.065, 0, 0.16, 0.04, -0.20),
+    makeBox(0.06, 0.26, 0.20, -0.205, 0.08, -0.09, -0.14),
+    makeBox(0.06, 0.26, 0.20, 0.205, 0.08, -0.09, -0.14),
   ];
 
-  const hullMetalParts: THREE.BufferGeometry[] = [
+  const hullMetalGeos: THREE.BufferGeometry[] = [
     makeCyl(0.022, 0.022, 0.03, 8, sensorPortL.x, sensorPortL.y + 0.002, sensorPortL.z, 0.14, 0, 0.22),
     makeCyl(0.022, 0.022, 0.03, 8, sensorPortR.x, sensorPortR.y + 0.002, sensorPortR.z, 0.14, 0, -0.22),
   ];
 
-  // Glowing side-console switch strips & throttle indicator LEDs
+  // Cockpit-only UI/controls (hidden in chase/orbit views for zero draw calls outside cockpit!)
+  const cockpitOnlyGroup = new THREE.Group();
+  cockpitOnlyGroup.visible = false;
+  group.add(cockpitOnlyGroup);
+
   const cockpitAccentParts: THREE.BufferGeometry[] = [
     makeBox(0.026, 0.008, 0.38, -0.29, 0.136, -0.34),
     makeBox(0.026, 0.008, 0.38, 0.29, 0.136, -0.34),
   ];
-
-  // UFC Illuminated Keypad Face (directly visible above Center MFD)
-  const ufcFace = new THREE.Mesh(
-    trackGeo(new THREE.PlaneGeometry(0.188, 0.092)),
-    ufcMat,
+  cockpitOnlyGroup.add(
+    new THREE.Mesh(
+      trackGeo(mergeStaticGeometries(cockpitAccentParts)),
+      cockpitAccentMat,
+    ),
   );
-  ufcFace.position.set(0, 0.415, -0.663);
-  ufcFace.rotation.x = -0.16;
-  group.add(ufcFace);
 
   // Transparent Green HUD Combiner Glass + Emissive Green Symbology Projection
   const hudGlassGeo = trackGeo(new THREE.PlaneGeometry(0.228, 0.150));
   const hudGlassMesh = new THREE.Mesh(hudGlassGeo, hudGlassTintMat);
   hudGlassMesh.position.set(0, 0.540, -0.710);
   hudGlassMesh.renderOrder = 3;
-  group.add(hudGlassMesh);
+  cockpitOnlyGroup.add(hudGlassMesh);
 
   const hudSymbologyMesh = new THREE.Mesh(hudGlassGeo, hudSymbologyMat);
   hudSymbologyMesh.position.set(0, 0.540, -0.706);
   hudSymbologyMesh.renderOrder = 4;
-  group.add(hudSymbologyMesh);
+  cockpitOnlyGroup.add(hudSymbologyMesh);
 
-  // 3 Unobstructed Side-by-Side MFD Screens (Left: Speed, Center: Radar/Attitude, Right: Altitude)
+  // Left (Speed) & Right (Altitude) MFD Screens flanking an open central view
   const sideBodyGeo = new THREE.BoxGeometry(0.174, 0.130, 0.028);
   const sideBezelGeo = new THREE.BoxGeometry(0.180, 0.136, 0.012);
   const sideScreenGeo = trackGeo(new THREE.PlaneGeometry(0.164, 0.120));
-
-  const centerBodyGeo = new THREE.BoxGeometry(0.190, 0.136, 0.028);
-  const centerBezelGeo = new THREE.BoxGeometry(0.196, 0.142, 0.012);
-  const centerScreenGeo = trackGeo(new THREE.PlaneGeometry(0.178, 0.124));
 
   const addMfdPanel = (
     xPos: number,
@@ -1375,160 +1226,104 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     const hG = bodyG.clone();
     hG.applyQuaternion(q);
     hG.translate(pos.x, pos.y, pos.z);
-    hullDarkParts.push(hG);
+    hullDarkGeos.push(hG);
 
     const bG = bezelG.clone();
     bG.translate(0, 0, 0.01);
     bG.applyQuaternion(q);
     bG.translate(pos.x, pos.y, pos.z);
-    hullGoldParts.push(bG);
+    hullGoldGeos.push(bG);
 
     const screen = new THREE.Mesh(screenG, screenMat);
     const offset = new THREE.Vector3(0, 0, 0.017).applyQuaternion(q);
     screen.position.copy(pos).add(offset);
     screen.quaternion.copy(q);
-    group.add(screen);
+    cockpitOnlyGroup.add(screen);
   };
 
   addMfdPanel(-0.214, 0.304, -0.648, 0.22, sideBodyGeo, sideBezelGeo, sideScreenGeo, speedScreen.mat);
-  addMfdPanel(0, 0.300, -0.665, 0, centerBodyGeo, centerBezelGeo, centerScreenGeo, radarScreen.mat);
   addMfdPanel(0.214, 0.304, -0.648, -0.22, sideBodyGeo, sideBezelGeo, sideScreenGeo, altScreen.mat);
 
   sideBodyGeo.dispose();
   sideBezelGeo.dispose();
-  centerBodyGeo.dispose();
-  centerBezelGeo.dispose();
 
-  group.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(hullGoldParts)), brushedGoldMat),
-  );
-  group.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(hullDarkParts)), darkTrimMat),
-  );
-  group.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(hullMetalParts)), engineMetalMat),
-  );
-  group.add(
-    new THREE.Mesh(
-      trackGeo(mergeStaticGeometries(cockpitAccentParts)),
-      cockpitAccentMat,
-    ),
-  );
+  for (let i = 0; i < hullGoldGeos.length; i++) {
+    shipBrightMetalParts.push({ geo: hullGoldGeos[i], color: COLOR_GOLD });
+  }
+  for (let i = 0; i < hullDarkGeos.length; i++) {
+    shipDarkTrimParts.push({ geo: hullDarkGeos[i], color: COLOR_DARK_TRIM });
+  }
+  for (let i = 0; i < hullMetalGeos.length; i++) {
+    shipBrightMetalParts.push({ geo: hullMetalGeos[i], color: COLOR_ENGINE_METAL });
+  }
 
-  // Low Ergonomic Center Flight Stick (Manche) between Pilot Knees (unobstructed MFDs!)
+  // Low Ergonomic Center Flight Stick (Manche) merged into 1 cockpit-only mesh
   const stickPivot = new THREE.Group();
   stickPivot.position.set(0, -0.06, -0.49);
-  group.add(stickPivot);
+  cockpitOnlyGroup.add(stickPivot);
 
-  const stickDarkGeo = trackGeo(
-    mergeStaticGeometries([
-      makeCyl(0.022, 0.018, 0.105, 8, 0, 0.175, 0.008, 0.14),
-      makeBox(0.048, 0.028, 0.042, 0, 0.23, 0.006),
+  const stickGeo = trackGeo(
+    mergeColoredGeometries([
+      { geo: makeCyl(0.022, 0.018, 0.105, 8, 0, 0.175, 0.008, 0.14), color: COLOR_DARK_TRIM },
+      { geo: makeBox(0.048, 0.028, 0.042, 0, 0.23, 0.006), color: COLOR_DARK_TRIM },
+      { geo: makeCyl(0.014, 0.017, 0.125, 8, 0, 0.062, 0), color: COLOR_ENGINE_METAL },
+      { geo: makeCyl(0.021, 0.021, 0.016, 8, 0, 0.122, 0), color: COLOR_GOLD },
+      { geo: makeBox(0.014, 0.016, 0.016, 0, 0.234, 0.026), color: COLOR_CRIMSON },
     ]),
   );
-  stickPivot.add(new THREE.Mesh(stickDarkGeo, darkTrimMat));
-  stickPivot.add(
-    new THREE.Mesh(
-      trackGeo(makeCyl(0.014, 0.017, 0.125, 8, 0, 0.062, 0)),
-      engineMetalMat,
-    ),
-  );
-  stickPivot.add(
-    new THREE.Mesh(
-      trackGeo(makeCyl(0.021, 0.021, 0.016, 8, 0, 0.122, 0)),
-      brushedGoldMat,
-    ),
-  );
-  stickPivot.add(
-    new THREE.Mesh(
-      trackGeo(makeBox(0.014, 0.016, 0.016, 0, 0.234, 0.026)),
-      crimsonMat,
-    ),
-  );
+  stickPivot.add(new THREE.Mesh(stickGeo, darkTrimMat));
 
-  const seatTanGeo = trackGeo(
-    mergeStaticGeometries([
-      makeBox(0.32, 0.055, 0.35, 0, -0.04, -0.17), // Cushion
-      makeBox(0.30, 0.36, 0.06, 0, 0.16, 0.005, -0.20), // Lumbar cushion
-      makeBox(0.22, 0.13, 0.065, 0, 0.39, 0.065, -0.12), // Headrest pad
-    ]),
+  // Seat cushions & harness straps merged directly into shipPaintedParts
+  shipPaintedParts.push(
+    { geo: makeBox(0.32, 0.055, 0.35, 0, -0.04, -0.17), color: COLOR_SEAT_TAN, atlasRegion: 'white' },
+    { geo: makeBox(0.30, 0.36, 0.06, 0, 0.16, 0.005, -0.20), color: COLOR_SEAT_TAN, atlasRegion: 'white' },
+    { geo: makeBox(0.22, 0.13, 0.065, 0, 0.39, 0.065, -0.12), color: COLOR_SEAT_TAN, atlasRegion: 'white' },
+    { geo: makeBox(0.04, 0.32, 0.025, -0.085, 0.18, -0.025, -0.20), color: COLOR_CRIMSON, atlasRegion: 'white' },
+    { geo: makeBox(0.04, 0.32, 0.025, 0.085, 0.18, -0.025, -0.20), color: COLOR_CRIMSON, atlasRegion: 'white' },
   );
-  group.add(new THREE.Mesh(seatTanGeo, seatTanMat));
-
-  const seatStrapGeo = trackGeo(
-    mergeStaticGeometries([
-      makeBox(0.04, 0.32, 0.025, -0.085, 0.18, -0.025, -0.20),
-      makeBox(0.04, 0.32, 0.025, 0.085, 0.18, -0.025, -0.20),
-    ]),
-  );
-  group.add(new THREE.Mesh(seatStrapGeo, crimsonMat));
 
   // Seated 1.66 u Astronaut Pilot inside Cockpit:
-  // - seatedLegsGroup stays visible in Cockpit View (knees framing center stick at bottom of FOV like Screenshot 3)
-  // - seatedUpperGroup is visible in exterior views when pilotSeated === true, hidden in Cockpit View
+  // - seatedLegsGroup visible only in Cockpit View when pilotSeated === true
+  // - seatedUpperGroup contains 1 merged full-pilot mesh + visor, visible in exterior views when pilotSeated === true
   const seatedLegsGroup = new THREE.Group();
   group.add(seatedLegsGroup);
 
   const seatedUpperGroup = new THREE.Group();
   group.add(seatedUpperGroup);
 
-  const thighMeshGeo = trackGeo(
-    mergeStaticPartsForSeat([
-      makeCyl(0.078, 0.066, 0.36, 8, -0.115, 0.045, -0.34, Math.PI * 0.42, 0.08, 0),
-      makeCyl(0.078, 0.066, 0.36, 8, 0.115, 0.045, -0.34, Math.PI * 0.42, -0.08, 0),
-      makeCyl(0.064, 0.058, 0.28, 8, -0.13, -0.025, -0.60, -0.28, 0, 0),
-      makeCyl(0.064, 0.058, 0.28, 8, 0.13, -0.025, -0.60, -0.28, 0, 0),
+  const makePilotLegParts = (): ColoredGeoPart[] => [
+    { geo: makeCyl(0.078, 0.066, 0.36, 8, -0.115, 0.045, -0.34, Math.PI * 0.42, 0.08, 0), color: COLOR_PILOT_WHITE },
+    { geo: makeCyl(0.078, 0.066, 0.36, 8, 0.115, 0.045, -0.34, Math.PI * 0.42, -0.08, 0), color: COLOR_PILOT_WHITE },
+    { geo: makeCyl(0.064, 0.058, 0.28, 8, -0.13, -0.025, -0.60, -0.28, 0, 0), color: COLOR_PILOT_WHITE },
+    { geo: makeCyl(0.064, 0.058, 0.28, 8, 0.13, -0.025, -0.60, -0.28, 0, 0), color: COLOR_PILOT_WHITE },
+    { geo: makeBox(0.095, 0.085, 0.11, -0.125, 0.09, -0.52, -0.28), color: COLOR_PILOT_GRAY },
+    { geo: makeBox(0.095, 0.085, 0.11, 0.125, 0.09, -0.52, -0.28), color: COLOR_PILOT_GRAY },
+  ];
+
+  const seatedLegsGeo = trackGeo(mergeColoredGeometries(makePilotLegParts()));
+  seatedLegsGroup.add(new THREE.Mesh(seatedLegsGeo, pilotSuitMat));
+
+  const pilotExteriorGeo = trackGeo(
+    mergeColoredGeometries([
+      ...makePilotLegParts(),
+      { geo: makeBox(0.31, 0.12, 0.20, 0, 0.015, -0.15, -0.18), color: COLOR_PILOT_WHITE },
+      { geo: makeBox(0.35, 0.42, 0.22, 0, 0.26, -0.08, -0.18), color: COLOR_PILOT_WHITE },
+      { geo: makeBox(0.30, 0.22, 0.06, 0, 0.31, -0.19, -0.18), color: COLOR_PILOT_WHITE },
+      { geo: makeCyl(0.052, 0.046, 0.24, 8, -0.22, 0.32, -0.16, 0.62, 0, -0.12), color: COLOR_PILOT_WHITE },
+      { geo: makeCyl(0.046, 0.040, 0.24, 8, -0.25, 0.20, -0.36, 1.38, -0.12, 0), color: COLOR_PILOT_WHITE },
+      { geo: makeCyl(0.052, 0.046, 0.24, 8, 0.22, 0.32, -0.16, 0.65, 0, 0.16), color: COLOR_PILOT_WHITE },
+      { geo: makeCyl(0.046, 0.040, 0.24, 8, 0.11, 0.21, -0.39, 1.42, 0.48, 0), color: COLOR_PILOT_WHITE },
+      { geo: makeSeatedHelmetWhiteGeo(), color: COLOR_PILOT_WHITE },
+      { geo: makeBox(0.14, 0.11, 0.025, 0, 0.32, -0.22, -0.18), color: COLOR_PILOT_GRAY },
+      { geo: makeCyl(0.128, 0.14, 0.05, 12, 0, 0.49, -0.04, -0.18), color: COLOR_PILOT_GRAY },
+      { geo: makeBox(0.20, 0.024, 0.055, 0, 0.70, -0.13), color: COLOR_PILOT_GRAY },
+      { geo: makeBox(0.34, 0.07, 0.22, 0, 0.055, -0.14, -0.18), color: COLOR_PILOT_BLACK },
+      { geo: makeBox(0.07, 0.085, 0.075, -0.27, 0.195, -0.50), color: COLOR_PILOT_BLACK },
+      { geo: makeBox(0.07, 0.085, 0.075, 0.01, 0.23, -0.54), color: COLOR_PILOT_BLACK },
+      { geo: makeBox(0.11, 0.13, 0.10, 0, 0.625, -0.055), color: COLOR_PILOT_SKIN },
     ]),
   );
-  seatedLegsGroup.add(new THREE.Mesh(thighMeshGeo, pilotWhiteMat));
-
-  const legPadGrayGeo = trackGeo(
-    mergeStaticGeometries([
-      makeBox(0.095, 0.085, 0.11, -0.125, 0.09, -0.52, -0.28),
-      makeBox(0.095, 0.085, 0.11, 0.125, 0.09, -0.52, -0.28),
-    ]),
-  );
-  seatedLegsGroup.add(new THREE.Mesh(legPadGrayGeo, pilotGrayMat));
-
-  const seatUpperWhiteGeo = trackGeo(
-    mergeStaticGeometries([
-      // Pelvis + torso reclined ~12 deg
-      makeBox(0.31, 0.12, 0.20, 0, 0.015, -0.15, -0.18),
-      makeBox(0.35, 0.42, 0.22, 0, 0.26, -0.08, -0.18),
-      makeBox(0.30, 0.22, 0.06, 0, 0.31, -0.19, -0.18),
-      // Upper arms & forearms reaching forward toward throttle (-X) and center stick (0, -0.54)
-      makeCyl(0.052, 0.046, 0.24, 8, -0.22, 0.32, -0.16, 0.62, 0, -0.12),
-      makeCyl(0.046, 0.040, 0.24, 8, -0.25, 0.20, -0.36, 1.38, -0.12, 0),
-      makeCyl(0.052, 0.046, 0.24, 8, 0.22, 0.32, -0.16, 0.65, 0, 0.16),
-      makeCyl(0.046, 0.040, 0.24, 8, 0.11, 0.21, -0.39, 1.42, 0.48, 0),
-      // Helmet outer white shell (opening facing -Z forward!)
-      makeSeatedHelmetWhiteGeo(),
-    ]),
-  );
-  seatedUpperGroup.add(new THREE.Mesh(seatUpperWhiteGeo, pilotWhiteMat));
-
-  const seatUpperGrayGeo = trackGeo(
-    mergeStaticGeometries([
-      makeBox(0.14, 0.11, 0.025, 0, 0.32, -0.22, -0.18),
-      makeCyl(0.128, 0.14, 0.05, 12, 0, 0.49, -0.04, -0.18),
-      makeBox(0.20, 0.024, 0.055, 0, 0.70, -0.13),
-    ]),
-  );
-  seatedUpperGroup.add(new THREE.Mesh(seatUpperGrayGeo, pilotGrayMat));
-
-  const seatUpperBlackGeo = trackGeo(
-    mergeStaticGeometries([
-      makeBox(0.34, 0.07, 0.22, 0, 0.055, -0.14, -0.18), // Utility belt
-      makeBox(0.07, 0.085, 0.075, -0.27, 0.195, -0.50), // Left glove on throttle
-      makeBox(0.07, 0.085, 0.075, 0.01, 0.23, -0.54), // Right glove on stick
-    ]),
-  );
-  seatedUpperGroup.add(new THREE.Mesh(seatUpperBlackGeo, pilotBlackMat));
-
-  const seatPilotFaceGeo = trackGeo(
-    makeBox(0.11, 0.13, 0.10, 0, 0.625, -0.055),
-  );
-  seatedUpperGroup.add(new THREE.Mesh(seatPilotFaceGeo, pilotSkinMat));
+  seatedUpperGroup.add(new THREE.Mesh(pilotExteriorGeo, pilotSuitMat));
 
   const seatVisorGeo = trackGeo(
     new THREE.SphereGeometry(
@@ -1557,15 +1352,43 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   canopy.renderOrder = 2;
   group.add(canopy);
 
-  // 3. Exterior parts (hidden in cockpit camera & merged per material for high FPS!)
+  // 3. Exterior dynamic parts (hidden in cockpit camera) + collider bounds
   const exteriorPartsGroup = new THREE.Group();
   group.add(exteriorPartsGroup);
 
-  const extIvoryParts: THREE.BufferGeometry[] = [];
-  const extGoldParts: THREE.BufferGeometry[] = [];
-  const extDarkParts: THREE.BufferGeometry[] = [];
-  const extMetalParts: THREE.BufferGeometry[] = [];
-  const extCrimsonParts: THREE.BufferGeometry[] = [];
+  const colliders: ShipColliderBox[] = [];
+  const measureGroupBox = (
+    id: string,
+    geos: THREE.BufferGeometry[],
+    extraObjects: THREE.Object3D[] = [],
+    pad = 0.15,
+    requiresGear = false,
+  ): ShipColliderBox => {
+    const tmpGroup = new THREE.Group();
+    for (let i = 0; i < geos.length; i++) {
+      tmpGroup.add(new THREE.Mesh(geos[i], darkTrimMat));
+    }
+    tmpGroup.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(tmpGroup);
+    for (let i = 0; i < extraObjects.length; i++) {
+      extraObjects[i].updateMatrixWorld(true);
+      const subBox = new THREE.Box3().setFromObject(extraObjects[i]);
+      box.union(subBox);
+    }
+    box.expandByScalar(pad);
+    return {
+      id,
+      min: box.min.clone(),
+      max: box.max.clone(),
+      requiresGear,
+    };
+  };
+
+  const extIvoryGeos: THREE.BufferGeometry[] = [];
+  const extGoldGeos: THREE.BufferGeometry[] = [];
+  const extDarkGeos: THREE.BufferGeometry[] = [];
+  const extMetalGeos: THREE.BufferGeometry[] = [];
+  const extCrimsonGeos: THREE.BufferGeometry[] = [];
   const extNozzleInnerParts: THREE.BufferGeometry[] = [];
 
   // Aft Dorsal Spine Cowl + Stripes + Flush Hull Collars
@@ -1586,16 +1409,25 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     0.05,
   );
   spineGeo.translate(0, 0.50, 1.66);
-  extIvoryParts.push(spineGeo);
+  extIvoryGeos.push(spineGeo);
 
-  extCrimsonParts.push(
+  const noseMeasureGeo = buildLoftedFuselageGeometry(0, 0.16, 8, 16, 0, false);
+  const hullMeasureGeo = buildLoftedFuselageGeometry(0.16, 1, 18, 20, 0, true);
+  colliders.push(measureGroupBox('nose', [noseMeasureGeo]));
+  colliders.push(
+    measureGroupBox('fuselage', [hullMeasureGeo, spineGeo], [canopy]),
+  );
+  noseMeasureGeo.dispose();
+  hullMeasureGeo.dispose();
+
+  extCrimsonGeos.push(
     makeBox(0.22, 0.018, 1.98, 0, 0.555, 1.75),
     makeBox(0.05, 0.018, 1.95, -0.19, 0.555, 1.75),
     makeBox(0.05, 0.018, 1.95, 0.19, 0.555, 1.75),
   );
 
   // Aft spine & tail hull collars hugging exact geometry
-  extGoldParts.push(
+  extGoldGeos.push(
     new THREE.TubeGeometry(
       new THREE.CatmullRomCurve3([
         hullSurfacePointAt(0.66, -Math.PI * 0.49, 0.002),
@@ -1642,7 +1474,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   ];
 
   for (const side of [-1, 1] as const) {
-    // Flush beltline gold seam rail following exact hull equator from Nose M-arch to Tail Collar
     const beltSamples: Array<[number, number]> = [];
     for (let k = 0; k <= 12; k++) {
       beltSamples.push([
@@ -1650,67 +1481,104 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
         side * Math.PI * 0.49,
       ]);
     }
-    extGoldParts.push(buildHullSurfaceTube(beltSamples, 0.016, 0.003, 24));
+    extGoldGeos.push(buildHullSurfaceTube(beltSamples, 0.016, 0.003, 24));
 
-    // Wing-root pylon & engine pod
-    extIvoryParts.push(makeBox(0.58, 0.25, 1.15, side * 0.99, 0.03, 1.25));
+    const pylonGeo = makeBox(0.58, 0.25, 1.15, side * 0.99, 0.03, 1.25);
     const podG = makeExtrudedSideShape(podPoints, side, 0.38, 0.075, 0.07);
     podG.translate(side * 1.44, 0.22, 1.28);
-    extIvoryParts.push(podG);
+    extIvoryGeos.push(pylonGeo, podG);
 
-    // Intake bezel, recess & turbine fan
-    extGoldParts.push(
-      makeBox(0.73, 0.48, 0.22, side * 1.44, 0.03, 0.22, 0, side * -0.32),
-      makeBox(0.67, 0.095, 0.12, side * 1.44, 0.22, 2.46),
+    const intakeGold1 = makeBox(0.73, 0.48, 0.22, side * 1.44, 0.03, 0.22, 0, side * -0.32);
+    const intakeGold2 = makeBox(0.67, 0.095, 0.12, side * 1.44, 0.22, 2.46);
+    const intakeDark = makeBox(0.57, 0.32, 0.25, side * 1.44, 0.03, 0.19, 0, side * -0.32);
+    const intakeMetal = makeCyl(0.13, 0.145, 0.16, 10, side * 1.44, 0.03, 0.14, Math.PI / 2, side * -0.32);
+    extGoldGeos.push(intakeGold1, intakeGold2);
+    extDarkGeos.push(intakeDark);
+    extMetalGeos.push(intakeMetal);
+
+    const podNozzleGeo = new THREE.LatheGeometry(
+      [
+        new THREE.Vector2(0.08, -0.40),
+        new THREE.Vector2(0.38, -0.32),
+        new THREE.Vector2(0.41, 0.19),
+        new THREE.Vector2(0.34, 0.54),
+        new THREE.Vector2(0.26, 0.54),
+        new THREE.Vector2(0.22, 0.32),
+      ],
+      12,
     );
-    extDarkParts.push(
-      makeBox(0.57, 0.32, 0.25, side * 1.44, 0.03, 0.19, 0, side * -0.32),
-    );
-    extMetalParts.push(
-      makeCyl(0.13, 0.145, 0.16, 10, side * 1.44, 0.03, 0.14, Math.PI / 2, side * -0.32),
+    podNozzleGeo.rotateX(Math.PI / 2);
+    podNozzleGeo.scale(0.62, 0.62, 0.72);
+    podNozzleGeo.translate(side * 1.44, 0.03, 2.46);
+    const podNozzleGlow = makeCyl(0.135, 0.135, 0.075, 10, side * 1.44, 0.03, 2.78, Math.PI / 2);
+    extMetalGeos.push(podNozzleGeo);
+    extNozzleInnerParts.push(podNozzleGlow);
+
+    colliders.push(
+      measureGroupBox(side < 0 ? 'pod-left' : 'pod-right', [
+        pylonGeo,
+        podG,
+        intakeGold1,
+        intakeGold2,
+        intakeDark,
+        intakeMetal,
+        podNozzleGeo,
+        podNozzleGlow,
+      ]),
     );
 
-    // Swept Outer Wing & Flush Leading-Edge Gold Trim
     const wingG = makeExtrudedSideShape(wingPoints, side, 0.12, 0.04, 0.04);
     wingG.translate(side * 1.79, 0.055, 1.47);
-    extIvoryParts.push(wingG);
+    const wingTrim = new THREE.TubeGeometry(
+      new THREE.CatmullRomCurve3([
+        new THREE.Vector3(side * 1.79, -0.005, 0.91),
+        new THREE.Vector3(side * 3.58, -0.005, 1.69),
+        new THREE.Vector3(side * 3.52, -0.005, 2.30),
+      ]),
+      12,
+      0.022,
+      7,
+      false,
+    );
+    extIvoryGeos.push(wingG);
+    extGoldGeos.push(wingTrim);
 
-    extGoldParts.push(
-      new THREE.TubeGeometry(
-        new THREE.CatmullRomCurve3([
-          new THREE.Vector3(side * 1.79, -0.005, 0.91),
-          new THREE.Vector3(side * 3.58, -0.005, 1.69),
-          new THREE.Vector3(side * 3.52, -0.005, 2.30),
-        ]),
-        12,
-        0.022,
-        7,
-        false,
-      ),
+    colliders.push(
+      measureGroupBox(side < 0 ? 'wing-left' : 'wing-right', [
+        wingG,
+        wingTrim,
+      ]),
     );
 
-    // Twin Under-Wing Laser Cannon Pods (matching WeaponsSystem muzzle at x = +-2.65, y = -0.15, z = +0.22)
     const wx = side * 2.65;
-    extIvoryParts.push(makeBox(0.12, 0.10, 0.70, wx, -0.08, 1.52)); // Mounting pylon under wing
-    extDarkParts.push(
-      makeBox(0.21, 0.15, 0.90, wx, -0.15, 1.45), // Armored gun pod housing
-      makeCyl(0.076, 0.102, 0.22, 8, wx, -0.15, 0.90, Math.PI / 2), // Nose fairing
-    );
-    extGoldParts.push(
-      makeCyl(0.072, 0.072, 0.10, 8, wx, -0.15, 0.74, Math.PI / 2), // Cooling collar
-    );
-    extCrimsonParts.push(
-      makeBox(0.22, 0.042, 0.38, wx, -0.15, 1.52), // Side accent stripe
-    );
-    extMetalParts.push(
-      makeCyl(0.034, 0.044, 0.64, 8, wx, -0.15, 0.54, Math.PI / 2), // Forward laser barrel (tip at z = +0.22)
-    );
-    extNozzleInnerParts.push(
-      makeCyl(0.026, 0.026, 0.04, 8, wx, -0.15, 0.21, Math.PI / 2), // Glowing muzzle emitter
+    const cPylon = makeBox(0.12, 0.10, 0.70, wx, -0.08, 1.52);
+    const cPod = makeBox(0.21, 0.15, 0.90, wx, -0.15, 1.45);
+    const cFairing = makeCyl(0.076, 0.102, 0.22, 8, wx, -0.15, 0.90, Math.PI / 2);
+    const cCollar = makeCyl(0.072, 0.072, 0.10, 8, wx, -0.15, 0.74, Math.PI / 2);
+    const cStripe = makeBox(0.22, 0.042, 0.38, wx, -0.15, 1.52);
+    const cBarrel = makeCyl(0.034, 0.044, 0.64, 8, wx, -0.15, 0.54, Math.PI / 2);
+    const cEmitter = makeCyl(0.026, 0.026, 0.04, 8, wx, -0.15, 0.21, Math.PI / 2);
+    extIvoryGeos.push(cPylon);
+    extDarkGeos.push(cPod, cFairing);
+    extGoldGeos.push(cCollar);
+    extCrimsonGeos.push(cStripe);
+    extMetalGeos.push(cBarrel);
+    extNozzleInnerParts.push(cEmitter);
+
+    colliders.push(
+      measureGroupBox(side < 0 ? 'cannon-left' : 'cannon-right', [
+        cPylon,
+        cPod,
+        cFairing,
+        cCollar,
+        cStripe,
+        cBarrel,
+        cEmitter,
+      ]),
     );
   }
 
-  // Main Engine Nozzle + Twin Pod Auxiliary Nozzles (LatheGeometry scaled 1.6x)
+  // Main Engine Nozzle (LatheGeometry scaled 1.6x)
   const mainNozzleProfile = [
     new THREE.Vector2(0.08, -0.40),
     new THREE.Vector2(0.38, -0.32),
@@ -1722,41 +1590,51 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   const mainNozzleGeo = new THREE.LatheGeometry(mainNozzleProfile, 14);
   mainNozzleGeo.rotateX(Math.PI / 2);
   mainNozzleGeo.translate(0, 0.06, 2.98);
-  extMetalParts.push(mainNozzleGeo);
+  const mainNozzleGlow = makeCyl(0.22, 0.22, 0.09, 12, 0, 0.06, 3.44, Math.PI / 2);
+  extMetalGeos.push(mainNozzleGeo);
+  extNozzleInnerParts.push(mainNozzleGlow);
 
-  for (const side of [-1, 1] as const) {
-    const podNozzleGeo = new THREE.LatheGeometry(mainNozzleProfile, 12);
-    podNozzleGeo.rotateX(Math.PI / 2);
-    podNozzleGeo.scale(0.62, 0.62, 0.72);
-    podNozzleGeo.translate(side * 1.44, 0.03, 2.46);
-    extMetalParts.push(podNozzleGeo);
+  colliders.push(
+    measureGroupBox('tail', [mainNozzleGeo, mainNozzleGlow]),
+  );
+
+  for (let i = 0; i < extIvoryGeos.length; i++) {
+    shipPaintedParts.push({ geo: extIvoryGeos[i], color: COLOR_WHITE, atlasRegion: 'wing' });
+  }
+  for (let i = 0; i < extCrimsonGeos.length; i++) {
+    shipPaintedParts.push({ geo: extCrimsonGeos[i], color: COLOR_CRIMSON, atlasRegion: 'white' });
+  }
+  for (let i = 0; i < extGoldGeos.length; i++) {
+    shipBrightMetalParts.push({ geo: extGoldGeos[i], color: COLOR_GOLD });
+  }
+  for (let i = 0; i < extMetalGeos.length; i++) {
+    shipBrightMetalParts.push({ geo: extMetalGeos[i], color: COLOR_ENGINE_METAL });
+  }
+  for (let i = 0; i < extDarkGeos.length; i++) {
+    shipDarkTrimParts.push({ geo: extDarkGeos[i], color: COLOR_DARK_TRIM });
   }
 
-  extNozzleInnerParts.push(
-    makeCyl(0.22, 0.22, 0.09, 12, 0, 0.06, 3.44, Math.PI / 2),
-    makeCyl(0.135, 0.135, 0.075, 10, -1.44, 0.03, 2.78, Math.PI / 2),
-    makeCyl(0.135, 0.135, 0.075, 10, 1.44, 0.03, 2.78, Math.PI / 2),
+  // Merged static meshes (3 opaque draw calls total for entire airframe + cockpit + trim!)
+  const shipMainMesh = new THREE.Mesh(
+    trackGeo(mergeColoredGeometries(shipPaintedParts)),
+    shipPaintedMat,
+  );
+  shipMainMesh.castShadow = !isMobileOrSoftware;
+  group.add(shipMainMesh);
+
+  group.add(
+    new THREE.Mesh(
+      trackGeo(mergeColoredGeometries(shipBrightMetalParts)),
+      brightMetalMat,
+    ),
+  );
+  group.add(
+    new THREE.Mesh(
+      trackGeo(mergeColoredGeometries(shipDarkTrimParts)),
+      darkTrimMat,
+    ),
   );
 
-  const exteriorIvoryMesh = new THREE.Mesh(
-    trackGeo(mergeStaticGeometries(extIvoryParts)),
-    wingIvoryMat,
-  );
-  exteriorIvoryMesh.castShadow = !isMobileOrSoftware;
-  exteriorPartsGroup.add(exteriorIvoryMesh);
-
-  exteriorPartsGroup.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(extGoldParts)), brushedGoldMat),
-  );
-  exteriorPartsGroup.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(extDarkParts)), darkTrimMat),
-  );
-  exteriorPartsGroup.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(extMetalParts)), engineMetalMat),
-  );
-  exteriorPartsGroup.add(
-    new THREE.Mesh(trackGeo(mergeStaticGeometries(extCrimsonParts)), crimsonMat),
-  );
   exteriorPartsGroup.add(
     new THREE.Mesh(
       trackGeo(mergeStaticGeometries(extNozzleInnerParts)),
@@ -1764,7 +1642,7 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     ),
   );
 
-  // 7. Dynamic Multi-Layer Thruster Exhaust Plumes + Mach Shock Ring (1.6x)
+  // 7. Instanced Multi-Layer Thruster Exhaust Plumes + Mach Shock Ring (2 instanced draws + 1 ring)
   const coreFlameGeo = trackGeo(new THREE.ConeGeometry(0.10, 1.25, 10, 1, true));
   coreFlameGeo.rotateX(Math.PI / 2);
   coreFlameGeo.translate(0, 0, 0.62);
@@ -1773,32 +1651,51 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   outerFlameGeo.rotateX(Math.PI / 2);
   outerFlameGeo.translate(0, 0, 1.08);
 
-  const mainCoreFlame = new THREE.Mesh(coreFlameGeo, flameMaterial);
-  mainCoreFlame.position.set(0, 0.06, 3.46);
-  exteriorPartsGroup.add(mainCoreFlame);
+  const coreFlamesInstanced = new THREE.InstancedMesh(coreFlameGeo, flameMaterial, 3);
+  coreFlamesInstanced.frustumCulled = false;
+  exteriorPartsGroup.add(coreFlamesInstanced);
 
-  const mainOuterFlame = new THREE.Mesh(outerFlameGeo, outerPlumeMaterial);
-  mainOuterFlame.position.set(0, 0.06, 3.46);
-  mainOuterFlame.renderOrder = 3;
-  exteriorPartsGroup.add(mainOuterFlame);
+  const outerFlamesInstanced = new THREE.InstancedMesh(outerFlameGeo, outerPlumeMaterial, 3);
+  outerFlamesInstanced.frustumCulled = false;
+  outerFlamesInstanced.renderOrder = 3;
+  exteriorPartsGroup.add(outerFlamesInstanced);
 
-  const leftCoreFlame = new THREE.Mesh(coreFlameGeo, flameMaterial);
-  leftCoreFlame.position.set(-1.44, 0.03, 2.80);
-  exteriorPartsGroup.add(leftCoreFlame);
+  const _flameMat4 = new THREE.Matrix4();
+  const writeFlameMatrices = (
+    mainW: number,
+    mainL: number,
+    podW: number,
+    podL: number,
+    coreW: number,
+    coreL: number,
+  ) => {
+    _flameMat4.makeScale(mainW * 0.9, mainW * 0.9, mainL * 0.85);
+    _flameMat4.setPosition(0, 0.06, 3.46);
+    coreFlamesInstanced.setMatrixAt(0, _flameMat4);
 
-  const rightCoreFlame = new THREE.Mesh(coreFlameGeo, flameMaterial);
-  rightCoreFlame.position.set(1.44, 0.03, 2.80);
-  exteriorPartsGroup.add(rightCoreFlame);
+    _flameMat4.makeScale(coreW, coreW, coreL);
+    _flameMat4.setPosition(-1.44, 0.03, 2.80);
+    coreFlamesInstanced.setMatrixAt(1, _flameMat4);
+    _flameMat4.setPosition(1.44, 0.03, 2.80);
+    coreFlamesInstanced.setMatrixAt(2, _flameMat4);
+    coreFlamesInstanced.instanceMatrix.needsUpdate = true;
 
-  const leftFlame = new THREE.Mesh(outerFlameGeo, outerPlumeMaterial);
-  leftFlame.position.set(-1.44, 0.03, 2.80);
-  leftFlame.renderOrder = 3;
-  exteriorPartsGroup.add(leftFlame);
+    _flameMat4.makeScale(mainW, mainW, mainL);
+    _flameMat4.setPosition(0, 0.06, 3.46);
+    outerFlamesInstanced.setMatrixAt(0, _flameMat4);
 
-  const rightFlame = new THREE.Mesh(outerFlameGeo, outerPlumeMaterial);
-  rightFlame.position.set(1.44, 0.03, 2.80);
-  rightFlame.renderOrder = 3;
-  exteriorPartsGroup.add(rightFlame);
+    _flameMat4.makeScale(podW, podW, podL);
+    _flameMat4.setPosition(-1.44, 0.03, 2.80);
+    outerFlamesInstanced.setMatrixAt(1, _flameMat4);
+    _flameMat4.setPosition(1.44, 0.03, 2.80);
+    outerFlamesInstanced.setMatrixAt(2, _flameMat4);
+    outerFlamesInstanced.instanceMatrix.needsUpdate = true;
+  };
+  writeFlameMatrices(1.28, 0.3, 0.61, 0.2, 0.52, 0.2);
+
+  // Detached proxy handles so FlightPhysics writes leftFlame/rightFlame without extra draw calls
+  const leftFlame = new THREE.Mesh(coreFlameGeo, flameMaterial);
+  const rightFlame = new THREE.Mesh(coreFlameGeo, flameMaterial);
 
   const machRingGeo = trackGeo(new THREE.RingGeometry(0.17, 0.25, 12));
   const centerRing = new THREE.Mesh(machRingGeo, machRingMaterial);
@@ -1822,43 +1719,25 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   reentryShield.renderOrder = 4;
   group.add(reentryShield);
 
-  // 9. Retractable Tricycle Landing Gear (GEAR_REST_HEIGHT = 1.08)
-  const landingGear = new THREE.Group();
-  landingGear.visible = false;
-  exteriorPartsGroup.add(landingGear);
-
+  // 9. Retractable Tricycle Landing Gear (1 instanced draw call when extended)
   const gearPivotY = -0.28;
   const gearReach = GEAR_REST_HEIGHT + gearPivotY; // 0.80
   const footHeight = 0.055;
   const strutLen = 0.42;
   const pistonLen = Math.max(0.18, gearReach - strutLen * 0.92 - footHeight * 0.5);
 
-  const legDarkGeo = trackGeo(
-    mergeStaticGeometries([
-      makeCyl(0.042, 0.036, strutLen, 8, 0, -strutLen * 0.5, 0),
-      makeCyl(
-        0.115,
-        0.145,
-        footHeight,
-        10,
-        0,
-        -(gearReach - footHeight * 0.5),
-        0,
-      ),
-    ]),
-  );
-  const legMetalGeo = trackGeo(
-    mergeStaticGeometries([
-      makeCyl(0.05, 0.05, 0.055, 8, 0, -strutLen * 0.92, 0),
-      makeCyl(
-        0.025,
-        0.028,
-        pistonLen,
-        8,
-        0,
-        -(gearReach - footHeight - pistonLen * 0.5),
-        0,
-      ),
+  const legGeo = trackGeo(
+    mergeColoredGeometries([
+      { geo: makeCyl(0.042, 0.036, strutLen, 8, 0, -strutLen * 0.5, 0), color: COLOR_DARK_TRIM },
+      {
+        geo: makeCyl(0.115, 0.145, footHeight, 10, 0, -(gearReach - footHeight * 0.5), 0),
+        color: COLOR_DARK_TRIM,
+      },
+      { geo: makeCyl(0.05, 0.05, 0.055, 8, 0, -strutLen * 0.92, 0), color: COLOR_ENGINE_METAL },
+      {
+        geo: makeCyl(0.025, 0.028, pistonLen, 8, 0, -(gearReach - footHeight - pistonLen * 0.5), 0),
+        color: COLOR_ENGINE_METAL,
+      },
     ]),
   );
 
@@ -1867,31 +1746,53 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     [-1.32, 1.30],
     [1.32, 1.30],
   ];
-  const gearLegs: THREE.Group[] = [];
+  const gearInstanced = new THREE.InstancedMesh(legGeo, darkTrimMat, gearLegOffsets.length);
+  gearInstanced.frustumCulled = false;
+  gearInstanced.visible = false;
+  exteriorPartsGroup.add(gearInstanced);
 
+  legGeo.computeBoundingBox();
+  const legLocalBox = legGeo.boundingBox!;
   for (let i = 0; i < gearLegOffsets.length; i++) {
     const [gx, gz] = gearLegOffsets[i];
-    const legGroup = new THREE.Group();
-    legGroup.position.set(gx, gearPivotY, gz);
-    legGroup.scale.setScalar(0.001);
-    legGroup.add(new THREE.Mesh(legDarkGeo, darkTrimMat));
-    legGroup.add(new THREE.Mesh(legMetalGeo, engineMetalMat));
-    landingGear.add(legGroup);
-    gearLegs.push(legGroup);
+    colliders.push({
+      id: `gear-${i}`,
+      min: new THREE.Vector3(
+        gx + legLocalBox.min.x - 0.15,
+        gearPivotY + legLocalBox.min.y - 0.15,
+        gz + legLocalBox.min.z - 0.15,
+      ),
+      max: new THREE.Vector3(
+        gx + legLocalBox.max.x + 0.15,
+        gearPivotY + legLocalBox.max.y + 0.15,
+        gz + legLocalBox.max.z + 0.15,
+      ),
+      requiresGear: true,
+    });
   }
 
+  const _gearMat4 = new THREE.Matrix4();
+  let lastGearSmooth = -1;
   const setGearExtension = (t: number) => {
     const s = THREE.MathUtils.smoothstep(THREE.MathUtils.clamp(t, 0, 1), 0, 1);
     if (s < 0.02) {
-      landingGear.visible = false;
+      gearInstanced.visible = false;
+      lastGearSmooth = 0;
       return;
     }
-    landingGear.visible = true;
+    gearInstanced.visible = true;
+    if (Math.abs(s - lastGearSmooth) < 0.0005) return;
+    lastGearSmooth = s;
     const xzScale = 0.4 + 0.6 * s;
-    for (let i = 0; i < gearLegs.length; i++) {
-      gearLegs[i].scale.set(xzScale, s, xzScale);
+    for (let i = 0; i < gearLegOffsets.length; i++) {
+      const [gx, gz] = gearLegOffsets[i];
+      _gearMat4.makeScale(xzScale, s, xzScale);
+      _gearMat4.setPosition(gx, gearPivotY, gz);
+      gearInstanced.setMatrixAt(i, _gearMat4);
     }
+    gearInstanced.instanceMatrix.needsUpdate = true;
   };
+  setGearExtension(0);
 
   // 10. Dynamic Thruster Glow Light
   let thrusterLight: THREE.PointLight | null = null;
@@ -1914,7 +1815,7 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
   let lastSpaceState = false;
 
   const syncPilotVisibility = () => {
-    seatedLegsGroup.visible = pilotSeated;
+    seatedLegsGroup.visible = pilotSeated && cockpitActive;
     seatedUpperGroup.visible = pilotSeated && !cockpitActive;
   };
   syncPilotVisibility();
@@ -1924,6 +1825,9 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     const showExterior = !active;
     if (exteriorPartsGroup.visible !== showExterior) {
       exteriorPartsGroup.visible = showExterior;
+    }
+    if (cockpitOnlyGroup.visible !== active) {
+      cockpitOnlyGroup.visible = active;
     }
     syncPilotVisibility();
   };
@@ -1944,13 +1848,13 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     pitchRad = 0,
     rollRad = 0,
     headingDeg = 0,
-    targetBearingDeg = 0,
+    _targetBearingDeg = 0,
   ) => {
+    if (!cockpitActive) return;
+
     stickRoll = THREE.MathUtils.damp(stickRoll, turnInput * 0.36, 12, dt);
     stickPitch = THREE.MathUtils.damp(stickPitch, pitchInput * 0.32, 12, dt);
     stickPivot.rotation.set(stickPitch, 0, stickRoll);
-
-    if (!cockpitActive) return;
 
     const speedRounded = Math.max(0, Math.round(speed));
     const speedText = String(speedRounded);
@@ -1986,13 +1890,32 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
     hudUpdateAccum += dt;
     if (hudUpdateAccum >= 0.08) {
       hudUpdateAccum = 0;
-      drawRadarConsole(pitchRad, rollRad, headingDeg, targetBearingDeg);
       drawHudCombiner(speed, altitude, headingDeg, pitchRad, rollRad);
     }
   };
 
+  if (import.meta.env.DEV && !loggedShipMeshStats) {
+    loggedShipMeshStats = true;
+    const rawPartsBefore =
+      shipPaintedParts.length +
+      shipBrightMetalParts.length +
+      shipDarkTrimParts.length +
+      extNozzleInnerParts.length +
+      cockpitAccentParts.length +
+      5 /*stick*/ +
+      22 /*pilot*/ +
+      12 /*gearLegs*/ +
+      14; /*individual meshes*/
+    let meshesAfter = 0;
+    group.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) meshesAfter++;
+    });
+    console.log(`[Models] createShipModel: ${rawPartsBefore} -> ${meshesAfter} meshes`);
+  }
+
   return {
     group,
+    colliders,
     leftFlame,
     rightFlame,
     thrusterLight,
@@ -2024,25 +1947,23 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
       }
 
       const showFlames = leftFlame.visible;
-      leftCoreFlame.visible = showFlames;
-      rightCoreFlame.visible = rightFlame.visible;
-      mainCoreFlame.visible = showFlames;
-      mainOuterFlame.visible = showFlames;
+      coreFlamesInstanced.visible = showFlames;
+      outerFlamesInstanced.visible = showFlames;
 
       const podWidth = leftFlame.scale.x * 0.72;
       const podLength = leftFlame.scale.z * 0.78;
       leftFlame.scale.set(podWidth, podWidth, podLength);
       rightFlame.scale.set(podWidth, podWidth, podLength);
 
-      const coreLength = leftFlame.scale.z * 0.82;
+      const coreLength = podLength * 0.82;
       const coreWidth = (0.72 + thrustPower * 0.28) * 0.72;
-      leftCoreFlame.scale.set(coreWidth, coreWidth, coreLength);
-      rightCoreFlame.scale.set(coreWidth, coreWidth, coreLength);
 
       const mainW = 1.28 + thrustPower * 0.34;
-      const mainL = Math.max(0.28, leftFlame.scale.z * 1.48);
-      mainOuterFlame.scale.set(mainW, mainW, mainL);
-      mainCoreFlame.scale.set(mainW * 0.9, mainW * 0.9, mainL * 0.85);
+      const mainL = Math.max(0.28, podLength * 1.48);
+
+      if (showFlames) {
+        writeFlameMatrices(mainW, mainL, podWidth, podLength, coreWidth, coreLength);
+      }
 
       const showRing = showFlames && thrustPower > 0.25;
       centerRing.visible = showRing;
@@ -2068,12 +1989,6 @@ export function createShipModel(isMobileOrSoftware: boolean): ShipModelHandle {
       textures.forEach((t) => t.dispose());
     },
   };
-}
-
-function mergeStaticPartsForSeat(
-  parts: THREE.BufferGeometry[],
-): THREE.BufferGeometry {
-  return mergeStaticGeometries(parts);
 }
 
 function makeSeatedHelmetWhiteGeo(): THREE.BufferGeometry {
@@ -2194,6 +2109,15 @@ export function createBeaconModel(): BeaconModelHandle {
   const beam = new THREE.Mesh(beamGeo, beamMat);
   beam.position.y = 14;
   group.add(beam);
+
+  if (import.meta.env.DEV && !loggedBeaconMeshStats) {
+    loggedBeaconMeshStats = true;
+    let meshesAfter = 0;
+    group.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) meshesAfter++;
+    });
+    console.log(`[Models] createBeaconModel: 5 -> ${meshesAfter} meshes`);
+  }
 
   return {
     group,

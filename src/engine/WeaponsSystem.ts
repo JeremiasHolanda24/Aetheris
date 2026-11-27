@@ -64,6 +64,7 @@ export interface WeaponsStepParams {
  * and collision checks against beacon, planet terrain, and moon.
  */
 export class WeaponsSystem {
+  public readonly root = new THREE.Group();
   private readonly scene: THREE.Scene;
   private readonly soundEngine: SoundEngine;
 
@@ -80,6 +81,8 @@ export class WeaponsSystem {
   constructor(scene: THREE.Scene, soundEngine: SoundEngine) {
     this.scene = scene;
     this.soundEngine = soundEngine;
+    this.root.userData.perfTag = 'fx';
+    this.scene.add(this.root);
 
     this.boltGeo = new THREE.CylinderGeometry(0.11, 0.14, 3.6, 6);
     this.boltGeo.rotateX(Math.PI / 2);
@@ -104,7 +107,7 @@ export class WeaponsSystem {
         i % 2 === 0 ? this.boltCyanMat : this.boltVioletMat,
       );
       mesh.visible = false;
-      this.scene.add(mesh);
+      this.root.add(mesh);
       this.bolts.push({
         mesh,
         pos: new THREE.Vector3(),
@@ -126,7 +129,7 @@ export class WeaponsSystem {
       });
       const mesh = new THREE.Mesh(this.burstGeo, material);
       mesh.visible = false;
-      this.scene.add(mesh);
+      this.root.add(mesh);
       this.bursts.push({
         mesh,
         material,
@@ -137,6 +140,41 @@ export class WeaponsSystem {
         baseOpacity: 0.95,
         active: false,
       });
+    }
+  }
+
+  private warmupSavedBolt0Visible = false;
+  private warmupSavedBolt1Visible = false;
+  private warmupSavedBurst0Visible = false;
+  private warmupSavedBurst0Opacity = 0;
+
+  public prepareForShaderWarmup(): void {
+    if (this.bolts.length > 0) {
+      this.warmupSavedBolt0Visible = this.bolts[0].mesh.visible;
+      this.bolts[0].mesh.visible = true;
+    }
+    if (this.bolts.length > 1) {
+      this.warmupSavedBolt1Visible = this.bolts[1].mesh.visible;
+      this.bolts[1].mesh.visible = true;
+    }
+    if (this.bursts.length > 0) {
+      this.warmupSavedBurst0Visible = this.bursts[0].mesh.visible;
+      this.warmupSavedBurst0Opacity = this.bursts[0].material.opacity;
+      this.bursts[0].material.opacity = 0.5;
+      this.bursts[0].mesh.visible = true;
+    }
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    if (this.bolts.length > 0) {
+      this.bolts[0].mesh.visible = this.warmupSavedBolt0Visible;
+    }
+    if (this.bolts.length > 1) {
+      this.bolts[1].mesh.visible = this.warmupSavedBolt1Visible;
+    }
+    if (this.bursts.length > 0) {
+      this.bursts[0].mesh.visible = this.warmupSavedBurst0Visible;
+      this.bursts[0].material.opacity = this.warmupSavedBurst0Opacity;
     }
   }
 
@@ -405,12 +443,13 @@ export class WeaponsSystem {
 
   public dispose(): void {
     for (const bolt of this.bolts) {
-      this.scene.remove(bolt.mesh);
+      this.root.remove(bolt.mesh);
     }
     for (const burst of this.bursts) {
-      this.scene.remove(burst.mesh);
+      this.root.remove(burst.mesh);
       burst.material.dispose();
     }
+    this.scene.remove(this.root);
     this.boltGeo.dispose();
     this.boltCyanMat.dispose();
     this.boltVioletMat.dispose();

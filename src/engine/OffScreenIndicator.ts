@@ -12,13 +12,15 @@ const _indColor = new THREE.Color();
  * Projects a 3D world target into viewport coordinates, clamping off-screen targets
  * to the configured margin with directional arrow angle and distance color gradient.
  */
-export function computeOffScreenIndicator(
+export function computeOffScreenIndicatorInto(
   camera: THREE.Camera,
   targetWorld: THREE.Vector3,
   viewportW: number,
   viewportH: number,
   indicatorMargin: number,
-): OffScreenIndicatorState {
+  out: OffScreenIndicatorState,
+  fixedColorHex?: string,
+): void {
   _viewPos.copy(targetWorld).applyMatrix4(camera.matrixWorldInverse);
   const isBehind = _viewPos.z > 0;
 
@@ -40,20 +42,25 @@ export function computeOffScreenIndicator(
     sy <= viewportH - 12;
 
   const dist = camera.position.distanceTo(targetWorld);
-  const t = THREE.MathUtils.clamp(dist / 220, 0, 1);
-  _indColor.lerpColors(_nearColor, _farColor, t);
-  const colorHex = `#${_indColor.getHexString()}`;
+  let colorHex: string;
+  if (fixedColorHex) {
+    colorHex = fixedColorHex;
+  } else {
+    const t = THREE.MathUtils.clamp(dist / 220, 0, 1);
+    _indColor.lerpColors(_nearColor, _farColor, t);
+    colorHex = `#${_indColor.getHexString()}`;
+  }
+
+  out.active = true;
+  out.distance = dist;
+  out.color = colorHex;
 
   if (onScreen) {
-    return {
-      active: true,
-      onScreen: true,
-      x: sx,
-      y: sy,
-      angleDeg: 0,
-      distance: dist,
-      color: colorHex,
-    };
+    out.onScreen = true;
+    out.x = sx;
+    out.y = sy;
+    out.angleDeg = 0;
+    return;
   }
 
   const cx = viewportW * 0.5;
@@ -74,19 +81,37 @@ export function computeOffScreenIndicator(
     halfH / (Math.abs(dy) + 0.001),
   );
 
-  const edgeX = cx + dx * scale;
-  const edgeY = cy + dy * scale;
-  const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI + 90;
+  out.onScreen = false;
+  out.x = cx + dx * scale;
+  out.y = cy + dy * scale;
+  out.angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI + 90;
+}
 
-  return {
+export function computeOffScreenIndicator(
+  camera: THREE.Camera,
+  targetWorld: THREE.Vector3,
+  viewportW: number,
+  viewportH: number,
+  indicatorMargin: number,
+): OffScreenIndicatorState {
+  const out: OffScreenIndicatorState = {
     active: true,
     onScreen: false,
-    x: edgeX,
-    y: edgeY,
-    angleDeg,
-    distance: dist,
-    color: colorHex,
+    x: 0,
+    y: 0,
+    angleDeg: 0,
+    distance: 0,
+    color: '#facc15',
   };
+  computeOffScreenIndicatorInto(
+    camera,
+    targetWorld,
+    viewportW,
+    viewportH,
+    indicatorMargin,
+    out,
+  );
+  return out;
 }
 
 const HORIZON_SAMPLES = 25;

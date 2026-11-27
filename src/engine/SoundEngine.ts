@@ -263,6 +263,110 @@ export class SoundEngine {
     noiseSrc.start(now, 0, noiseDur);
   }
 
+  public playCollect(kind: 'crystal' | 'wreck' | 'ruin' | 'flora'): void {
+    this.unlock();
+    if (
+      this.disposed ||
+      this.muted ||
+      this.paused ||
+      !this.ctx ||
+      !this.compressor ||
+      this.ctx.state !== 'running'
+    ) {
+      return;
+    }
+
+    const now = this.ctx.currentTime;
+    const baseFreq =
+      kind === 'crystal'
+        ? 660
+        : kind === 'ruin'
+          ? 520
+          : kind === 'wreck'
+            ? 440
+            : 587.33;
+    const notes = kind === 'ruin' ? [1, 1.25, 1.5, 2] : [1, 1.25, 1.5];
+
+    for (let i = 0; i < notes.length; i++) {
+      const t0 = now + i * 0.055;
+      const dur = 0.16;
+      const osc = this.ctx.createOscillator();
+      osc.type = kind === 'wreck' ? 'triangle' : 'sine';
+      osc.frequency.setValueAtTime(baseFreq * notes[i], t0);
+
+      const gain = this.ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.linearRampToValueAtTime(0.11, t0 + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+      osc.connect(gain);
+      gain.connect(this.compressor);
+      osc.onended = () => {
+        osc.disconnect();
+        gain.disconnect();
+      };
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.01);
+    }
+  }
+
+  public playImpact(severity = 0.6): void {
+    this.unlock();
+    if (
+      this.disposed ||
+      this.muted ||
+      this.paused ||
+      !this.ctx ||
+      !this.compressor ||
+      this.ctx.state !== 'running'
+    ) {
+      return;
+    }
+
+    const now = this.ctx.currentTime;
+    const s = Math.max(0.2, Math.min(1, severity));
+
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(115, now);
+    osc.frequency.exponentialRampToValueAtTime(34, now + 0.24);
+
+    const oscGain = this.ctx.createGain();
+    oscGain.gain.setValueAtTime(0.26 * s, now);
+    oscGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+
+    osc.connect(oscGain);
+    oscGain.connect(this.compressor);
+    osc.onended = () => {
+      osc.disconnect();
+      oscGain.disconnect();
+    };
+    osc.start(now);
+    osc.stop(now + 0.27);
+
+    const noiseSrc = this.ctx.createBufferSource();
+    noiseSrc.buffer = this.getNoiseBuffer(this.ctx);
+
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(640, now);
+    bp.Q.value = 1.1;
+
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.32 * s, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+
+    noiseSrc.connect(bp);
+    bp.connect(noiseGain);
+    noiseGain.connect(this.compressor);
+    noiseSrc.onended = () => {
+      noiseSrc.disconnect();
+      bp.disconnect();
+      noiseGain.disconnect();
+    };
+    noiseSrc.start(now, 0, 0.16);
+  }
+
   public updateAtmosphereEntry(reentryIntensity: number): void {
     if (
       this.disposed ||

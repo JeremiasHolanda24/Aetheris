@@ -9,6 +9,7 @@ export interface VirtualInputs {
   firing: boolean;
   charUp?: boolean;
   charDown?: boolean;
+  collect?: boolean;
 }
 
 export interface FlightInputSample {
@@ -27,6 +28,7 @@ export interface CharacterInputSample {
   down: boolean;
   sprint: boolean;
   jumpEdge: boolean;
+  collectHeld: boolean;
   lookDeltaX: number;
   lookDeltaY: number;
   keyYaw: number;
@@ -65,6 +67,7 @@ export class InputController {
     firing: false,
     charUp: false,
     charDown: false,
+    collect: false,
   };
   private prevVirtualUp = false;
 
@@ -84,6 +87,7 @@ export class InputController {
     down: false,
     sprint: false,
     jumpEdge: false,
+    collectHeld: false,
     lookDeltaX: 0,
     lookDeltaY: 0,
     keyYaw: 0,
@@ -292,12 +296,17 @@ export class InputController {
         this.virtualInputs.boost,
     );
 
+    const collectHeld = Boolean(
+      this.keysDown.has('KeyE') || this.virtualInputs.collect,
+    );
+
     this.charSample.forward = forward;
     this.charSample.strafe = strafe;
     this.charSample.up = up;
     this.charSample.down = down;
     this.charSample.sprint = sprint;
     this.charSample.jumpEdge = this.pendingJumpEdge;
+    this.charSample.collectHeld = collectHeld;
     this.charSample.lookDeltaX = this.pendingLookDX;
     this.charSample.lookDeltaY = this.pendingLookDY;
     this.charSample.keyYaw = keyYaw;

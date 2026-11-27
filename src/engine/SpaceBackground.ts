@@ -114,6 +114,8 @@ export class SpaceBackground {
   private params: BackdropParams;
   private starRatio = 1;
   private totalStars = 0;
+  private skyVisibility = 1;
+  private skyVisible = true;
   private readonly tempColor = new THREE.Color();
 
   constructor(initialParams: BackdropParams) {
@@ -126,6 +128,7 @@ export class SpaceBackground {
       uniforms: {
         uTime: { value: 0 },
         uPixelRatio: { value: 1 },
+        uSkyVisibility: { value: 1 },
       },
       vertexShader: `
         attribute float aSize;
@@ -146,17 +149,18 @@ export class SpaceBackground {
       fragmentShader: `
         varying vec3 vColor;
         varying float vTwinkle;
+        uniform float uSkyVisibility;
 
         void main() {
           float d = length(gl_PointCoord - vec2(0.5));
           if (d > 0.5) discard;
           float a = 1.0 - smoothstep(0.22, 0.5, d);
-          gl_FragColor = vec4(vColor * vTwinkle, a);
+          gl_FragColor = vec4(vColor * vTwinkle * uSkyVisibility, a * uSkyVisibility);
         }
       `,
-      transparent: false,
+      transparent: true,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,
       blending: THREE.AdditiveBlending,
       vertexColors: true,
       fog: false,
@@ -166,10 +170,10 @@ export class SpaceBackground {
     this.nebulaGeometry = new THREE.SphereGeometry(1250, 20, 14);
     this.nebulaMaterial = new THREE.MeshBasicMaterial({
       map: this.nebulaTexture,
-      transparent: false,
+      transparent: true,
       opacity: initialParams.nebulaOpacity,
       depthWrite: false,
-      depthTest: false,
+      depthTest: true,
       blending: THREE.AdditiveBlending,
       side: THREE.BackSide,
       fog: false,
@@ -197,17 +201,57 @@ export class SpaceBackground {
     }
   }
 
+  private warmupSavedRootVisible = true;
+  private warmupSavedSkyVisibility = 1;
+  private warmupSavedSkyVisible = true;
+
+  public prepareForShaderWarmup(): void {
+    this.warmupSavedRootVisible = this.root.visible;
+    this.warmupSavedSkyVisibility = this.skyVisibility;
+    this.warmupSavedSkyVisible = this.skyVisible;
+    this.root.visible = true;
+    this.skyVisible = true;
+    this.setSkyVisibility(1);
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    this.root.visible = this.warmupSavedRootVisible;
+    this.skyVisible = this.warmupSavedSkyVisible;
+    this.setSkyVisibility(this.warmupSavedSkyVisibility);
+  }
+
+  public setSkyVisibility(visibility: number): void {
+    const v = THREE.MathUtils.clamp(visibility, 0, 1);
+    this.skyVisibility = v;
+
+    if (this.skyVisible && v < 0.02) {
+      this.skyVisible = false;
+    } else if (!this.skyVisible && v > 0.06) {
+      this.skyVisible = true;
+    }
+
+    this.nebulaMaterial.opacity = this.params.nebulaOpacity * v;
+    this.starMaterial.uniforms.uSkyVisibility.value = v;
+    this.nebulaMesh.visible = this.skyVisible;
+    if (this.starPoints) {
+      this.starPoints.visible = this.skyVisible;
+    }
+  }
+
   public updateParams(next: BackdropParams): void {
     const starsNeedRebuild =
       next.starCount !== this.params.starCount ||
       next.minStarSize !== this.params.minStarSize ||
       next.maxStarSize !== this.params.maxStarSize;
 
-    this.nebulaMaterial.opacity = next.nebulaOpacity;
+    this.nebulaMaterial.opacity = next.nebulaOpacity * this.skyVisibility;
     this.params = { ...next };
 
     if (starsNeedRebuild) {
       this.rebuildStars();
+      if (this.starPoints) {
+        this.starPoints.visible = this.skyVisible;
+      }
     }
   }
 

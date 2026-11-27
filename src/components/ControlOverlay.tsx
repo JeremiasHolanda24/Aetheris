@@ -2,15 +2,20 @@ import React, { useEffect, useState } from 'react';
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
+  Backpack,
+  Coins,
   Crosshair,
   Eye,
   Flame,
+  Fuel,
   LocateFixed,
   Maximize2,
   Minimize2,
   Orbit,
+  Play,
   RotateCcw,
   Settings,
+  Shield,
   Volume2,
   VolumeX,
   Wind,
@@ -19,6 +24,8 @@ import {
 import {
   CameraMode,
   CharacterCameraMode,
+  DiagnosticFlags,
+  OtherDrawBreakdown,
   QualityLevel,
   SimulationConfig,
   TelemetrySnapshot,
@@ -26,13 +33,17 @@ import {
 
 interface TelemetryHeaderProps {
   telemetry: TelemetrySnapshot;
+  showFps: boolean;
   dockOpen: boolean;
+  backpackOpen: boolean;
   isFullscreen: boolean;
   isTouchDevice: boolean;
   targetLocked: boolean;
   isMuted: boolean;
   dimmed: boolean;
+  hideFuelHullBars?: boolean;
   onToggleDock: () => void;
+  onToggleBackpack: () => void;
   onToggleFullscreen: () => void;
   onToggleTargetLock: () => void;
   onToggleMute: () => void;
@@ -45,13 +56,17 @@ interface TelemetryHeaderProps {
 export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
   ({
     telemetry,
+    showFps,
     dockOpen,
+    backpackOpen,
     isFullscreen,
     isTouchDevice,
     targetLocked,
     isMuted,
     dimmed,
+    hideFuelHullBars = false,
     onToggleDock,
+    onToggleBackpack,
     onToggleFullscreen,
     onToggleTargetLock,
     onToggleMute,
@@ -110,7 +125,7 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
         <span className="text-slate-600" aria-hidden="true">
           ·
         </span>
-        {/* Turbo Charge Bar */}
+        {/* Turbo, Fuel & Hull Bars */}
         {telemetry.playerMode === 'ship' && (
           <>
             <div
@@ -127,7 +142,7 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
                       : 'text-amber-400/80'
                 }`}
               />
-              <div className="w-12 sm:w-14 h-2 rounded-sm bg-slate-400/20 overflow-hidden">
+              <div className="w-10 sm:w-12 h-2 rounded-sm bg-slate-400/20 overflow-hidden">
                 <div
                   className={`h-full transition-[width] duration-75 ${
                     telemetry.turboExhausted
@@ -149,6 +164,92 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
             </span>
           </>
         )}
+        {!hideFuelHullBars && (() => {
+          const fuelPct = Math.round(
+            Math.min(
+              100,
+              Math.max(
+                0,
+                (telemetry.player.fuel / telemetry.player.maxFuel) * 100,
+              ),
+            ),
+          );
+          const hullPct = Math.round(
+            Math.min(
+              100,
+              Math.max(
+                0,
+                (telemetry.player.hull / telemetry.player.maxHull) * 100,
+              ),
+            ),
+          );
+          return (
+            <>
+              <div
+                className="flex items-center gap-1.5 shrink-0"
+                title={`Combustível ${fuelPct}%`}
+                aria-label={`Combustível ${fuelPct} por cento`}
+              >
+                <Fuel
+                  className={`w-3.5 h-3.5 ${
+                    telemetry.player.reserveMode
+                      ? 'text-rose-400'
+                      : fuelPct < 25
+                        ? 'text-amber-300'
+                        : 'text-cyan-400'
+                  }`}
+                />
+                <div className="w-10 sm:w-12 h-2 rounded-sm bg-slate-400/20 overflow-hidden">
+                  <div
+                    className={`h-full transition-[width] duration-150 ${
+                      telemetry.player.reserveMode
+                        ? 'bg-rose-500'
+                        : fuelPct < 25
+                          ? 'bg-amber-400'
+                          : 'bg-cyan-400'
+                    }`}
+                    style={{ width: `${fuelPct}%` }}
+                  />
+                </div>
+                {telemetry.player.reserveMode && (
+                  <span className="text-[9px] font-semibold font-mono-tabular text-rose-400">
+                    RES
+                  </span>
+                )}
+              </div>
+              <div
+                className="flex items-center gap-1.5 shrink-0"
+                title={`Casco ${hullPct}%`}
+                aria-label={`Casco ${hullPct} por cento`}
+              >
+                <Shield
+                  className={`w-3.5 h-3.5 ${
+                    hullPct < 35
+                      ? 'text-rose-400'
+                      : hullPct < 65
+                        ? 'text-amber-300'
+                        : 'text-emerald-400'
+                  }`}
+                />
+                <div className="w-10 sm:w-12 h-2 rounded-sm bg-slate-400/20 overflow-hidden">
+                  <div
+                    className={`h-full transition-[width] duration-150 ${
+                      hullPct < 35
+                        ? 'bg-rose-500'
+                        : hullPct < 65
+                          ? 'bg-amber-400'
+                          : 'bg-emerald-400'
+                    }`}
+                    style={{ width: `${hullPct}%` }}
+                  />
+                </div>
+              </div>
+              <span className="text-slate-600" aria-hidden="true">
+                ·
+              </span>
+            </>
+          );
+        })()}
         <div className="flex flex-wrap items-center gap-x-2 sm:gap-x-2.5 gap-y-0.5 text-[11px] sm:text-xs text-slate-300 font-mono-tabular">
           <span>
             ALT{' '}
@@ -259,6 +360,32 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
           </button>
         )}
 
+        <div
+          className="min-h-[38px] px-2.5 py-1.5 text-xs font-mono-tabular rounded-lg border bg-[#090c16]/90 text-amber-300 border-white/10 whitespace-nowrap shrink-0 flex items-center gap-1.5"
+          title="Créditos disponíveis"
+        >
+          <Coins className="w-3.5 h-3.5 text-amber-400" />
+          <span className="font-semibold">{telemetry.player.credits}</span>
+        </div>
+
+        <button
+          type="button"
+          onClick={onToggleBackpack}
+          className={`min-h-[38px] px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
+            backpackOpen
+              ? 'bg-amber-500 text-slate-950 border-amber-300 font-semibold'
+              : 'bg-[#090c16]/90 text-slate-200 border-white/10 hover:border-white/25'
+          }`}
+          aria-label="Abrir mochila e carga"
+          aria-expanded={backpackOpen}
+          title="Mochila e Carga (B)"
+        >
+          <Backpack className="w-4 h-4 text-amber-400" />
+          <span className="font-mono-tabular">
+            {telemetry.player.inventoryCount}/{telemetry.player.inventoryCapacity}
+          </span>
+        </button>
+
         <button
           type="button"
           onClick={onToggleFullscreen}
@@ -306,6 +433,15 @@ export const TelemetryHeader: React.FC<TelemetryHeaderProps> = React.memo(
         >
           <Settings className="w-4 h-4" />
         </button>
+
+        {showFps && (
+          <span
+            className="px-2 py-1 text-[10px] font-mono-tabular text-slate-400 bg-[#090c16]/85 border border-white/10 rounded-md whitespace-nowrap shrink-0"
+            title="FPS médio (~1s)"
+          >
+            {telemetry.fps} FPS
+          </span>
+        )}
       </div>
     </header>
   ),
@@ -315,25 +451,38 @@ TelemetryHeader.displayName = 'TelemetryHeader';
 
 interface ControlDockProps {
   config: SimulationConfig;
+  diagnostics: DiagnosticFlags;
   dockOpen: boolean;
   activeSliderId: string | null;
   autoQuality: boolean;
   qualityLevel: QualityLevel;
   fps: number;
+  worstFps: number;
+  cpuFrameMs: number;
   floraInstances: number;
   floraGroups: number;
   renderCalls: number;
   terrainDraws: number;
   floraDraws: number;
   otherDraws: number;
+  otherBreakdown: OtherDrawBreakdown;
+  benchmarkActive: boolean;
   onActiveSliderChange: (id: string | null) => void;
   onToggleAutoQuality: () => void;
+  onToggleDiagnostic: (key: keyof DiagnosticFlags) => void;
+  onStartBenchmark: () => void;
+  onStartDescentBenchmark: () => void;
   onCloseDock: () => void;
   onUpdateConfig: (updater: (prev: SimulationConfig) => SimulationConfig) => void;
   onLandSurface: () => void;
   onLaunchOrbit: () => void;
   onRelocateTarget: () => void;
   onResetDefaults: () => void;
+  onNewGame: () => void;
+  onDebugAddCredits: () => void;
+  onDebugFillInventory: () => void;
+  onDebugDamageHull: () => void;
+  onTeleportNearestPoi: () => void;
 }
 
 type DockTab = 'flight' | 'planet' | 'backdrop' | 'camera';
@@ -399,27 +548,47 @@ const SliderRow: React.FC<SliderRowProps> = ({
 export const ControlDock: React.FC<ControlDockProps> = React.memo(
   ({
     config,
+    diagnostics,
     dockOpen,
     activeSliderId,
     autoQuality,
     qualityLevel,
     fps,
+    worstFps,
+    cpuFrameMs,
     floraInstances,
     floraGroups,
     renderCalls,
     terrainDraws,
     floraDraws,
     otherDraws,
+    otherBreakdown,
+    benchmarkActive,
     onActiveSliderChange,
     onToggleAutoQuality,
+    onToggleDiagnostic,
+    onStartBenchmark,
+    onStartDescentBenchmark,
     onCloseDock,
     onUpdateConfig,
     onLandSurface,
     onLaunchOrbit,
     onRelocateTarget,
     onResetDefaults,
+    onNewGame,
+    onDebugAddCredits,
+    onDebugFillInventory,
+    onDebugDamageHull,
+    onTeleportNearestPoi,
   }) => {
     const [activeTab, setActiveTab] = useState<DockTab>('flight');
+    const [confirmNewGame, setConfirmNewGame] = useState(false);
+
+    useEffect(() => {
+      if (!dockOpen) {
+        setConfirmNewGame(false);
+      }
+    }, [dockOpen]);
 
     // Release slider transparency cleanly even if pointer lifts outside the slider
     useEffect(() => {
@@ -526,6 +695,39 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                 <Crosshair className="w-3.5 h-3.5 text-amber-400" />
                 <span>Novo Alvo</span>
               </button>
+              {confirmNewGame ? (
+                <div className="flex items-center gap-1 bg-rose-500/15 border border-rose-400/45 rounded-md px-1.5 py-0.5">
+                  <span className="text-[11px] font-medium text-rose-200 px-1">
+                    Zerar progresso?
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmNewGame(false);
+                      onNewGame();
+                    }}
+                    className="px-2 py-1 text-[11px] font-semibold bg-rose-500 hover:bg-rose-400 text-white rounded cursor-pointer"
+                  >
+                    Confirmar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmNewGame(false)}
+                    className="px-1.5 py-1 text-[11px] font-medium text-slate-300 hover:text-white cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmNewGame(true)}
+                  className="px-2.5 py-1.5 text-xs font-medium text-rose-200 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/35 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  title="Reiniciar créditos, inventário, combustível, casco e POIs"
+                >
+                  Novo jogo
+                </button>
+              )}
               <button
                 type="button"
                 onClick={onResetDefaults}
@@ -810,6 +1012,127 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
                     Malha
                   </button>
                 </div>
+
+                {/* Diagnóstico (não persistido) */}
+                <div
+                  className={`col-span-2 sm:col-span-3 pt-2 border-t border-white/10 transition-opacity duration-150 ${
+                    isDraggingAny ? 'opacity-15 pointer-events-none' : 'opacity-100'
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                    <div className="text-[11px] font-medium text-slate-400">
+                      Diagnóstico (reinicia ao recarregar)
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={benchmarkActive}
+                        onClick={onTeleportNearestPoi}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded-md border bg-cyan-500/20 text-cyan-200 border-cyan-400/45 hover:bg-cyan-500/30 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1.5"
+                      >
+                        <LocateFixed className="w-3 h-3" />
+                        <span>Teleportar ao POI mais próximo</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={benchmarkActive}
+                        onClick={onStartDescentBenchmark}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded-md border bg-amber-500/20 text-amber-200 border-amber-400/45 hover:bg-amber-500/30 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Play className="w-3 h-3" />
+                        <span>Benchmark de descida</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={benchmarkActive}
+                        onClick={onStartBenchmark}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded-md border bg-sky-500/20 text-sky-200 border-sky-400/45 hover:bg-sky-500/30 disabled:opacity-40 transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Play className="w-3 h-3" />
+                        <span>Rodar benchmark</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(
+                      [
+                        { key: 'noReentryGlow', label: 'Brilho de reentrada desligado' },
+                        { key: 'noReentryParticles', label: 'Sem partículas de reentrada' },
+                        { key: 'noPois', label: 'Sem POIs' },
+                        { key: 'noPoiHudMarkers', label: 'Sem marcadores de POI no HUD' },
+                        { key: 'noPoiEffects', label: 'Sem fumaça/efeitos de POI' },
+                        { key: 'noFuelHullBars', label: 'Sem barras de combustível e casco' },
+                        { key: 'noAutosave', label: 'Sem salvar progresso' },
+                        { key: 'simpleTerrain', label: 'Terreno simples' },
+                        { key: 'noAtmosphere', label: 'Sem atmosfera' },
+                        { key: 'noSpaceBackdrop', label: 'Sem estrelas e nebulosa' },
+                        { key: 'noFlora', label: 'Sem flora' },
+                        { key: 'hideShip', label: 'Esconder nave' },
+                        { key: 'hideCharacter', label: 'Esconder personagem' },
+                        { key: 'halfResolution', label: 'Resolução 0.5x' },
+                        { key: 'noProceduralGrass', label: 'Sem grama procedural' },
+                        { key: 'noContours', label: 'Sem contornos' },
+                        { key: 'noPixelBiomeBlend', label: 'Sem mistura de bioma por pixel' },
+                        { key: 'noReceiveShadow', label: 'Sem receber sombra' },
+                        { key: 'noNoiseDetail', label: 'Sem detalhe de ruído' },
+                        { key: 'terrainNoTexture', label: 'Terreno sem textura' },
+                        { key: 'terrainNoLighting', label: 'Terreno sem luz/normal' },
+                        { key: 'terrainNoSkyAtmo', label: 'Terreno sem sombra do ceu/atmosfera' },
+                        { key: 'terrainFewerPatches', label: 'Terreno com menos patches' },
+                        { key: 'showColliders', label: 'Mostrar colisores' },
+                      ] as Array<{ key: keyof DiagnosticFlags; label: string }>
+                    ).map((item) => {
+                      const active = diagnostics[item.key];
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          role="switch"
+                          aria-checked={active}
+                          onClick={() => onToggleDiagnostic(item.key)}
+                          className={`px-2.5 py-1.5 text-[11px] font-medium rounded-md border transition-colors whitespace-nowrap cursor-pointer flex items-center gap-2 ${
+                            active
+                              ? 'bg-amber-500/20 text-amber-300 border-amber-400/50'
+                              : 'bg-slate-800/90 text-slate-300 border-white/10 hover:border-white/25'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block w-2 h-2 rounded-full ${
+                              active ? 'bg-amber-400' : 'bg-slate-500'
+                            }`}
+                          />
+                          <span>{item.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-2.5 pt-2 border-t border-white/10 flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] font-medium text-slate-400">
+                      Testes rápidos (economia e nave):
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onDebugAddCredits}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md border bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 border-amber-400/35 transition-colors cursor-pointer"
+                    >
+                      +100 créditos
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onDebugFillInventory}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md border bg-sky-500/15 hover:bg-sky-500/25 text-sky-200 border-sky-400/35 transition-colors cursor-pointer"
+                    >
+                      Encher inventário
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onDebugDamageHull}
+                      className="px-2.5 py-1 text-[11px] font-medium rounded-md border bg-rose-500/15 hover:bg-rose-500/25 text-rose-200 border-rose-400/35 transition-colors cursor-pointer"
+                    >
+                      Dano de 30 no casco
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -946,39 +1269,76 @@ export const ControlDock: React.FC<ControlDockProps> = React.memo(
             )}
           </div>
 
-          {/* Footer: Qualidade automática switch + current quality level */}
+          {/* Footer: Qualidade automática + Mostrar FPS switches + performance telemetry */}
           <div
             className={`mt-3 pt-2.5 border-t border-white/10 flex flex-wrap items-center justify-between gap-2 text-xs transition-opacity duration-150 ${
               isDraggingAny ? 'opacity-15 pointer-events-none' : 'opacity-100'
             }`}
           >
-            <button
-              type="button"
-              role="switch"
-              aria-checked={autoQuality}
-              onClick={onToggleAutoQuality}
-              className="flex items-center gap-2 text-slate-200 hover:text-white cursor-pointer"
-            >
-              <span
-                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                  autoQuality
-                    ? 'bg-emerald-500/85 border-emerald-300/70'
-                    : 'bg-slate-800 border-white/15'
-                }`}
+            <div className="flex flex-wrap items-center gap-4">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoQuality}
+                onClick={onToggleAutoQuality}
+                className="flex items-center gap-2 text-slate-200 hover:text-white cursor-pointer"
               >
                 <span
-                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                    autoQuality ? 'translate-x-4' : 'translate-x-0.5'
+                  className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                    autoQuality
+                      ? 'bg-emerald-500/85 border-emerald-300/70'
+                      : 'bg-slate-800 border-white/15'
                   }`}
-                />
-              </span>
-              <span className="font-medium">Qualidade automática</span>
-            </button>
-            <div className="flex items-center gap-3 font-mono-tabular text-slate-300">
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      autoQuality ? 'translate-x-4' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+                <span className="font-medium">Qualidade automática</span>
+              </button>
+
+              <button
+                type="button"
+                role="switch"
+                aria-checked={config.showFps}
+                onClick={() =>
+                  onUpdateConfig((prev) => ({
+                    ...prev,
+                    showFps: !prev.showFps,
+                  }))
+                }
+                className="flex items-center gap-2 text-slate-200 hover:text-white cursor-pointer"
+              >
+                <span
+                  className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                    config.showFps
+                      ? 'bg-sky-500/85 border-sky-300/70'
+                      : 'bg-slate-800 border-white/15'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      config.showFps ? 'translate-x-4' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
+                <span className="font-medium">Mostrar FPS</span>
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono-tabular text-[11px] text-slate-300">
               <span className="text-slate-400">
                 Flora:{' '}
                 <strong className="text-slate-200 font-medium">
-                  FPS {fps} · {floraGroups} grupos · {floraInstances} inst · {renderCalls} draws (terreno {terrainDraws} · flora {floraDraws} · outros {otherDraws})
+                  FPS {fps} · pior {worstFps} · CPU {cpuFrameMs.toFixed(1)} ms · {floraGroups} grupos · {floraInstances} inst · {renderCalls} draws (terreno {terrainDraws} · flora {floraDraws} · outros {otherDraws})
+                </strong>
+              </span>
+              <span className="text-slate-400">
+                outros:{' '}
+                <strong className="text-slate-200 font-medium">
+                  nave {otherBreakdown.nave} · alvo {otherBreakdown.alvo} · fundo {otherBreakdown.fundo} · atm/lua {otherBreakdown.atmLua} · fx {otherBreakdown.fx}
                 </strong>
               </span>
               <span>

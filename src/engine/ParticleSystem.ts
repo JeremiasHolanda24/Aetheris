@@ -45,6 +45,7 @@ export interface ParticleStepParams {
   speed: number;
   reentryIntensity: number;
   particleRatio: number;
+  disableReentryParticles?: boolean;
 }
 
 /**
@@ -52,6 +53,7 @@ export interface ParticleStepParams {
  * and atmospheric slipstream / re-entry thermal ember streaks.
  */
 export class ParticleSystem {
+  public readonly root = new THREE.Group();
   private readonly scene: THREE.Scene;
 
   private readonly exhaustGeo: THREE.IcosahedronGeometry;
@@ -66,9 +68,13 @@ export class ParticleSystem {
   private readonly streakMesh: THREE.InstancedMesh;
   private readonly streakParticles: StreakParticle[] = [];
   private streakSpawnAccum = 0;
+  private activeParticleTotal = 0;
+  private prevActiveStreaks = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
+    this.root.userData.perfTag = 'fx';
+    this.scene.add(this.root);
 
     this.exhaustGeo = new THREE.IcosahedronGeometry(0.22, 0);
     this.exhaustMat = new THREE.MeshBasicMaterial({
@@ -84,6 +90,7 @@ export class ParticleSystem {
       MAX_EXHAUST,
     );
     this.exhaustMesh.frustumCulled = false;
+    this.exhaustMesh.visible = false;
     this.exhaustMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     _dummyObj.scale.set(0, 0, 0);
     _dummyObj.updateMatrix();
@@ -105,7 +112,7 @@ export class ParticleSystem {
     if (this.exhaustMesh.instanceColor) {
       this.exhaustMesh.instanceColor.needsUpdate = true;
     }
-    this.scene.add(this.exhaustMesh);
+    this.root.add(this.exhaustMesh);
 
     this.streakGeo = new THREE.BoxGeometry(0.065, 0.065, 3.6);
     this.streakMat = new THREE.MeshBasicMaterial({
@@ -121,6 +128,7 @@ export class ParticleSystem {
       MAX_STREAKS,
     );
     this.streakMesh.frustumCulled = false;
+    this.streakMesh.visible = false;
     this.streakMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     _particleColor.setHex(0x7dd3fc);
     for (let i = 0; i < MAX_STREAKS; i++) {
@@ -139,7 +147,26 @@ export class ParticleSystem {
     if (this.streakMesh.instanceColor) {
       this.streakMesh.instanceColor.needsUpdate = true;
     }
-    this.scene.add(this.streakMesh);
+    this.root.add(this.streakMesh);
+  }
+
+  private warmupSavedExhaustVisible = false;
+  private warmupSavedStreakVisible = false;
+
+  public prepareForShaderWarmup(): void {
+    this.warmupSavedExhaustVisible = this.exhaustMesh.visible;
+    this.warmupSavedStreakVisible = this.streakMesh.visible;
+    this.exhaustMesh.visible = true;
+    this.streakMesh.visible = true;
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    this.exhaustMesh.visible = this.warmupSavedExhaustVisible;
+    this.streakMesh.visible = this.warmupSavedStreakVisible;
+  }
+
+  public getActiveCount(): number {
+    return this.activeParticleTotal;
   }
 
   public update(dt: number, params: ParticleStepParams): void {
@@ -155,7 +182,11 @@ export class ParticleSystem {
       speed,
       reentryIntensity,
       particleRatio,
+      disableReentryParticles,
     } = params;
+
+    const isReentryActive = reentryIntensity > 0.14;
+    const reentryTotalCap = 60;
 
     // 1. Thruster Exhaust Particles
     _shipForward.set(0, 0, -1).applyQuaternion(shipQuat);
@@ -163,10 +194,13 @@ export class ParticleSystem {
     _shipRight.set(1, 0, 0).applyQuaternion(shipQuat);
     _worldQuatTemp.copy(shipQuat).multiply(shipVisualQuat);
 
-    const maxExhaustActive = Math.max(
+    const rawExhaustCap = Math.max(
       1,
       Math.floor(MAX_EXHAUST * particleRatio),
     );
+    const maxExhaustActive = isReentryActive
+      ? Math.min(rawExhaustCap, 24)
+      : rawExhaustCap;
     const exhaustRate = isThrusting
       ? isBoosting
         ? 90
@@ -178,13 +212,21 @@ export class ParticleSystem {
     while (this.exhaustSpawnAccum >= 1) {
       this.exhaustSpawnAccum -= 1;
       let slot: ExhaustParticle | null = null;
-      for (let i = 0; i < maxExhaustActive; i++) {
-        if (!this.exhaustParticles[i].active) {
+      let curActive = 0;
+      for (let i = 0; i < MAX_EXHAUST; i++) {
+        if (this.exhaustParticles[i].active) {
+          curActive++;
+        } else if (!slot && i < maxExhaustActive) {
           slot = this.exhaustParticles[i];
-          break;
         }
       }
-      if (!slot) break;
+      if (
+        !slot ||
+        curActive >= maxExhaustActive ||
+        (isReentryActive && curActive + this.prevActiveStreaks >= reentryTotalCap)
+      ) {
+        break;
+      }
 
       this.exhaustAlternator = (this.exhaustAlternator + 1) % 3;
       const side =
@@ -215,6 +257,7 @@ export class ParticleSystem {
       slot.vel.z += (Math.random() - 0.5) * 2.2;
     }
 
+    let activeExhaust = 0;
     for (let i = 0; i < MAX_EXHAUST; i++) {
       const p = this.exhaustParticles[i];
       if (!p.active) {
@@ -226,7 +269,7 @@ export class ParticleSystem {
 
       p.age += dt;
       const t = p.age / p.maxAge;
-      if (t >= 1) {
+      if (t >= 1 || (isReentryActive && activeExhaust >= maxExhaustActive)) {
         p.active = false;
         _dummyObj.scale.set(0, 0, 0);
         _dummyObj.updateMatrix();
@@ -234,6 +277,7 @@ export class ParticleSystem {
         continue;
       }
 
+      activeExhaust++;
       p.pos.addScaledVector(p.vel, dt);
       const scale = p.baseScale * (1 - t * 0.92);
       _dummyObj.position.copy(p.pos);
@@ -252,34 +296,48 @@ export class ParticleSystem {
       _particleColor.lerpColors(_particleStartCol, _particleEndCol, t);
       this.exhaustMesh.setColorAt(i, _particleColor);
     }
-    this.exhaustMesh.instanceMatrix.needsUpdate = true;
-    if (this.exhaustMesh.instanceColor) {
-      this.exhaustMesh.instanceColor.needsUpdate = true;
+    this.exhaustMesh.visible = activeExhaust > 0;
+    if (activeExhaust > 0) {
+      this.exhaustMesh.instanceMatrix.needsUpdate = true;
+      if (this.exhaustMesh.instanceColor) {
+        this.exhaustMesh.instanceColor.needsUpdate = true;
+      }
     }
 
     // 2. Atmospheric Slipstream & Re-Entry Thermal Ember Streaks
-    const isReentryActive = reentryIntensity > 0.14;
-    const streakRate = isReentryActive
-      ? 35 + reentryIntensity * 65
-      : atmoRatio > 0.05 && speed > 18
-        ? Math.min(36, (speed - 16) * 0.85 * atmoRatio)
-        : 0;
+    const pauseReentrySpawn = Boolean(disableReentryParticles && isReentryActive);
+    const streakRate = pauseReentrySpawn
+      ? 0
+      : isReentryActive
+        ? 35 + reentryIntensity * 65
+        : atmoRatio > 0.05 && speed > 18
+          ? Math.min(36, (speed - 16) * 0.85 * atmoRatio)
+          : 0;
 
-    const maxStreakActive = Math.max(
+    const rawStreakCap = Math.max(
       1,
       Math.floor(MAX_STREAKS * particleRatio),
     );
-    this.streakSpawnAccum += dt * streakRate;
+    const maxStreakActive = isReentryActive
+      ? Math.min(rawStreakCap, Math.max(0, reentryTotalCap - activeExhaust))
+      : rawStreakCap;
+    if (pauseReentrySpawn) {
+      this.streakSpawnAccum = 0;
+    } else {
+      this.streakSpawnAccum += dt * streakRate;
+    }
     while (this.streakSpawnAccum >= 1) {
       this.streakSpawnAccum -= 1;
       let slot: StreakParticle | null = null;
-      for (let i = 0; i < maxStreakActive; i++) {
-        if (!this.streakParticles[i].active) {
+      let curActive = 0;
+      for (let i = 0; i < MAX_STREAKS; i++) {
+        if (this.streakParticles[i].active) {
+          curActive++;
+        } else if (!slot && i < maxStreakActive) {
           slot = this.streakParticles[i];
-          break;
         }
       }
-      if (!slot) break;
+      if (!slot || curActive >= maxStreakActive) break;
 
       const angle = Math.random() * Math.PI * 2;
       const radialDist = isReentryActive
@@ -303,6 +361,7 @@ export class ParticleSystem {
       slot.vel.copy(_shipForward).multiplyScalar(-backSpeed);
     }
 
+    let activeStreaks = 0;
     for (let i = 0; i < MAX_STREAKS; i++) {
       const s = this.streakParticles[i];
       if (!s.active) {
@@ -314,7 +373,7 @@ export class ParticleSystem {
 
       s.age += dt;
       const t = s.age / s.maxAge;
-      if (t >= 1) {
+      if (t >= 1 || (isReentryActive && activeExhaust + activeStreaks >= reentryTotalCap)) {
         s.active = false;
         _dummyObj.scale.set(0, 0, 0);
         _dummyObj.updateMatrix();
@@ -322,6 +381,7 @@ export class ParticleSystem {
         continue;
       }
 
+      activeStreaks++;
       s.pos.addScaledVector(s.vel, dt);
       _dummyObj.position.copy(s.pos);
       _dummyObj.quaternion.copy(shipQuat);
@@ -343,15 +403,22 @@ export class ParticleSystem {
       }
       this.streakMesh.setColorAt(i, _particleColor);
     }
-    this.streakMesh.instanceMatrix.needsUpdate = true;
-    if (this.streakMesh.instanceColor) {
-      this.streakMesh.instanceColor.needsUpdate = true;
+    this.streakMesh.visible = activeStreaks > 0;
+    if (activeStreaks > 0) {
+      this.streakMesh.instanceMatrix.needsUpdate = true;
+      if (this.streakMesh.instanceColor) {
+        this.streakMesh.instanceColor.needsUpdate = true;
+      }
     }
+
+    this.prevActiveStreaks = activeStreaks;
+    this.activeParticleTotal = activeExhaust + activeStreaks;
   }
 
   public dispose(): void {
-    this.scene.remove(this.exhaustMesh);
-    this.scene.remove(this.streakMesh);
+    this.root.remove(this.exhaustMesh);
+    this.root.remove(this.streakMesh);
+    this.scene.remove(this.root);
     this.exhaustGeo.dispose();
     this.exhaustMat.dispose();
     this.exhaustMesh.dispose();

@@ -35,8 +35,8 @@ const FLORA_VIEW_RATIOS: Record<QualityLevel, number> = {
 const TERRAIN_DETAIL_RATIOS: Record<QualityLevel, number> = {
   0: 1.0,
   1: 1.0,
-  2: 0.6,
-  3: 0.3,
+  2: 0.85,
+  3: 0.6,
 };
 
 const PIXEL_RATIO_CAPS: Record<QualityLevel, number> = {
@@ -59,6 +59,7 @@ export class QualityScaler {
   private readonly onLevelApplied: (preset: QualityPreset) => void;
 
   private enabled = true;
+  private paused = false;
   private sliderDragging = false;
   private level: QualityLevel = 0;
 
@@ -85,6 +86,10 @@ export class QualityScaler {
     return this.level;
   }
 
+  public isEnabled(): boolean {
+    return this.enabled;
+  }
+
   public getCurrentPreset(): QualityPreset {
     return this.buildPreset(this.level);
   }
@@ -100,12 +105,49 @@ export class QualityScaler {
     }
   }
 
+  public setEnabledSilent(enabled: boolean): void {
+    this.enabled = enabled;
+  }
+
+  public forceLevel(level: QualityLevel): void {
+    this.level = level;
+    this.lowFpsDuration = 0;
+    this.highFpsDuration = 0;
+    this.cooldownRemaining = 0;
+    this.hasSample = false;
+    this.avgDt = 1 / 60;
+    this.onLevelApplied(this.buildPreset(level));
+  }
+
+  public prepareForAutoBenchmark(): void {
+    this.warmupElapsed = 3.0;
+    this.hasSample = false;
+    this.avgDt = 1 / 60;
+    this.lowFpsDuration = 0;
+    this.highFpsDuration = 0;
+    this.cooldownRemaining = 0;
+  }
+
+  public pause(): void {
+    this.paused = true;
+  }
+
+  public resume(): void {
+    this.paused = false;
+    this.lowFpsDuration = 0;
+    this.highFpsDuration = 0;
+  }
+
+  public isPaused(): boolean {
+    return this.paused;
+  }
+
   public setSliderDragging(dragging: boolean): void {
     this.sliderDragging = dragging;
   }
 
   public update(rawDt: number, hidden: boolean): void {
-    if (this.isSoftwareGl || !this.enabled || hidden) return;
+    if (this.isSoftwareGl || !this.enabled || this.paused || hidden) return;
     if (!Number.isFinite(rawDt) || rawDt <= 0 || rawDt > 0.2) return;
 
     if (this.warmupElapsed < 3.0) {

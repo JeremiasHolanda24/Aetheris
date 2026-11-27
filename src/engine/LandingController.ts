@@ -191,9 +191,10 @@ export class LandingController {
   public forceLanded(
     dir: THREE.Vector3,
     _planetManager: PlanetTerrainManager,
+    body: LandingBody = 'planet',
   ): void {
     this.state = 'landed';
-    this.landedBody = 'planet';
+    this.landedBody = body;
     this.gearT = 1;
     this.stateTime = 1.0;
     this.pendingTakeoffHooks = false;

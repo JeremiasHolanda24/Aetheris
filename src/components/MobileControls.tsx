@@ -8,6 +8,7 @@ import {
   Flame,
   Gauge,
   LocateFixed,
+  Pickaxe,
   RotateCw,
   Settings,
   Smartphone,
@@ -30,6 +31,8 @@ interface MobileControlsProps {
   targetLocked: boolean;
   landingState: LandingState;
   canLand: boolean;
+  collectAvailable?: boolean;
+  collectLabel?: string;
   showSettingsFallback?: boolean;
   isPortraitMobile: boolean;
   portraitDismissed: boolean;
@@ -54,6 +57,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
     targetLocked,
     landingState,
     canLand,
+    collectAvailable = false,
+    collectLabel = '',
     showSettingsFallback = false,
     isPortraitMobile,
     portraitDismissed,
@@ -74,6 +79,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
       brakePressed: false,
       charUpPressed: false,
       charDownPressed: false,
+      collectPressed: false,
     });
 
     const activeStickPointerRef = useRef<number | null>(null);
@@ -86,6 +92,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
       brake: false,
       charUp: false,
       charDown: false,
+      collect: false,
     });
 
     const emitCombinedInputs = useCallback(() => {
@@ -96,6 +103,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         brakePressed,
         charUpPressed,
         charDownPressed,
+        collectPressed,
       } = pedalStateRef.current;
 
       let pedalThrust = 0;
@@ -110,6 +118,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         firing: false,
         charUp: charUpPressed,
         charDown: charDownPressed,
+        collect: collectPressed,
       });
     }, [onVirtualInputChange]);
 
@@ -122,6 +131,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
           brakePressed: false,
           charUpPressed: false,
           charDownPressed: false,
+          collectPressed: false,
         };
         activeStickPointerRef.current = null;
         setPuckOffset({ x: 0, y: 0, active: false });
@@ -131,6 +141,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
           brake: false,
           charUp: false,
           charDown: false,
+          collect: false,
         });
         onVirtualInputChange({
           turn: 0,
@@ -140,6 +151,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
           firing: false,
           charUp: false,
           charDown: false,
+          collect: false,
         });
       }
     }, [visible, onVirtualInputChange]);
@@ -214,7 +226,8 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         | 'boostPressed'
         | 'brakePressed'
         | 'charUpPressed'
-        | 'charDownPressed',
+        | 'charDownPressed'
+        | 'collectPressed',
       pressed: boolean,
     ) => {
       pedalStateRef.current[key] = pressed;
@@ -224,6 +237,7 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
         brake: pedalStateRef.current.brakePressed,
         charUp: pedalStateRef.current.charUpPressed,
         charDown: pedalStateRef.current.charDownPressed,
+        collect: pedalStateRef.current.collectPressed,
       });
       emitCombinedInputs();
     };
@@ -332,6 +346,34 @@ export const MobileControls: React.FC<MobileControlsProps> = React.memo(
               {playerMode === 'character' ? (
                 <>
                   <div className="flex flex-col items-center gap-2">
+                    {collectAvailable && (
+                      <button
+                        type="button"
+                        onPointerDown={(e) => {
+                          e.preventDefault();
+                          e.currentTarget.setPointerCapture(e.pointerId);
+                          setPedal('collectPressed', true);
+                        }}
+                        onPointerUp={(e) => {
+                          e.preventDefault();
+                          setPedal('collectPressed', false);
+                        }}
+                        onPointerCancel={() => setPedal('collectPressed', false)}
+                        style={{ touchAction: 'none' }}
+                        className={`min-w-[82px] h-11 px-2.5 rounded-xl border-2 flex items-center justify-center gap-1 transition-all active:scale-95 cursor-pointer ${
+                          pedalsUi.collect
+                            ? 'bg-cyan-400 text-slate-950 border-cyan-100 font-bold'
+                            : 'bg-cyan-500/20 text-cyan-200 border-cyan-400/60 font-semibold'
+                        }`}
+                        aria-label={`Coletar ${collectLabel}`}
+                      >
+                        <Pickaxe className="w-3.5 h-3.5" />
+                        <span className="text-[10px] font-bold tracking-wide leading-none">
+                          COLETAR
+                        </span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
                       onPointerDown={(e) => {

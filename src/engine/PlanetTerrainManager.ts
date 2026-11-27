@@ -25,7 +25,11 @@ export const CUBE_FACES: CubeFaceBasis[] = [
 
 const PATCH_SUBDIV = 4;
 const PATCH_SEGMENTS = 20;
+const PATCH_VC = (PATCH_SEGMENTS + 1) * (PATCH_SEGMENTS + 1);
+const ORBITAL_SEGMENTS = 32;
 const MOON_RADIUS_RATIO = 0.145;
+const _patchRGrid = new Float32Array(PATCH_VC);
+const _patchNGrid = new Float32Array(PATCH_VC * 3);
 const _camDir = new THREE.Vector3();
 const _cullProjScreenMatrix = new THREE.Matrix4();
 const _cullFrustum = new THREE.Frustum();
@@ -91,52 +95,96 @@ function tileableNoise(x: number, y: number, period: number): number {
   return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
 }
 
+function hash2Pair(ix: number, iy: number, seed: number): number {
+  const s = Math.sin(ix * 127.1 + iy * 311.7 + seed * 74.7) * 43758.5453123;
+  return s - Math.floor(s);
+}
+
 /**
- * Generates a bright, tileable procedural blue-and-purple surface texture
- * with zero black/dark blotches for triplanar sphere mapping.
+ * Generates ONE small (256x256) tileable RGBA DataTexture encoding 4 independent
+ * seamless noise channels so the terrain fragment shader needs at most 1-2 texture2D
+ * reads and zero real-time procedural noise/loops:
+ * - R: Macro patches & mineral strata (periods 2 + 4)
+ * - G: Medium grass/mineral variation (periods 6 + 12)
+ * - B: Close grass blade tufts & bump height (periods 36 + 72)
+ * - A: Precomputed tileable Voronoi flower dot mask (16x16 periodic cells)
  */
-function createPlanetSurfaceTexture(): THREE.CanvasTexture {
+function createTerrainNoiseTexture(): THREE.DataTexture {
   const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (ctx) {
-    const img = ctx.createImageData(size, size);
-    const data = img.data;
-    for (let y = 0; y < size; y++) {
-      for (let x = 0; x < size; x++) {
-        const u = x / size;
-        const v = y / size;
+  const data = new Uint8Array(size * size * 4);
 
-        const n1 = tileableNoise(u * 6, v * 6, 6);
-        const n2 = tileableNoise(u * 14 + 3.2, v * 14 + 1.9, 14);
-        const n3 = tileableNoise(u * 30 + 7.1, v * 30 + 5.4, 30);
-
-        const strata =
-          Math.sin((u * 4 + v * 2 + n1 * 1.5) * Math.PI * 2) * 0.5 + 0.5;
-        const grain = n1 * 0.5 + n2 * 0.32 + n3 * 0.18;
-        const blend = strata * 0.42 + grain * 0.58;
-
-        // Luminous blue-to-purple variation without darkening albedo
-        const r = 165 + blend * 85;
-        const g = 148 + (1 - blend) * 70;
-        const b = 232 + blend * 23;
-
-        const idx = (y * size + x) * 4;
-        data[idx] = Math.min(255, Math.round(r));
-        data[idx + 1] = Math.min(255, Math.round(g));
-        data[idx + 2] = Math.min(255, Math.round(b));
-        data[idx + 3] = 255;
+  // Precompute 16x16 periodic flower cell centers
+  const flowerGrid = 16;
+  const cellCount = flowerGrid * flowerGrid;
+  const flowerActive = new Uint8Array(cellCount);
+  const flowerCx = new Float32Array(cellCount);
+  const flowerCy = new Float32Array(cellCount);
+  for (let cy = 0; cy < flowerGrid; cy++) {
+    for (let cx = 0; cx < flowerGrid; cx++) {
+      const idx = cy * flowerGrid + cx;
+      const pick = hash2Pair(cx, cy, 11.3);
+      if (pick < 0.14) {
+        flowerActive[idx] = 1;
+        flowerCx[idx] = cx + 0.22 + 0.56 * hash2Pair(cx, cy, 23.7);
+        flowerCy[idx] = cy + 0.22 + 0.56 * hash2Pair(cx, cy, 41.9);
       }
     }
-    ctx.putImageData(img, 0, 0);
   }
 
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
+  for (let y = 0; y < size; y++) {
+    const v = y / size;
+    const fy = v * flowerGrid;
+    const baseCy = Math.floor(fy);
+
+    for (let x = 0; x < size; x++) {
+      const u = x / size;
+      const fx = u * flowerGrid;
+      const baseCx = Math.floor(fx);
+
+      const macro =
+        tileableNoise(u * 2, v * 2, 2) * 0.66 +
+        tileableNoise(u * 4 + 1.7, v * 4 + 3.1, 4) * 0.34;
+      const medium =
+        tileableNoise(u * 6 + 5.2, v * 6 + 1.9, 6) * 0.62 +
+        tileableNoise(u * 12 + 2.3, v * 12 + 7.4, 12) * 0.38;
+      const fine =
+        tileableNoise(u * 36 + 4.1, v * 36 + 9.3, 36) * 0.58 +
+        tileableNoise(u * 72 + 8.7, v * 72 + 3.6, 72) * 0.42;
+
+      let minD2 = 1.0;
+      for (let oy = -1; oy <= 1; oy++) {
+        const ny = (((baseCy + oy) % flowerGrid) + flowerGrid) % flowerGrid;
+        const wrapY = (baseCy + oy - ny) * (1 / flowerGrid) * flowerGrid;
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = (((baseCx + ox) % flowerGrid) + flowerGrid) % flowerGrid;
+          const cIdx = ny * flowerGrid + nx;
+          if (!flowerActive[cIdx]) continue;
+          const wrapX = (baseCx + ox - nx) * (1 / flowerGrid) * flowerGrid;
+          const dx = flowerCx[cIdx] + wrapX - fx;
+          const dy = flowerCy[cIdx] + wrapY - fy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < minD2) {
+            minD2 = d2;
+          }
+        }
+      }
+      const flowerDot = 1 - smoothstep(0.06, 0.18, Math.sqrt(minD2));
+
+      const pIdx = (y * size + x) * 4;
+      data[pIdx] = Math.min(255, Math.max(0, Math.round(macro * 255)));
+      data[pIdx + 1] = Math.min(255, Math.max(0, Math.round(medium * 255)));
+      data[pIdx + 2] = Math.min(255, Math.max(0, Math.round(fine * 255)));
+      data[pIdx + 3] = Math.min(255, Math.max(0, Math.round(flowerDot * 255)));
+    }
+  }
+
+  const tex = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+  tex.colorSpace = THREE.NoColorSpace;
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = true;
   tex.needsUpdate = true;
   return tex;
 }
@@ -147,6 +195,15 @@ function createPlanetSurfaceTexture(): THREE.CanvasTexture {
  * - Rich blue & purple planetary elevation colors + seamless triplanar mineral texture
  * - Cyan-to-Violet Fresnel atmosphere halo shell
  * - Distant orbiting moon
+ */
+/**
+ * "Terreno simples" (forceOrbitalTerrain -> orbitalMesh com orbitalMaterial) desativa:
+ * 1. Texturas e detalhe procedural no fragment shader (uNoiseTex triplanar, grama/flores procedurais,
+ *    curvas de nivel, perturbacao de normal grassPerturbNormalArb).
+ * 2. Iluminacao PBR e normais do MeshStandardMaterial (RoomEnvironment IBL/envMap, specular,
+ *    recebimento de sombras direcionais/receiveShadow), trocando para MeshLambertMaterial simples.
+ * 3. Malha de alta resolucao dividida em 96 patches (20x20 cada, ~40 visiveis), trocando para
+ *    uma unica malha global (6 faces x 32x32 segmentos, 1 draw call).
  */
 export class PlanetTerrainManager {
   public readonly root = new THREE.Group();
@@ -165,11 +222,44 @@ export class PlanetTerrainManager {
 
   private sharedIndices: THREE.BufferAttribute;
   private sharedUvs: THREE.BufferAttribute;
-  private surfaceTexture: THREE.CanvasTexture;
+  private noiseTexture: THREE.DataTexture;
   private terrainMaterial: THREE.MeshStandardMaterial;
+  private unlitTerrainMaterial: THREE.MeshBasicMaterial;
   private contourUniform = { value: 1.0 };
   private grassDetailUniform = { value: 1.0 };
+  private highDetailScaleUniform = { value: 1.0 };
+  private bumpEnabledUniform = { value: 1.0 };
   private timeUniform = { value: 0.0 };
+  private planetRadiusUniform = { value: 360.0 };
+  private invMaxHeightUniform = { value: 1 / 14 };
+  private diagNoGrassUniform = { value: 0.0 };
+  private diagNoContoursUniform = { value: 0.0 };
+  private diagNoPixelBiomeUniform = { value: 0.0 };
+  private diagNoNoiseUniform = { value: 0.0 };
+  private diagNoTextureUniform = { value: 0.0 };
+  public readonly horizonFogColorUniform = { value: new THREE.Color(0x0e2547) };
+  public readonly horizonFogParamsUniform = {
+    value: new THREE.Vector3(95, 175, 1.0),
+  };
+  private morphRangeUniform = { value: new THREE.Vector2(55, 155) };
+
+  private orbitalGeometry: THREE.BufferGeometry;
+  private orbitalMaterial: THREE.MeshLambertMaterial;
+  private orbitalMesh: THREE.Mesh;
+  private isOrbitalMode = false;
+  private forceOrbitalTerrain = false;
+  private terrainFewerPatches = false;
+  private terrainNoLighting = false;
+  private noReceiveShadow = false;
+  private readonly lastShadowFocus = new THREE.Vector3();
+  private hasShadowFocus = false;
+
+  private rebuildPending = false;
+  private rebuildPatchIdx = 0;
+  private rebuildOrbFaceIdx = 0;
+  // Counts terrain patches/meshes actually rebuilt with GPU BufferAttribute needsUpdate = true
+  // (0 during normal descent because LOD uses GPU vertex morphing on prebuilt patches).
+  private builtPatchCounter = 0;
 
   private atmosphereMesh: THREE.Mesh;
   private atmosphereGeo: THREE.SphereGeometry;
@@ -228,7 +318,9 @@ export class PlanetTerrainManager {
 
     this.sharedIndices = new THREE.BufferAttribute(indices, 1);
     this.sharedUvs = new THREE.BufferAttribute(uvs, 2);
-    this.surfaceTexture = createPlanetSurfaceTexture();
+    this.noiseTexture = createTerrainNoiseTexture();
+    this.planetRadiusUniform.value = initialParams.planetRadius;
+    this.invMaxHeightUniform.value = 1 / Math.max(initialParams.maxHeight, 0.001);
 
     this.terrainMaterial = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -239,100 +331,101 @@ export class PlanetTerrainManager {
       emissiveIntensity: 0.04,
       wireframe: initialParams.wireframe,
       side: THREE.FrontSide,
+      fog: false,
+    });
+
+    this.unlitTerrainMaterial = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      wireframe: initialParams.wireframe,
+      side: THREE.FrontSide,
     });
 
     this.contourUniform.value = initialParams.showContours ? 1.0 : 0.0;
-    this.terrainMaterial.customProgramCacheKey = () => 'planet-terrain-grass-v1';
+    this.terrainMaterial.customProgramCacheKey = () => 'planet-terrain-opt-v5';
 
     this.terrainMaterial.onBeforeCompile = (shader) => {
       shader.uniforms.uShowContours = this.contourUniform;
-      shader.uniforms.uDetailTex = { value: this.surfaceTexture };
+      shader.uniforms.uNoiseTex = { value: this.noiseTexture };
       shader.uniforms.uGrassDetail = this.grassDetailUniform;
+      shader.uniforms.uHighDetailScale = this.highDetailScaleUniform;
+      shader.uniforms.uBumpEnabled = this.bumpEnabledUniform;
       shader.uniforms.uTime = this.timeUniform;
+      shader.uniforms.uPlanetRadius = this.planetRadiusUniform;
+      shader.uniforms.uInvMaxHeight = this.invMaxHeightUniform;
+      shader.uniforms.uDiagNoGrass = this.diagNoGrassUniform;
+      shader.uniforms.uDiagNoContours = this.diagNoContoursUniform;
+      shader.uniforms.uDiagNoPixelBiome = this.diagNoPixelBiomeUniform;
+      shader.uniforms.uDiagNoNoise = this.diagNoNoiseUniform;
+      shader.uniforms.uDiagNoTexture = this.diagNoTextureUniform;
+      shader.uniforms.uHorizonFogColor = this.horizonFogColorUniform;
+      shader.uniforms.uHorizonFogParams = this.horizonFogParamsUniform;
+      shader.uniforms.uMorphRange = this.morphRangeUniform;
 
       shader.vertexShader = shader.vertexShader
         .replace(
           '#include <common>',
           `#include <common>
-          attribute float aGrass;
-          varying float vGrass;
-          varying vec3 vPlanetPos;
-          varying vec3 vPlanetNormal;`,
+          attribute vec4 aTerrainData;
+          attribute vec4 aMorph;
+          varying highp vec3 vPlanetPos;
+          varying mediump vec3 vPlanetNormal;
+          varying mediump vec4 vTerrainData;
+          varying mediump float vHeightFactor;
+          varying mediump float vCamDist;
+          varying mediump float vDetailFade;
+          uniform float uPlanetRadius;
+          uniform float uInvMaxHeight;
+          uniform vec2 uMorphRange;`,
+        )
+        .replace(
+          '#include <beginnormal_vertex>',
+          `#include <beginnormal_vertex>
+          float planetCamDistV = distance(cameraPosition, (modelMatrix * vec4(position, 1.0)).xyz);
+          float morphT = smoothstep(uMorphRange.x, uMorphRange.y, planetCamDistV);
+          objectNormal = normalize(mix(objectNormal, aMorph.yzw, morphT));`,
+        )
+        .replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+          transformed += normalize(position) * (aMorph.x * morphT);`,
         )
         .replace(
           '#include <worldpos_vertex>',
           `#include <worldpos_vertex>
-          vPlanetPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+          vec4 planetWp = modelMatrix * vec4(transformed, 1.0);
+          vPlanetPos = planetWp.xyz;
           vPlanetNormal = normalize(mat3(modelMatrix) * objectNormal);
-          vGrass = aGrass;`,
+          vTerrainData = aTerrainData;
+          vHeightFactor = clamp((length(planetWp.xyz) - uPlanetRadius) * uInvMaxHeight, -1.0, 1.0);
+          vCamDist = distance(cameraPosition, planetWp.xyz);
+          vDetailFade = 1.0 - smoothstep(70.0, 120.0, vCamDist);`,
         );
 
       shader.fragmentShader = shader.fragmentShader
         .replace(
           '#include <common>',
           `#include <common>
-          varying vec3 vPlanetPos;
-          varying vec3 vPlanetNormal;
-          varying float vGrass;
-          uniform float uShowContours;
-          uniform float uGrassDetail;
-          uniform float uTime;
-          uniform sampler2D uDetailTex;
+          varying highp vec3 vPlanetPos;
+          varying mediump vec3 vPlanetNormal;
+          varying mediump vec4 vTerrainData;
+          varying mediump float vHeightFactor;
+          varying mediump float vCamDist;
+          varying mediump float vDetailFade;
+          uniform mediump float uShowContours;
+          uniform mediump float uGrassDetail;
+          uniform mediump float uHighDetailScale;
+          uniform mediump float uBumpEnabled;
+          uniform mediump float uTime;
+          uniform mediump float uDiagNoGrass;
+          uniform mediump float uDiagNoContours;
+          uniform mediump float uDiagNoPixelBiome;
+          uniform mediump float uDiagNoNoise;
+          uniform mediump float uDiagNoTexture;
+          uniform mediump vec3 uHorizonFogColor;
+          uniform mediump vec3 uHorizonFogParams;
+          uniform sampler2D uNoiseTex;
 
-          float grassHash31(vec3 p) {
-            p = fract(p * 0.1031);
-            p += dot(p, p.yzx + 33.33);
-            return fract((p.x + p.y) * p.z);
-          }
-
-          vec3 grassHash33(vec3 p) {
-            p = fract(p * vec3(0.1031, 0.1030, 0.0973));
-            p += dot(p, p.yxz + 33.33);
-            return fract((p.xxy + p.yxx) * p.zyx);
-          }
-
-          float grassNoise3D(vec3 p) {
-            vec3 i = floor(p);
-            vec3 f = fract(p);
-            vec3 u = f * f * (3.0 - 2.0 * f);
-            return mix(
-              mix(
-                mix(grassHash31(i + vec3(0.0, 0.0, 0.0)), grassHash31(i + vec3(1.0, 0.0, 0.0)), u.x),
-                mix(grassHash31(i + vec3(0.0, 1.0, 0.0)), grassHash31(i + vec3(1.0, 1.0, 0.0)), u.x),
-                u.y
-              ),
-              mix(
-                mix(grassHash31(i + vec3(0.0, 0.0, 1.0)), grassHash31(i + vec3(1.0, 0.0, 1.0)), u.x),
-                mix(grassHash31(i + vec3(0.0, 1.0, 1.0)), grassHash31(i + vec3(1.0, 1.0, 1.0)), u.x),
-                u.y
-              ),
-              u.z
-            );
-          }
-
-          vec2 grassVoronoi3D(vec3 p) {
-            vec3 i = floor(p);
-            vec3 f = fract(p);
-            float minD = 8.0;
-            float cellId = 0.0;
-            for (int z = -1; z <= 1; z++) {
-              for (int y = -1; y <= 1; y++) {
-                for (int x = -1; x <= 1; x++) {
-                  vec3 neighbor = vec3(float(x), float(y), float(z));
-                  vec3 rnd = grassHash33(i + neighbor);
-                  vec3 diff = neighbor + rnd - f;
-                  float d = dot(diff, diff);
-                  if (d < minD) {
-                    minD = d;
-                    cellId = rnd.x;
-                  }
-                }
-              }
-            }
-            return vec2(sqrt(minD), cellId);
-          }
-
-          vec3 grassPerturbNormalArb(vec3 surf_pos, vec3 surf_norm, vec2 dHdxy, float faceDir) {
+          mediump vec3 grassPerturbNormalArb(vec3 surf_pos, vec3 surf_norm, mediump vec2 dHdxy, float faceDir) {
             vec3 dPosX = dFdx(surf_pos.xyz);
             vec3 dPosY = dFdy(surf_pos.xyz);
             float lenX = length(dPosX);
@@ -353,96 +446,145 @@ export class PlanetTerrainManager {
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
-          vec3 triW = abs(vPlanetNormal);
-          triW *= triW;
-          triW *= triW;
-          triW /= max(triW.x + triW.y + triW.z, 0.0001);
-          float texScale = 0.018;
-          vec3 tx = texture2D(uDetailTex, vPlanetPos.yz * texScale).rgb;
-          vec3 ty = texture2D(uDetailTex, vPlanetPos.xz * texScale).rgb;
-          vec3 tz = texture2D(uDetailTex, vPlanetPos.xy * texScale).rgb;
-          vec3 detailTint = tx * triW.x + ty * triW.y + tz * triW.z;
-          float lum = dot(detailTint, vec3(0.299, 0.587, 0.114));
-          diffuseColor.rgb *= mix(1.0, lum * 1.5, 0.45);
+          mediump float grassBumpH = 0.0;
+          mediump float grassNearFade = 0.0;
+          mediump float highDetail = uGrassDetail * uHighDetailScale;
+          mediump float vGrass = vTerrainData.x;
+          mediump vec4 noiseVal = vec4(0.5, 0.5, 0.5, 0.0);
+          mediump float flowerRaw = 0.0;
 
-          float grassCamDist = distance(cameraPosition, vPlanetPos);
-          float grassNearFade = 1.0 - smoothstep(35.0, 150.0, grassCamDist);
-          float grassBumpH = 0.0;
-
-          if (vGrass > 0.001) {
-            // 1. Macro patches (~0.035)
-            float patchN = grassNoise3D(vPlanetPos * 0.035);
-            vec3 grassTint = mix(vec3(0.62, 0.78, 0.30), vec3(0.24, 0.62, 0.38), patchN);
-            float grassTintMean = (grassTint.r + grassTint.g + grassTint.b) / 3.0;
-            diffuseColor.rgb *= mix(vec3(1.0), grassTint / max(grassTintMean, 0.001), vGrass * 0.75);
-
-            // 2. Medium scale (~0.25) +-12%
-            float medN = grassNoise3D(vPlanetPos * 0.25 + vec3(5.2, 13.7, 9.1));
-            diffuseColor.rgb *= 1.0 + (medN * 2.0 - 1.0) * 0.12 * vGrass;
-
-            // 5. Subtle wind brightness wave
-            if (uGrassDetail > 0.3 && grassNearFade > 0.001) {
-              float windWave = 0.04 * sin(uTime * 1.2 + dot(vPlanetPos, vec3(0.3, 0.2, 0.4)));
-              diffuseColor.rgb *= 1.0 + windWave * grassNearFade * vGrass;
-            }
-
-            // 3. Close fur layers (~4 and ~9) + synthetic height for bump (only on grassy nearby pixels)
-            if (uGrassDetail > 0.3 && grassNearFade > 0.001) {
-              float gN1 = grassNoise3D(vPlanetPos * 4.0);
-              float gN2 = grassNoise3D(vPlanetPos * 9.0 + vec3(17.3, 31.7, 11.1));
-              float gTips = smoothstep(0.55, 0.9, gN1);
-              float gTufts = smoothstep(0.5, 0.85, gN2);
-              grassBumpH = gTips - gTufts * 0.65;
-              float furShade = (gTips - gTufts) * 0.18;
-              diffuseColor.rgb *= 1.0 + furShade * grassNearFade * uGrassDetail * vGrass;
-            }
-
-            // 4. Flowers (Voronoi ~1.4, ~12% cells)
-            if (uGrassDetail > 0.5 && vGrass > 0.6 && grassCamDist < 60.0) {
-              vec2 vor = grassVoronoi3D(vPlanetPos * 1.4);
-              if (vor.y < 0.12) {
-                float dotMask = (1.0 - smoothstep(0.06, 0.14, vor.x)) * (1.0 - smoothstep(45.0, 60.0, grassCamDist));
-                if (dotMask > 0.001) {
-                  float colPick = fract(vor.y * 83.71);
-                  vec3 flowerCol = colPick < 0.333
-                    ? vec3(0.98, 0.98, 0.95)
-                    : colPick < 0.666
-                      ? vec3(0.98, 0.86, 0.25)
-                      : vec3(0.96, 0.52, 0.72);
-                  float flowerBlend = dotMask * smoothstep(0.6, 0.78, vGrass) * 0.9;
-                  diffuseColor.rgb = mix(diffuseColor.rgb, flowerCol, flowerBlend);
-                }
+          if (uDiagNoNoise < 0.5 && uDiagNoTexture < 0.5) {
+            mediump vec3 an = abs(vPlanetNormal);
+            highp vec2 uv1;
+            highp vec2 uv2;
+            mediump float w1;
+            mediump float w2;
+            if (an.y >= an.x && an.y >= an.z) {
+              uv1 = vPlanetPos.xz;
+              w1 = an.y;
+              if (an.x >= an.z) {
+                uv2 = vPlanetPos.yz;
+                w2 = an.x;
+              } else {
+                uv2 = vPlanetPos.xy;
+                w2 = an.z;
               }
+            } else if (an.x >= an.y && an.x >= an.z) {
+              uv1 = vPlanetPos.yz;
+              w1 = an.x;
+              if (an.y >= an.z) {
+                uv2 = vPlanetPos.xz;
+                w2 = an.y;
+              } else {
+                uv2 = vPlanetPos.xy;
+                w2 = an.z;
+              }
+            } else {
+              uv1 = vPlanetPos.xy;
+              w1 = an.z;
+              if (an.y >= an.x) {
+                uv2 = vPlanetPos.xz;
+                w2 = an.y;
+              } else {
+                uv2 = vPlanetPos.yz;
+                w2 = an.x;
+              }
+            }
+            w1 = max(w1 - 0.57735, 0.0001);
+            w2 = max(w2 - 0.57735, 0.0);
+            w1 *= w1;
+            w2 *= w2;
+            mediump float wInv = 1.0 / (w1 + w2);
+            w1 *= wInv;
+            w2 *= wInv;
+
+            mediump vec4 n1 = texture2D(uNoiseTex, uv1 * 0.055);
+            if (vDetailFade > 0.001 && w2 > 0.001) {
+              mediump vec4 n2 = texture2D(uNoiseTex, uv2 * 0.055);
+              noiseVal = n1 * w1 + n2 * w2;
+              flowerRaw = max(n1.a * step(0.12, w1), n2.a * step(0.12, w2));
+            } else {
+              noiseVal = n1;
+              flowerRaw = n1.a;
             }
           }
 
-          if (uShowContours > 0.5 && grassCamDist < 220.0) {
-            float r = length(vPlanetPos);
-            float e = abs(fract(r * 0.18 - 0.5) - 0.5) / max(fwidth(r * 0.18), 0.0001);
-            float contourLine = 1.0 - min(e, 1.0);
+          // Continuous snow, polar ice, and coastal softness driven by interpolated vertex masks + 1 noise breakup
+          mediump float nBreak = (noiseVal.r - 0.5) * 0.22;
+          mediump float snowMask = smoothstep(0.14, 0.88, vTerrainData.y + nBreak);
+          mediump float polarMask = smoothstep(0.14, 0.88, vTerrainData.w + nBreak * 0.8);
+          mediump float iceBlend = max(snowMask, polarMask);
+          mediump vec3 iceCol = mix(
+            vec3(0.859, 0.918, 0.996),
+            vec3(0.957, 0.969, 0.984),
+            smoothstep(0.25, 0.65, vTerrainData.z + nBreak * 0.4)
+          );
+          diffuseColor.rgb = mix(diffuseColor.rgb, iceCol, iceBlend);
 
-            vec3 dir = vPlanetPos / max(r, 0.001);
-            float lat = asin(clamp(dir.y, -1.0, 1.0)) * 8.0;
-            float lon = atan(dir.z, dir.x) * 8.0;
-            float gLat = abs(fract(lat - 0.5) - 0.5) / max(fwidth(lat), 0.0001);
-            float gLon = abs(fract(lon - 0.5) - 0.5) / max(fwidth(lon), 0.0001);
-            float gridLine = 1.0 - min(min(gLat, gLon), 1.0);
+          if (vDetailFade > 0.001) {
+            if (uDiagNoPixelBiome < 0.5 && uDiagNoTexture < 0.5) {
+              mediump float mineralLum = mix(0.84, 1.16, noiseVal.r * 0.55 + noiseVal.g * 0.45);
+              mediump float heightTint = mix(0.95, 1.04, clamp(vHeightFactor * 0.5 + 0.5, 0.0, 1.0));
+              diffuseColor.rgb *= mix(1.0, mineralLum * heightTint, 0.42 * vDetailFade);
+            }
 
-            float distFade = 1.0 - smoothstep(60.0, 220.0, grassCamDist);
-            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.38, 0.82, 1.0), gridLine * 0.08 * distFade);
-            diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.8, 0.55, 1.0), contourLine * 0.12 * distFade);
+            if (uDiagNoGrass < 0.5 && uDiagNoTexture < 0.5 && uGrassDetail > 0.0 && vGrass > 0.001) {
+              grassNearFade = 1.0 - smoothstep(32.0, 95.0, vCamDist);
+
+              mediump vec3 grassTint = mix(vec3(0.62, 0.78, 0.30), vec3(0.24, 0.62, 0.38), noiseVal.r);
+              mediump float grassTintMean = (grassTint.r + grassTint.g + grassTint.b) * 0.3333;
+              diffuseColor.rgb *= mix(vec3(1.0), grassTint / max(grassTintMean, 0.001), vGrass * 0.75 * vDetailFade);
+
+              diffuseColor.rgb *= 1.0 + (noiseVal.g * 2.0 - 1.0) * 0.12 * vGrass * vDetailFade;
+
+              if (uGrassDetail >= 0.5 && grassNearFade > 0.001) {
+                mediump float windWave = 0.04 * sin(uTime * 1.2 + dot(vPlanetPos, vec3(0.3, 0.2, 0.4)));
+                mediump float gTips = smoothstep(0.50, 0.88, noiseVal.b);
+                mediump float gTufts = smoothstep(0.45, 0.85, noiseVal.g);
+                grassBumpH = uGrassDetail >= 0.8 ? (gTips - gTufts * 0.65) : gTips;
+                mediump float furShade = uGrassDetail >= 0.8 ? (gTips - gTufts) * 0.18 : (gTips - 0.35) * 0.22;
+                diffuseColor.rgb *= (1.0 + windWave * grassNearFade * vGrass) * (1.0 + furShade * grassNearFade * uGrassDetail * vGrass);
+              }
+
+              if (highDetail >= 0.8 && vGrass > 0.6 && vCamDist < 55.0 && flowerRaw > 0.01) {
+                mediump float dotMask = flowerRaw * (1.0 - smoothstep(40.0, 55.0, vCamDist));
+                mediump float colPick = fract(noiseVal.g * 7.31 + noiseVal.r * 3.17);
+                mediump vec3 flowerCol = colPick < 0.333
+                  ? vec3(0.98, 0.98, 0.95)
+                  : colPick < 0.666
+                    ? vec3(0.98, 0.86, 0.25)
+                    : vec3(0.96, 0.52, 0.72);
+                mediump float flowerBlend = dotMask * smoothstep(0.6, 0.78, vGrass) * 0.9;
+                diffuseColor.rgb = mix(diffuseColor.rgb, flowerCol, flowerBlend);
+              }
+            }
+
+            if (uShowContours > 0.5 && uDiagNoContours < 0.5) {
+              highp float r = length(vPlanetPos);
+              mediump float contourCoord = r * 0.18;
+              mediump float fw = max(fwidth(contourCoord), 0.0001);
+              mediump float e = abs(fract(contourCoord - 0.5) - 0.5) / fw;
+              mediump float contourLine = 1.0 - min(e, 1.0);
+              diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.8, 0.55, 1.0), contourLine * 0.14 * vDetailFade);
+            }
           }`,
         )
         .replace(
           '#include <normal_fragment_maps>',
           `#include <normal_fragment_maps>
-          if (uGrassDetail > 0.3 && vGrass > 0.001 && grassNearFade > 0.001) {
-            float grassBumpAmp = 0.35 * grassNearFade * uGrassDetail * vGrass;
+          if (uBumpEnabled > 0.5 && uDiagNoGrass < 0.5 && uDiagNoNoise < 0.5 && uDiagNoTexture < 0.5 && highDetail >= 0.9 && vGrass > 0.001 && grassNearFade > 0.001) {
+            mediump float grassBumpAmp = 0.35 * grassNearFade * uGrassDetail * vGrass;
             if (grassBumpAmp > 0.001) {
-              vec2 grassDH = vec2(dFdx(grassBumpH), dFdy(grassBumpH));
+              mediump vec2 grassDH = clamp(vec2(dFdx(grassBumpH), dFdy(grassBumpH)), -0.35, 0.35);
               normal = grassPerturbNormalArb(-vViewPosition, normal, grassDH * grassBumpAmp, faceDirection);
             }
           }`,
+        )
+        .replace(
+          '#include <fog_fragment>',
+          `#include <fog_fragment>
+          mediump float hFogFactor = smoothstep(uHorizonFogParams.x, uHorizonFogParams.y, vCamDist) * uHorizonFogParams.z;
+          gl_FragColor.rgb = mix(gl_FragColor.rgb, uHorizonFogColor, hFogFactor);`,
         );
     };
 
@@ -470,8 +612,12 @@ export class PlanetTerrainManager {
             new THREE.BufferAttribute(new Float32Array(vc * 3), 3),
           );
           geometry.setAttribute(
-            'aGrass',
-            new THREE.BufferAttribute(new Float32Array(vc), 1),
+            'aTerrainData',
+            new THREE.BufferAttribute(new Float32Array(vc * 4), 4),
+          );
+          geometry.setAttribute(
+            'aMorph',
+            new THREE.BufferAttribute(new Float32Array(vc * 4), 4),
           );
           geometry.setAttribute('uv', this.sharedUvs);
           geometry.setIndex(this.sharedIndices);
@@ -525,6 +671,63 @@ export class PlanetTerrainManager {
       }
     }
 
+    // Single-draw Orbital Planet Mesh (6 faces * 32x32 segments, simple Lambert vertex-colored terrain)
+    const orbVertsPerFace = (ORBITAL_SEGMENTS + 1) * (ORBITAL_SEGMENTS + 1);
+    const orbTotalVerts = CUBE_FACES.length * orbVertsPerFace;
+    const orbIndices = new Uint16Array(
+      CUBE_FACES.length * ORBITAL_SEGMENTS * ORBITAL_SEGMENTS * 6,
+    );
+    let oti = 0;
+    for (let f = 0; f < CUBE_FACES.length; f++) {
+      const baseV = f * orbVertsPerFace;
+      for (let y = 0; y < ORBITAL_SEGMENTS; y++) {
+        for (let x = 0; x < ORBITAL_SEGMENTS; x++) {
+          const tl = baseV + y * (ORBITAL_SEGMENTS + 1) + x;
+          const tr = tl + 1;
+          const bl = tl + (ORBITAL_SEGMENTS + 1);
+          const br = bl + 1;
+          orbIndices[oti++] = tl;
+          orbIndices[oti++] = tr;
+          orbIndices[oti++] = bl;
+          orbIndices[oti++] = tr;
+          orbIndices[oti++] = br;
+          orbIndices[oti++] = bl;
+        }
+      }
+    }
+    this.orbitalGeometry = new THREE.BufferGeometry();
+    this.orbitalGeometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(orbTotalVerts * 3), 3),
+    );
+    this.orbitalGeometry.setAttribute(
+      'color',
+      new THREE.BufferAttribute(new Float32Array(orbTotalVerts * 3), 3),
+    );
+    this.orbitalGeometry.setAttribute(
+      'normal',
+      new THREE.BufferAttribute(new Float32Array(orbTotalVerts * 3), 3),
+    );
+    this.orbitalGeometry.setAttribute(
+      'aTerrainData',
+      new THREE.BufferAttribute(new Float32Array(orbTotalVerts * 4), 4),
+    );
+    this.orbitalGeometry.setAttribute(
+      'aMorph',
+      new THREE.BufferAttribute(new Float32Array(orbTotalVerts * 4), 4),
+    );
+    this.orbitalGeometry.setIndex(new THREE.BufferAttribute(orbIndices, 1));
+    this.orbitalMaterial = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      wireframe: initialParams.wireframe,
+      side: THREE.FrontSide,
+    });
+    this.orbitalMesh = new THREE.Mesh(this.orbitalGeometry, this.orbitalMaterial);
+    this.orbitalMesh.visible = false;
+    this.orbitalMesh.receiveShadow = false;
+    this.orbitalMesh.castShadow = false;
+    this.root.add(this.orbitalMesh);
+
     // Cyan-to-Violet Atmospheric Fresnel Glow Shell with Day/Night Terminator
     this.atmosphereGeo = new THREE.SphereGeometry(1, 36, 24);
     this.atmosphereMat = new THREE.ShaderMaterial({
@@ -571,6 +774,7 @@ export class PlanetTerrainManager {
     });
     this.atmosphereMesh = new THREE.Mesh(this.atmosphereGeo, this.atmosphereMat);
     this.atmosphereMesh.renderOrder = 4;
+    this.atmosphereMesh.userData.perfTag = 'atmLua';
     this.root.add(this.atmosphereMesh);
 
     // Distant Orbiting Moon (unit radius geometry scaled to planetRadius * MOON_RADIUS_RATIO)
@@ -583,10 +787,11 @@ export class PlanetTerrainManager {
       flatShading: true,
     });
     this.moonMesh = new THREE.Mesh(this.moonGeo, this.moonMat);
+    this.moonPivot.userData.perfTag = 'atmLua';
     this.moonPivot.add(this.moonMesh);
     this.root.add(this.moonPivot);
 
-    this.rebuildPlanet();
+    this.rebuildPlanetSync();
   }
 
   public get patchCount(): number {
@@ -594,6 +799,7 @@ export class PlanetTerrainManager {
   }
 
   public getVisiblePatchCount(): number {
+    if (this.orbitalMesh.visible) return 1;
     let count = 0;
     for (let i = 0; i < this.patches.length; i++) {
       if (this.patches[i].mesh.visible) count++;
@@ -601,8 +807,160 @@ export class PlanetTerrainManager {
     return count;
   }
 
-  public setGrassDetail(detail: number): void {
+  public consumeBuiltPatchCount(): number {
+    const count = this.builtPatchCounter;
+    this.builtPatchCounter = 0;
+    return count;
+  }
+
+  private warmupSavedOrbitalVisible = false;
+  private warmupSavedOrbitalReceiveShadow = false;
+  private warmupSavedAtmoVisible = true;
+  private warmupSavedMoonVisible = true;
+  private readonly warmupSavedPatchVisible: boolean[] = [];
+  private readonly warmupSavedPatchShadow: boolean[] = [];
+
+  public prepareForShaderWarmup(shadowsEnabled: boolean): void {
+    this.warmupSavedOrbitalVisible = this.orbitalMesh.visible;
+    this.warmupSavedOrbitalReceiveShadow = this.orbitalMesh.receiveShadow;
+    this.warmupSavedAtmoVisible = this.atmosphereMesh.visible;
+    this.warmupSavedMoonVisible = this.moonMesh.visible;
+    this.warmupSavedPatchVisible.length = 0;
+    this.warmupSavedPatchShadow.length = 0;
+
+    this.orbitalMesh.visible = true;
+    this.atmosphereMesh.visible = true;
+    this.moonMesh.visible = true;
+
+    for (let i = 0; i < this.patches.length; i++) {
+      const m = this.patches[i].mesh;
+      this.warmupSavedPatchVisible.push(m.visible);
+      this.warmupSavedPatchShadow.push(m.receiveShadow);
+      m.visible = true;
+      // Ensure both shadowed and unshadowed terrain shader variants compile
+      m.receiveShadow = i === 0 ? false : shadowsEnabled;
+    }
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    this.orbitalMesh.visible = this.warmupSavedOrbitalVisible;
+    this.orbitalMesh.receiveShadow = this.warmupSavedOrbitalReceiveShadow;
+    this.atmosphereMesh.visible = this.warmupSavedAtmoVisible;
+    this.moonMesh.visible = this.warmupSavedMoonVisible;
+    for (let i = 0; i < this.patches.length; i++) {
+      const m = this.patches[i].mesh;
+      if (i < this.warmupSavedPatchVisible.length) {
+        m.visible = this.warmupSavedPatchVisible[i];
+        m.receiveShadow = this.warmupSavedPatchShadow[i];
+      }
+    }
+  }
+
+  public setGrassDetail(detail: number, isLowSpec = false): void {
     this.grassDetailUniform.value = THREE.MathUtils.clamp(detail, 0, 1);
+    this.highDetailScaleUniform.value = isLowSpec ? 0.7 : 1.0;
+    this.bumpEnabledUniform.value = isLowSpec ? 0.0 : 1.0;
+  }
+
+  public setForceOrbitalTerrain(force: boolean): void {
+    this.forceOrbitalTerrain = force;
+    this.syncOrbitalMaterial();
+  }
+
+  public setTerrainFewerPatches(enabled: boolean): void {
+    this.terrainFewerPatches = enabled;
+    this.syncOrbitalMaterial();
+  }
+
+  public setTerrainNoTexture(disabled: boolean): void {
+    this.diagNoTextureUniform.value = disabled ? 1.0 : 0.0;
+  }
+
+  public setHorizonFog(
+    srgbR: number,
+    srgbG: number,
+    srgbB: number,
+    fogNear: number,
+    fogFar: number,
+    fogStrength: number,
+  ): void {
+    this.horizonFogColorUniform.value.setRGB(srgbR, srgbG, srgbB);
+    this.horizonFogParamsUniform.value.set(fogNear, fogFar, fogStrength);
+  }
+
+  public setMorphRange(near: number, far: number): void {
+    this.morphRangeUniform.value.set(near, far);
+  }
+
+  public setTerrainNoLighting(disabled: boolean): void {
+    if (this.terrainNoLighting === disabled) return;
+    this.terrainNoLighting = disabled;
+    const mat = disabled ? this.unlitTerrainMaterial : this.terrainMaterial;
+    for (let i = 0; i < this.patches.length; i++) {
+      this.patches[i].mesh.material = mat;
+    }
+    this.syncOrbitalMaterial();
+  }
+
+  private syncOrbitalMaterial(): void {
+    if (this.forceOrbitalTerrain || this.isOrbitalMode) {
+      this.orbitalMesh.material = this.orbitalMaterial;
+      this.orbitalMesh.receiveShadow = false;
+    } else if (this.terrainFewerPatches) {
+      this.orbitalMesh.material = this.terrainNoLighting
+        ? this.unlitTerrainMaterial
+        : this.terrainMaterial;
+      this.orbitalMesh.receiveShadow =
+        !this.noReceiveShadow && !this.terrainNoLighting;
+    }
+  }
+
+  public setAtmosphereVisible(visible: boolean): void {
+    this.atmosphereMesh.visible = visible;
+  }
+
+  public setTerrainShaderDiagnostics(opts: {
+    noProceduralGrass: boolean;
+    noContours: boolean;
+    noPixelBiomeBlend: boolean;
+    noNoiseDetail: boolean;
+  }): void {
+    this.diagNoGrassUniform.value = opts.noProceduralGrass ? 1.0 : 0.0;
+    this.diagNoContoursUniform.value = opts.noContours ? 1.0 : 0.0;
+    this.diagNoPixelBiomeUniform.value = opts.noPixelBiomeBlend ? 1.0 : 0.0;
+    this.diagNoNoiseUniform.value = opts.noNoiseDetail ? 1.0 : 0.0;
+  }
+
+  public setNoReceiveShadow(disabled: boolean): void {
+    this.noReceiveShadow = disabled;
+    this.syncOrbitalMaterial();
+    if (disabled) {
+      for (let i = 0; i < this.patches.length; i++) {
+        this.patches[i].mesh.receiveShadow = false;
+      }
+      return;
+    }
+    if (this.hasShadowFocus) {
+      this.applyPatchShadowMask(this.lastShadowFocus);
+    } else {
+      for (let i = 0; i < this.patches.length; i++) {
+        this.patches[i].mesh.receiveShadow = true;
+      }
+    }
+  }
+
+  private applyPatchShadowMask(shadowFocus: THREE.Vector3): void {
+    for (let i = 0; i < this.patches.length; i++) {
+      const patch = this.patches[i];
+      if (this.noReceiveShadow) {
+        patch.mesh.receiveShadow = false;
+      } else {
+        const bs = patch.geometry.boundingSphere;
+        patch.mesh.receiveShadow = bs
+          ? bs.center.distanceTo(shadowFocus) <= bs.radius + 60
+          : true;
+      }
+    }
   }
 
   public getMoonState(): {
@@ -971,13 +1329,48 @@ export class PlanetTerrainManager {
     if (sunDir) {
       this.atmosphereMat.uniforms.uSunDir.value.copy(sunDir).normalize();
     }
+    if (this.rebuildPending) {
+      this.stepRebuild();
+    }
   }
 
   public updateHorizonCulling(
     cameraPos: THREE.Vector3,
     camera?: THREE.Camera,
+    focusPos?: THREE.Vector3,
   ): void {
+    const shadowRef = focusPos ?? cameraPos;
+    this.lastShadowFocus.copy(shadowRef);
+    this.hasShadowFocus = true;
+
     const camDist = cameraPos.length();
+    const camAlt = camDist - this.params.planetRadius;
+    const atmo = Math.max(1, this.params.atmosphereHeight);
+
+    const prevOrbital = this.isOrbitalMode;
+    if (!this.isOrbitalMode && camAlt > atmo * 2.2) {
+      this.isOrbitalMode = true;
+    } else if (this.isOrbitalMode && camAlt < atmo * 1.8) {
+      this.isOrbitalMode = false;
+    }
+    if (prevOrbital !== this.isOrbitalMode) {
+      this.syncOrbitalMaterial();
+    }
+
+    if (
+      this.forceOrbitalTerrain ||
+      this.isOrbitalMode ||
+      this.terrainFewerPatches
+    ) {
+      this.syncOrbitalMaterial();
+      this.orbitalMesh.visible = true;
+      for (let i = 0; i < this.patches.length; i++) {
+        this.patches[i].mesh.visible = false;
+      }
+      return;
+    }
+
+    this.orbitalMesh.visible = false;
     const applyHorizon = camDist > this.params.planetRadius;
 
     let horizonAngle = Math.PI;
@@ -1011,6 +1404,16 @@ export class PlanetTerrainManager {
         visible = _cullFrustum.intersectsSphere(patch.geometry.boundingSphere);
       }
       patch.mesh.visible = visible;
+      if (visible) {
+        if (this.noReceiveShadow) {
+          patch.mesh.receiveShadow = false;
+        } else {
+          const bs = patch.geometry.boundingSphere;
+          patch.mesh.receiveShadow = bs
+            ? bs.center.distanceTo(shadowRef) <= bs.radius + 60
+            : true;
+        }
+      }
     }
   }
 
@@ -1026,11 +1429,15 @@ export class PlanetTerrainManager {
       next.planetRadius !== this.params.planetRadius;
 
     this.terrainMaterial.wireframe = next.wireframe;
+    this.unlitTerrainMaterial.wireframe = next.wireframe;
+    this.orbitalMaterial.wireframe = next.wireframe;
     this.contourUniform.value = next.showContours ? 1.0 : 0.0;
+    this.planetRadiusUniform.value = next.planetRadius;
+    this.invMaxHeightUniform.value = 1 / Math.max(next.maxHeight, 0.001);
     this.params = { ...next };
 
     if (geoChanged) {
-      this.rebuildPlanet();
+      this.scheduleRebuild();
     } else if (atmoChanged) {
       this.syncShellScales();
     }
@@ -1060,8 +1467,20 @@ export class PlanetTerrainManager {
     noiseScale: number,
     maxHeight: number,
     seaLevel: number,
+    rawH: number,
   ): [number, number, number] {
-    const eps = 0.008;
+    const safeMaxH = Math.max(maxHeight, 0.001);
+    const rawHNorm = rawH / safeMaxH;
+    const landSlopeWeight = smoothstep(
+      seaLevel - 0.025,
+      seaLevel + 0.035,
+      rawHNorm,
+    );
+    if (landSlopeWeight <= 0.0001) {
+      return [nx, ny, nz];
+    }
+
+    const eps = 0.006;
     const ax = Math.abs(ny) < 0.9 ? 0 : 1;
     const ay = Math.abs(ny) < 0.9 ? 1 : 0;
     const az = 0;
@@ -1078,159 +1497,362 @@ export class PlanetTerrainManager {
     const t2y = nz * t1x - nx * t1z;
     const t2z = nx * t1y - ny * t1x;
 
-    const sample = (dx: number, dy: number, dz: number) => {
+    const sampleH = (dx: number, dy: number, dz: number) => {
       const len = Math.hypot(dx, dy, dz) || 1;
-      const ux = dx / len;
-      const uy = dy / len;
-      const uz = dz / len;
-      const r =
-        planetRadius +
-        getPlanetSurfaceHeight(
-          ux,
-          uy,
-          uz,
-          planetRadius,
-          noiseScale,
-          maxHeight,
-          seaLevel,
-        );
-      return [ux * r, uy * r, uz * r];
+      return getPlanetTerrainHeight(
+        dx / len,
+        dy / len,
+        dz / len,
+        planetRadius,
+        noiseScale,
+        maxHeight,
+      );
     };
 
-    const p1a = sample(nx + t1x * eps, ny + t1y * eps, nz + t1z * eps);
-    const p1b = sample(nx - t1x * eps, ny - t1y * eps, nz - t1z * eps);
-    const p2a = sample(nx + t2x * eps, ny + t2y * eps, nz + t2z * eps);
-    const p2b = sample(nx - t2x * eps, ny - t2y * eps, nz - t2z * eps);
+    const h1a = sampleH(nx + t1x * eps, ny + t1y * eps, nz + t1z * eps);
+    const h1b = sampleH(nx - t1x * eps, ny - t1y * eps, nz - t1z * eps);
+    const h2a = sampleH(nx + t2x * eps, ny + t2y * eps, nz + t2z * eps);
+    const h2b = sampleH(nx - t2x * eps, ny - t2y * eps, nz - t2z * eps);
 
-    const d1x = p1a[0] - p1b[0];
-    const d1y = p1a[1] - p1b[1];
-    const d1z = p1a[2] - p1b[2];
+    const r = planetRadius + Math.max(rawH, seaLevel * maxHeight);
+    const invStep = landSlopeWeight / (2 * eps * Math.max(r, 1));
+    const dh1 = (h1a - h1b) * invStep;
+    const dh2 = (h2a - h2b) * invStep;
 
-    const d2x = p2a[0] - p2b[0];
-    const d2y = p2a[1] - p2b[1];
-    const d2z = p2a[2] - p2b[2];
-
-    let outX = d1y * d2z - d1z * d2y;
-    let outY = d1z * d2x - d1x * d2z;
-    let outZ = d1x * d2y - d1y * d2x;
-    if (outX * nx + outY * ny + outZ * nz < 0) {
-      outX = -outX;
-      outY = -outY;
-      outZ = -outZ;
-    }
+    const outX = nx - t1x * dh1 - t2x * dh2;
+    const outY = ny - t1y * dh1 - t2y * dh2;
+    const outZ = nz - t1z * dh1 - t2z * dh2;
     const outLen = Math.hypot(outX, outY, outZ) || 1;
     return [outX / outLen, outY / outLen, outZ / outLen];
   }
 
-  private rebuildPlanet(): void {
+  private buildSinglePatch(patchIdx: number): void {
+    const patch = this.patches[patchIdx];
     const { planetRadius, maxHeight, noiseScale, seaLevel } = this.params;
     const safeMaxH = Math.max(maxHeight, 0.001);
     const seaFloorH = seaLevel * maxHeight;
     const patchSpan = 2 / PATCH_SUBDIV;
 
-    for (const patch of this.patches) {
-      const face = CUBE_FACES[patch.faceIdx];
-      const uStart = -1 + patch.pu * patchSpan;
-      const vStart = -1 + patch.pv * patchSpan;
+    const face = CUBE_FACES[patch.faceIdx];
+    const uStart = -1 + patch.pu * patchSpan;
+    const vStart = -1 + patch.pv * patchSpan;
 
-      const posAttr = patch.geometry.getAttribute(
-        'position',
-      ) as THREE.BufferAttribute;
-      const colAttr = patch.geometry.getAttribute(
-        'color',
-      ) as THREE.BufferAttribute;
-      const normAttr = patch.geometry.getAttribute(
-        'normal',
-      ) as THREE.BufferAttribute;
-      const grassAttr = patch.geometry.getAttribute(
-        'aGrass',
-      ) as THREE.BufferAttribute;
+    const posAttr = patch.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const colAttr = patch.geometry.getAttribute('color') as THREE.BufferAttribute;
+    const normAttr = patch.geometry.getAttribute('normal') as THREE.BufferAttribute;
+    const dataAttr = patch.geometry.getAttribute('aTerrainData') as THREE.BufferAttribute;
+    const morphAttr = patch.geometry.getAttribute('aMorph') as THREE.BufferAttribute;
 
-      const positions = posAttr.array as Float32Array;
-      const colors = colAttr.array as Float32Array;
-      const normals = normAttr.array as Float32Array;
-      const grass = grassAttr.array as Float32Array;
+    const positions = posAttr.array as Float32Array;
+    const colors = colAttr.array as Float32Array;
+    const normals = normAttr.array as Float32Array;
+    const terrainData = dataAttr.array as Float32Array;
+    const morphs = morphAttr.array as Float32Array;
 
-      let vi = 0;
-      for (let py = 0; py <= PATCH_SEGMENTS; py++) {
-        const v = vStart + (py / PATCH_SEGMENTS) * patchSpan;
-        for (let px = 0; px <= PATCH_SEGMENTS; px++) {
-          const u = uStart + (px / PATCH_SEGMENTS) * patchSpan;
+    let vi = 0;
+    for (let py = 0; py <= PATCH_SEGMENTS; py++) {
+      const v = vStart + (py / PATCH_SEGMENTS) * patchSpan;
+      for (let px = 0; px <= PATCH_SEGMENTS; px++) {
+        const u = uStart + (px / PATCH_SEGMENTS) * patchSpan;
 
-          const cx =
-            face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0];
-          const cy =
-            face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1];
-          const cz =
-            face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2];
+        const cx = face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0];
+        const cy = face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1];
+        const cz = face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2];
 
-          const { nx, ny, nz } = spherifyCubePoint(cx, cy, cz);
-          const rawH = getPlanetTerrainHeight(
-            nx,
-            ny,
-            nz,
-            planetRadius,
-            noiseScale,
-            maxHeight,
-          );
-          const h = Math.max(rawH, seaFloorH);
-          const r = planetRadius + h;
+        const { nx, ny, nz } = spherifyCubePoint(cx, cy, cz);
+        const rawH = getPlanetTerrainHeight(
+          nx,
+          ny,
+          nz,
+          planetRadius,
+          noiseScale,
+          maxHeight,
+        );
+        const h = Math.max(rawH, seaFloorH);
+        const r = planetRadius + h;
 
-          positions[vi * 3] = nx * r;
-          positions[vi * 3 + 1] = ny * r;
-          positions[vi * 3 + 2] = nz * r;
+        _patchRGrid[vi] = r;
+        positions[vi * 3] = nx * r;
+        positions[vi * 3 + 1] = ny * r;
+        positions[vi * 3 + 2] = nz * r;
 
-          const [snx, sny, snz] = this.computeSmoothTerrainNormal(
-            nx,
-            ny,
-            nz,
-            planetRadius,
-            noiseScale,
-            maxHeight,
-            seaLevel,
-          );
-          normals[vi * 3] = snx;
-          normals[vi * 3 + 1] = sny;
-          normals[vi * 3 + 2] = snz;
+        const [snx, sny, snz] = this.computeSmoothTerrainNormal(
+          nx,
+          ny,
+          nz,
+          planetRadius,
+          noiseScale,
+          maxHeight,
+          seaLevel,
+          rawH,
+        );
+        normals[vi * 3] = snx;
+        normals[vi * 3 + 1] = sny;
+        normals[vi * 3 + 2] = snz;
+        _patchNGrid[vi * 3] = snx;
+        _patchNGrid[vi * 3 + 1] = sny;
+        _patchNGrid[vi * 3 + 2] = snz;
 
-          const rawHeightNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
-          getBiomeColor(
-            nx,
-            ny,
-            nz,
+        const rawHeightNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
+        getBiomeColor(
+          nx,
+          ny,
+          nz,
+          rawHeightNorm,
+          seaLevel,
+          this.tempColor,
+          _biomeSample,
+          false,
+        );
+
+        colors[vi * 3] = this.tempColor.r;
+        colors[vi * 3 + 1] = this.tempColor.g;
+        colors[vi * 3 + 2] = this.tempColor.b;
+
+        const dotSlope = THREE.MathUtils.clamp(
+          snx * nx + sny * ny + snz * nz,
+          0,
+          1,
+        );
+        const grassCov =
+          getGrassCoverage(
+            _biomeSample.T,
+            _biomeSample.M,
             rawHeightNorm,
             seaLevel,
-            this.tempColor,
-            _biomeSample,
-          );
+          ) * smoothstep(0.8, 0.92, dotSlope);
 
-          colors[vi * 3] = this.tempColor.r;
-          colors[vi * 3 + 1] = this.tempColor.g;
-          colors[vi * 3 + 2] = this.tempColor.b;
+        const snowLine = THREE.MathUtils.lerp(0.48, 0.90, _biomeSample.T);
+        const snowDriver = THREE.MathUtils.clamp(
+          (rawHeightNorm - (snowLine - 0.18)) / 0.36,
+          0,
+          1,
+        );
+        const shoreDriver = THREE.MathUtils.clamp(
+          (rawHeightNorm - (seaLevel - 0.05)) / 0.12,
+          0,
+          1,
+        );
+        const polarDriver = THREE.MathUtils.clamp(
+          (0.28 - _biomeSample.T) / 0.25,
+          0,
+          1,
+        );
 
-          const dotSlope = THREE.MathUtils.clamp(
-            snx * nx + sny * ny + snz * nz,
-            0,
-            1,
-          );
-          grass[vi] =
-            getGrassCoverage(
-              _biomeSample.T,
-              _biomeSample.M,
-              rawHeightNorm,
-              seaLevel,
-            ) * smoothstep(0.8, 0.92, dotSlope);
-          vi++;
-        }
+        terrainData[vi * 4] = grassCov;
+        terrainData[vi * 4 + 1] = snowDriver;
+        terrainData[vi * 4 + 2] = shoreDriver;
+        terrainData[vi * 4 + 3] = polarDriver;
+        vi++;
       }
-
-      posAttr.needsUpdate = true;
-      colAttr.needsUpdate = true;
-      normAttr.needsUpdate = true;
-      grassAttr.needsUpdate = true;
-      patch.geometry.computeBoundingSphere();
     }
 
+    // Second fast pass: compute half-resolution geomorph targets (zero border cracks)
+    const stride = PATCH_SEGMENTS + 1;
+    let mi = 0;
+    for (let py = 0; py <= PATCH_SEGMENTS; py++) {
+      const oddY = (py & 1) === 1;
+      for (let px = 0; px <= PATCH_SEGMENTS; px++) {
+        const oddX = (px & 1) === 1;
+        let idxA = mi;
+        let idxB = mi;
+        if (oddX && !oddY) {
+          idxA = mi - 1;
+          idxB = mi + 1;
+        } else if (!oddX && oddY) {
+          idxA = mi - stride;
+          idxB = mi + stride;
+        } else if (oddX && oddY) {
+          // Matches quad diagonal tr (px+1, py-1) <-> bl (px-1, py+1)
+          idxA = (py - 1) * stride + (px + 1);
+          idxB = (py + 1) * stride + (px - 1);
+        }
+
+        const halfR = 0.5 * (_patchRGrid[idxA] + _patchRGrid[idxB]);
+        let hnx = _patchNGrid[idxA * 3] + _patchNGrid[idxB * 3];
+        let hny = _patchNGrid[idxA * 3 + 1] + _patchNGrid[idxB * 3 + 1];
+        let hnz = _patchNGrid[idxA * 3 + 2] + _patchNGrid[idxB * 3 + 2];
+        const hnLen = Math.hypot(hnx, hny, hnz) || 1;
+        hnx /= hnLen;
+        hny /= hnLen;
+        hnz /= hnLen;
+
+        morphs[mi * 4] = halfR - _patchRGrid[mi];
+        morphs[mi * 4 + 1] = hnx;
+        morphs[mi * 4 + 2] = hny;
+        morphs[mi * 4 + 3] = hnz;
+        mi++;
+      }
+    }
+
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+    normAttr.needsUpdate = true;
+    dataAttr.needsUpdate = true;
+    morphAttr.needsUpdate = true;
+    patch.geometry.computeBoundingSphere();
+    // Incremented whenever a terrain patch mesh is actually rebuilt/regenerated
+    // (0 during normal flight descent because LOD uses GPU vertex morphing on prebuilt patches).
+    this.builtPatchCounter++;
+  }
+
+  private buildOrbitalFace(faceIdx: number): void {
+    const { planetRadius, maxHeight, noiseScale, seaLevel } = this.params;
+    const safeMaxH = Math.max(maxHeight, 0.001);
+    const seaFloorH = seaLevel * maxHeight;
+    const orbVertsPerFace = (ORBITAL_SEGMENTS + 1) * (ORBITAL_SEGMENTS + 1);
+
+    const orbPosAttr = this.orbitalGeometry.getAttribute('position') as THREE.BufferAttribute;
+    const orbColAttr = this.orbitalGeometry.getAttribute('color') as THREE.BufferAttribute;
+    const orbNormAttr = this.orbitalGeometry.getAttribute('normal') as THREE.BufferAttribute;
+    const orbDataAttr = this.orbitalGeometry.getAttribute('aTerrainData') as THREE.BufferAttribute;
+    const orbMorphAttr = this.orbitalGeometry.getAttribute('aMorph') as THREE.BufferAttribute;
+
+    const orbPos = orbPosAttr.array as Float32Array;
+    const orbCol = orbColAttr.array as Float32Array;
+    const orbNorm = orbNormAttr.array as Float32Array;
+    const orbData = orbDataAttr.array as Float32Array;
+    const orbMorph = orbMorphAttr.array as Float32Array;
+
+    const face = CUBE_FACES[faceIdx];
+    let ovi = faceIdx * orbVertsPerFace;
+    for (let py = 0; py <= ORBITAL_SEGMENTS; py++) {
+      const v = -1 + (py / ORBITAL_SEGMENTS) * 2;
+      for (let px = 0; px <= ORBITAL_SEGMENTS; px++) {
+        const u = -1 + (px / ORBITAL_SEGMENTS) * 2;
+        const cx = face.normal[0] + u * face.uAxis[0] + v * face.vAxis[0];
+        const cy = face.normal[1] + u * face.uAxis[1] + v * face.vAxis[1];
+        const cz = face.normal[2] + u * face.uAxis[2] + v * face.vAxis[2];
+
+        const { nx, ny, nz } = spherifyCubePoint(cx, cy, cz);
+        const rawH = getPlanetTerrainHeight(
+          nx,
+          ny,
+          nz,
+          planetRadius,
+          noiseScale,
+          maxHeight,
+        );
+        const h = Math.max(rawH, seaFloorH);
+        const r = planetRadius + h;
+
+        orbPos[ovi * 3] = nx * r;
+        orbPos[ovi * 3 + 1] = ny * r;
+        orbPos[ovi * 3 + 2] = nz * r;
+
+        const [snx, sny, snz] = this.computeSmoothTerrainNormal(
+          nx,
+          ny,
+          nz,
+          planetRadius,
+          noiseScale,
+          maxHeight,
+          seaLevel,
+          rawH,
+        );
+        orbNorm[ovi * 3] = snx;
+        orbNorm[ovi * 3 + 1] = sny;
+        orbNorm[ovi * 3 + 2] = snz;
+
+        const rawHeightNorm = THREE.MathUtils.clamp(rawH / safeMaxH, -1, 1);
+        getBiomeColor(
+          nx,
+          ny,
+          nz,
+          rawHeightNorm,
+          seaLevel,
+          this.tempColor,
+          _biomeSample,
+          true,
+        );
+        orbCol[ovi * 3] = this.tempColor.r;
+        orbCol[ovi * 3 + 1] = this.tempColor.g;
+        orbCol[ovi * 3 + 2] = this.tempColor.b;
+
+        const dotSlope = THREE.MathUtils.clamp(
+          snx * nx + sny * ny + snz * nz,
+          0,
+          1,
+        );
+        const grassCov =
+          getGrassCoverage(
+            _biomeSample.T,
+            _biomeSample.M,
+            rawHeightNorm,
+            seaLevel,
+          ) * smoothstep(0.8, 0.92, dotSlope);
+        const snowLine = THREE.MathUtils.lerp(0.48, 0.90, _biomeSample.T);
+        orbData[ovi * 4] = grassCov;
+        orbData[ovi * 4 + 1] = THREE.MathUtils.clamp(
+          (rawHeightNorm - (snowLine - 0.18)) / 0.36,
+          0,
+          1,
+        );
+        orbData[ovi * 4 + 2] = THREE.MathUtils.clamp(
+          (rawHeightNorm - (seaLevel - 0.05)) / 0.12,
+          0,
+          1,
+        );
+        orbData[ovi * 4 + 3] = THREE.MathUtils.clamp(
+          (0.28 - _biomeSample.T) / 0.25,
+          0,
+          1,
+        );
+
+        orbMorph[ovi * 4] = 0;
+        orbMorph[ovi * 4 + 1] = snx;
+        orbMorph[ovi * 4 + 2] = sny;
+        orbMorph[ovi * 4 + 3] = snz;
+        ovi++;
+      }
+    }
+
+    if (faceIdx === CUBE_FACES.length - 1) {
+      orbPosAttr.needsUpdate = true;
+      orbColAttr.needsUpdate = true;
+      orbNormAttr.needsUpdate = true;
+      orbDataAttr.needsUpdate = true;
+      orbMorphAttr.needsUpdate = true;
+      this.orbitalGeometry.computeBoundingSphere();
+      // Orbital global mesh buffers uploaded with needsUpdate = true
+      this.builtPatchCounter++;
+    }
+  }
+
+  private scheduleRebuild(): void {
+    this.rebuildPending = true;
+    this.rebuildPatchIdx = 0;
+    this.rebuildOrbFaceIdx = 0;
+    this.syncShellScales();
+    this.stepRebuild();
+  }
+
+  private stepRebuild(): void {
+    if (!this.rebuildPending) return;
+
+    if (this.rebuildPatchIdx < this.patches.length) {
+      this.buildSinglePatch(this.rebuildPatchIdx);
+      this.rebuildPatchIdx++;
+      return;
+    }
+
+    if (this.rebuildOrbFaceIdx < CUBE_FACES.length) {
+      this.buildOrbitalFace(this.rebuildOrbFaceIdx);
+      this.rebuildOrbFaceIdx++;
+      if (this.rebuildOrbFaceIdx < CUBE_FACES.length) return;
+    }
+
+    this.rebuildPending = false;
+  }
+
+  private rebuildPlanetSync(): void {
+    for (let i = 0; i < this.patches.length; i++) {
+      this.buildSinglePatch(i);
+    }
+    for (let f = 0; f < CUBE_FACES.length; f++) {
+      this.buildOrbitalFace(f);
+    }
+    this.rebuildPending = false;
     this.syncShellScales();
   }
 
@@ -1240,8 +1862,12 @@ export class PlanetTerrainManager {
       patch.geometry.dispose();
     }
     this.patches.length = 0;
-    this.surfaceTexture.dispose();
+    this.root.remove(this.orbitalMesh);
+    this.orbitalGeometry.dispose();
+    this.orbitalMaterial.dispose();
+    this.noiseTexture.dispose();
     this.terrainMaterial.dispose();
+    this.unlitTerrainMaterial.dispose();
     this.atmosphereGeo.dispose();
     this.atmosphereMat.dispose();
     this.moonGeo.dispose();

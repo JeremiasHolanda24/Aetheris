@@ -27,10 +27,13 @@ const _shipDelta = new THREE.Vector3();
 export class CameraRig {
   public readonly camera: THREE.PerspectiveCamera;
   private readonly controls: OrbitControls;
+  private currentMode: CameraMode;
+  private frozen = false;
   private userOrbiting = false;
   private landedCamBlend = 0;
   private hasPrevOrbitShipPos = false;
   private readonly prevOrbitShipPos = new THREE.Vector3();
+  private impactShake = 0;
 
   constructor(
     domElement: HTMLElement,
@@ -40,6 +43,7 @@ export class CameraRig {
     isSoftwareGl: boolean,
     initialPlanetRadius: number,
   ) {
+    this.currentMode = initialMode;
     // Near plane raised to 0.6 outside cockpit to reduce depth fighting along planet borders
     this.camera = new THREE.PerspectiveCamera(
       62,
@@ -70,14 +74,27 @@ export class CameraRig {
     }
   }
 
+  public triggerImpactShake(intensity: number): void {
+    this.impactShake = Math.max(
+      this.impactShake,
+      THREE.MathUtils.clamp(intensity, 0, 1.5),
+    );
+  }
+
+  public setFrozen(frozen: boolean): void {
+    this.frozen = frozen;
+    this.controls.enabled = !frozen && this.currentMode === 'orbit';
+  }
+
   public setMode(mode: CameraMode, focusPos: THREE.Vector3): void {
+    this.currentMode = mode;
     const targetNear = mode === 'cockpit' ? 0.08 : 0.6;
     if (this.camera.near !== targetNear) {
       this.camera.near = targetNear;
       this.camera.updateProjectionMatrix();
     }
 
-    this.controls.enabled = mode === 'orbit';
+    this.controls.enabled = !this.frozen && mode === 'orbit';
     this.hasPrevOrbitShipPos = false;
     if (mode === 'orbit') {
       this.controls.target.copy(focusPos);
@@ -203,6 +220,16 @@ export class CameraRig {
       const shake = reentryIntensity * (mode === 'cockpit' ? 0.05 : 0.12);
       this.camera.position.x += Math.sin(elapsed * 53) * shake;
       this.camera.position.y += Math.cos(elapsed * 61) * shake;
+    }
+
+    if (this.impactShake > 0.005) {
+      const impAmp = this.impactShake * (mode === 'cockpit' ? 0.22 : 0.48);
+      this.camera.position.x += Math.sin(elapsed * 79) * impAmp;
+      this.camera.position.y += Math.cos(elapsed * 97) * impAmp;
+      this.camera.position.z += Math.sin(elapsed * 67) * impAmp * 0.6;
+      this.impactShake = Math.max(0, this.impactShake - dt * 2.9);
+    } else {
+      this.impactShake = 0;
     }
 
     _camUp.copy(_shipUp);

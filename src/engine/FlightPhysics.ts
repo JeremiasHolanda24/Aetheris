@@ -1,9 +1,16 @@
 import * as THREE from 'three';
 import { CameraMode, PlanetParams, ShipParams } from '../types/simulation';
+import {
+  IMPACT_DAMAGE_SCALE,
+  IMPACT_MAX_DAMAGE,
+  IMPACT_MIN_SPEED,
+  RESERVE_THRUST_FACTOR,
+} from './economy';
 import { FloraManager, TreeCollider } from './FloraManager';
 import { FlightInputSample } from './InputController';
 import {
   GEAR_REST_HEIGHT,
+  LandingBody,
   LandingController,
   LandingHooks,
 } from './LandingController';
@@ -65,6 +72,8 @@ export interface PhysicsStepResult {
   atmoRatio: number;
   thrustPower: number;
   isBoosting: boolean;
+  impactDamage: number;
+  impactSeverity: number;
 }
 
 /**
@@ -84,6 +93,7 @@ export class FlightPhysics {
   public turboCharge = 1.0;
   public turboExhausted = false;
   private turboRechargeDelay = 0;
+  private impactCooldown = 0;
 
   private readonly scene: THREE.Scene;
   private readonly shipModel: ShipModelHandle;
@@ -101,11 +111,14 @@ export class FlightPhysics {
     atmoRatio: 1,
     thrustPower: 0,
     isBoosting: false,
+    impactDamage: 0,
+    impactSeverity: 0,
   };
 
   constructor(scene: THREE.Scene, shipModel: ShipModelHandle) {
     this.scene = scene;
     this.shipModel = shipModel;
+    this.shipRoot.userData.perfTag = 'nave';
     this.shipRoot.add(this.shipModel.group);
     this.scene.add(this.shipRoot);
 
@@ -121,7 +134,37 @@ export class FlightPhysics {
       this.hoverShadowGeo,
       this.hoverShadowMat,
     );
+    this.hoverShadowMesh.userData.perfTag = 'nave';
     this.scene.add(this.hoverShadowMesh);
+  }
+
+  private warmupSavedHoverShadowVisible = false;
+  private forceHideHoverShadow = false;
+  private readonly warmupSavedShipVisibles = new Map<THREE.Object3D, boolean>();
+
+  public setForceHideHoverShadow(hidden: boolean): void {
+    this.forceHideHoverShadow = hidden;
+    if (hidden) {
+      this.hoverShadowMesh.visible = false;
+    }
+  }
+
+  public prepareForShaderWarmup(): void {
+    this.warmupSavedHoverShadowVisible = this.hoverShadowMesh.visible;
+    this.hoverShadowMesh.visible = true;
+    this.warmupSavedShipVisibles.clear();
+    this.shipRoot.traverse((obj) => {
+      this.warmupSavedShipVisibles.set(obj, obj.visible);
+      obj.visible = true;
+    });
+  }
+
+  public restoreAfterShaderWarmup(): void {
+    this.hoverShadowMesh.visible = this.warmupSavedHoverShadowVisible;
+    this.warmupSavedShipVisibles.forEach((vis, obj) => {
+      obj.visible = vis;
+    });
+    this.warmupSavedShipVisibles.clear();
   }
 
   public landOnSurface(
@@ -194,6 +237,85 @@ export class FlightPhysics {
       .addScaledVector(_surfNormal, 0.7);
   }
 
+  public restoreToLandingSpot(
+    dir: THREE.Vector3,
+    body: LandingBody,
+    planetManager: PlanetTerrainManager,
+    outCamPos: THREE.Vector3,
+    outLookAt: THREE.Vector3,
+    outUp: THREE.Vector3,
+  ): void {
+    if (body === 'moon') {
+      const moon = planetManager.getMoonState();
+      _radialUp.copy(dir).applyQuaternion(moon.moonQuat).normalize();
+      this.shipRoot.position
+        .copy(moon.center)
+        .addScaledVector(_radialUp, moon.radius + GEAR_REST_HEIGHT);
+      _surfNormal.copy(_radialUp);
+    } else {
+      _radialUp.copy(dir).normalize();
+      const surfR = planetManager.getRenderedSupportRadiusAt(
+        _radialUp.x,
+        _radialUp.y,
+        _radialUp.z,
+      );
+      this.shipRoot.position
+        .copy(_radialUp)
+        .multiplyScalar(surfR + GEAR_REST_HEIGHT);
+      planetManager.getSurfaceNormalAt(
+        _radialUp.x,
+        _radialUp.y,
+        _radialUp.z,
+        _surfNormal,
+      );
+    }
+
+    _shipRight.crossVectors(_unitY, _surfNormal);
+    if (_shipRight.lengthSq() < 0.0001) {
+      _shipRight.set(1, 0, 0);
+    } else {
+      _shipRight.normalize();
+    }
+    _shipForward.crossVectors(_surfNormal, _shipRight).normalize();
+    _shipBack.copy(_shipForward).negate();
+    _basisMat.makeBasis(_shipRight, _surfNormal, _shipBack);
+
+    this.shipQuat.setFromRotationMatrix(_basisMat).normalize();
+    this.shipRoot.quaternion.copy(this.shipQuat);
+    this.shipModel.group.quaternion.identity();
+    this.velocity.set(0, 0, 0);
+    this.bankRad = 0;
+    this.pitchVisualRad = 0;
+    this.reentryIntensity = 0;
+    this.impactCooldown = 0.8;
+
+    this.landing.forceLanded(dir, planetManager, body);
+    this.shipModel.setGearExtension(this.landing.gearT);
+    this.shipModel.updateCockpit(
+      0.1,
+      0,
+      GEAR_REST_HEIGHT,
+      body === 'moon',
+      false,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    );
+
+    outUp.copy(_surfNormal);
+    outCamPos
+      .copy(this.shipRoot.position)
+      .addScaledVector(_shipForward, -20.0)
+      .addScaledVector(_surfNormal, 5.7);
+    outLookAt
+      .copy(this.shipRoot.position)
+      .addScaledVector(_shipForward, 5)
+      .addScaledVector(_surfNormal, 0.7);
+  }
+
   public launchToOrbit(
     planetParams: PlanetParams,
     outCamPos: THREE.Vector3,
@@ -246,6 +368,34 @@ export class FlightPhysics {
     outLookAt.copy(this.shipRoot.position).addScaledVector(_shipForward, 135);
   }
 
+  public prepareDescentState(
+    position: THREE.Vector3,
+    quaternion: THREE.Quaternion,
+    startAltitude: number,
+    atmosphereHeight: number,
+  ): void {
+    this.landing.forceFlying();
+    this.shipModel.setGearExtension(0);
+
+    this.shipRoot.position.copy(position);
+    this.shipQuat.copy(quaternion).normalize();
+    this.shipRoot.quaternion.copy(this.shipQuat);
+    this.shipModel.group.quaternion.identity();
+
+    this.velocity.set(0, 0, 0);
+    this.bankRad = 0;
+    this.pitchVisualRad = 0;
+    this.reentryIntensity = 0;
+    this.turboCharge = 1.0;
+    this.turboExhausted = false;
+    this.turboRechargeDelay = 0;
+    this.shipAltitude = startAltitude;
+    this.inSpace = startAltitude > atmosphereHeight;
+    this.atmospherePct = Math.round(
+      (1 - THREE.MathUtils.smoothstep(startAltitude, 0, atmosphereHeight)) * 100,
+    );
+  }
+
   public step(
     dt: number,
     elapsed: number,
@@ -261,6 +411,9 @@ export class FlightPhysics {
       floraManager?: FloraManager;
       floraEnabled?: boolean;
       cameraMode?: CameraMode;
+      disableHorizonLeveling?: boolean;
+      autopilotMaxSpeed?: number;
+      reserveMode?: boolean;
     },
   ): PhysicsStepResult {
     const {
@@ -275,16 +428,23 @@ export class FlightPhysics {
       floraManager,
       floraEnabled,
       cameraMode,
+      disableHorizonLeveling,
+      reserveMode = false,
     } = params;
     const { rotationSpeed, thrustForce, maxSpeed, drag } = ship;
     const { planetRadius, atmosphereHeight } = planet;
+
+    this.impactCooldown = Math.max(0, this.impactCooldown - dt);
 
     const turnInput = inputs.turn;
     const pitchInput = inputs.pitch;
     const thrustInput = inputs.thrust;
 
     const wantsBoost =
-      inputs.isBoosting && thrustInput > 0.05 && !this.landing.isControlling;
+      !reserveMode &&
+      inputs.isBoosting &&
+      thrustInput > 0.05 &&
+      !this.landing.isControlling;
     let effectiveBoosting = false;
     if (wantsBoost && !this.turboExhausted && this.turboCharge > 0.001) {
       effectiveBoosting = true;
@@ -306,6 +466,7 @@ export class FlightPhysics {
     }
 
     const boostMult = effectiveBoosting ? 1.85 : 1.0;
+    const reserveScale = reserveMode ? RESERVE_THRUST_FACTOR : 1.0;
 
     // Radial normal & atmosphere ratio
     _radialUp.copy(this.shipRoot.position).normalize();
@@ -315,6 +476,8 @@ export class FlightPhysics {
       1 - THREE.MathUtils.smoothstep(altitude, 0, atmosphereHeight);
     this.atmospherePct = Math.round(atmoRatio * 100);
     this.inSpace = altitude > atmosphereHeight;
+
+    let maxImpactSpeed = 0;
 
     if (this.landing.isControlling) {
       this.landing.update(
@@ -368,7 +531,11 @@ export class FlightPhysics {
       // Gentle planetary horizon roll-leveling inside atmosphere when not near vertical
       _shipForward.set(0, 0, -1).applyQuaternion(this.shipQuat);
       _shipUp.set(0, 1, 0).applyQuaternion(this.shipQuat);
-      if (atmoRatio > 0.08 && Math.abs(_shipForward.dot(_radialUp)) < 0.85) {
+      if (
+        !disableHorizonLeveling &&
+        atmoRatio > 0.08 &&
+        Math.abs(_shipForward.dot(_radialUp)) < 0.85
+      ) {
         _targetRight.crossVectors(_shipForward, _radialUp).normalize();
         _targetUp.crossVectors(_targetRight, _shipForward).normalize();
         _alignQuat.setFromUnitVectors(_shipUp, _targetUp);
@@ -388,12 +555,18 @@ export class FlightPhysics {
       if (Math.abs(thrustInput) > 0.01) {
         this.velocity.addScaledVector(
           _shipForward,
-          thrustInput * thrustForce * vacuumMult * boostMult * dt,
+          thrustInput * thrustForce * vacuumMult * boostMult * reserveScale * dt,
         );
       }
 
-      const effectiveMax =
-        maxSpeed * vacuumMult * (effectiveBoosting ? 1.45 : 1.0);
+      let effectiveMax =
+        maxSpeed *
+        vacuumMult *
+        (effectiveBoosting ? 1.45 : 1.0) *
+        (reserveMode ? 0.45 : 1.0);
+      if (params.autopilotMaxSpeed !== undefined) {
+        effectiveMax = Math.min(effectiveMax, params.autopilotMaxSpeed);
+      }
       if (this.velocity.length() > effectiveMax) {
         this.velocity.setLength(effectiveMax);
       }
@@ -419,12 +592,13 @@ export class FlightPhysics {
         this.shipRoot.position.copy(_radialUp).multiplyScalar(minFlightR);
         const inward = this.velocity.dot(_radialUp);
         if (inward < 0) {
+          if (-inward > maxImpactSpeed) maxImpactSpeed = -inward;
           this.velocity.addScaledVector(_radialUp, -inward);
         }
       }
 
       // Moon Collision Sphere
-      const { center: moonCenter, radius: moonRadius } =
+      const { center: moonCenter, radius: moonRadius, moonVelocity } =
         planetManager.getMoonState();
       _moonToShip.subVectors(this.shipRoot.position, moonCenter);
       const moonDist = _moonToShip.length();
@@ -438,6 +612,14 @@ export class FlightPhysics {
         this.shipRoot.position
           .copy(moonCenter)
           .addScaledVector(_moonToShip, minMoonR);
+        const relVx = this.velocity.x - moonVelocity.x;
+        const relVy = this.velocity.y - moonVelocity.y;
+        const relVz = this.velocity.z - moonVelocity.z;
+        const relInward =
+          relVx * _moonToShip.x + relVy * _moonToShip.y + relVz * _moonToShip.z;
+        if (relInward < 0) {
+          if (-relInward > maxImpactSpeed) maxImpactSpeed = -relInward;
+        }
         const inwardMoon = this.velocity.dot(_moonToShip);
         if (inwardMoon < 0) {
           this.velocity.addScaledVector(_moonToShip, -inwardMoon);
@@ -483,6 +665,7 @@ export class FlightPhysics {
           );
           const inwardTree = this.velocity.dot(_treeRadial);
           if (inwardTree < 0) {
+            if (-inwardTree > maxImpactSpeed) maxImpactSpeed = -inwardTree;
             this.velocity.addScaledVector(_treeRadial, -inwardTree);
           }
         }
@@ -507,7 +690,8 @@ export class FlightPhysics {
     this.shipAltitude = Math.max(0.5, moonClosest ? curMoonAlt : curPlanetAlt);
 
     // Spherical Ground Contact Shadow (fallback for mobile/software GPUs without shadowMap)
-    const showShadow = !shadowMapEnabled && this.shipAltitude < 32;
+    const showShadow =
+      !this.forceHideHoverShadow && !shadowMapEnabled && this.shipAltitude < 32;
     this.hoverShadowMesh.visible = showShadow;
     if (showShadow) {
       if (moonClosest) {
@@ -680,10 +864,27 @@ export class FlightPhysics {
       targetBearingDeg,
     );
 
+    let impactDamage = 0;
+    let impactSeverity = 0;
+    if (maxImpactSpeed > IMPACT_MIN_SPEED && this.impactCooldown <= 0) {
+      impactDamage = Math.min(
+        IMPACT_MAX_DAMAGE,
+        (maxImpactSpeed - IMPACT_MIN_SPEED) * IMPACT_DAMAGE_SCALE,
+      );
+      impactSeverity = THREE.MathUtils.clamp(
+        (maxImpactSpeed - IMPACT_MIN_SPEED) / 25,
+        0.25,
+        1,
+      );
+      this.impactCooldown = 0.45;
+    }
+
     this.stepOut.speed = speed;
     this.stepOut.atmoRatio = atmoRatio;
     this.stepOut.thrustPower = thrustPower;
     this.stepOut.isBoosting = effectiveBoosting;
+    this.stepOut.impactDamage = impactDamage;
+    this.stepOut.impactSeverity = impactSeverity;
     return this.stepOut;
   }
 
